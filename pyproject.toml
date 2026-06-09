@@ -1,0 +1,24 @@
+[build-system]
+requires = ["setuptools>=69", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "qwen-mm-token-probe"
+version = "0.1.0"
+description = "Hugging Face multimodal inference and token probability visualization for Qwen3.5-style models."
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+    "accelerate>=0.33.0",
+    "matplotlib>=3.8.0",
+    "numpy>=1.24.0",
+    "pillow>=10.0.0",
+    "torch>=2.3.0",
+    "transformers[serving] @ git+https://github.com/huggingface/transformers.git@main",
+]
+
+[project.scripts]
+qwen-mm-token-probe = "qwen_mm_token_probe.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
