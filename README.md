@@ -1,11 +1,11 @@
 # Qwen Multimodal Token Probability Probe
 
-This project runs Hugging Face multimodal inference, then teacher-forces the generated answer twice:
+This project runs Hugging Face multimodal inference on both the original image and a degraded copy, then teacher-forces each generated answer twice:
 
-1. with the original image
-2. with a masked or degraded copy of the same image
+1. under the original image condition
+2. under the masked or degraded image condition
 
-It exports per-token probabilities for the generated text, so you can inspect how much the image perturbation changes the probability of each generated token.
+It exports per-token probabilities for both generated responses, so you can inspect how the image perturbation changes the response itself and the probability of each generated token.
 
 ## Install
 
@@ -92,19 +92,28 @@ The output directory contains:
 
 - `original.png`: normalized RGB input image
 - `masked.png`: masked or degraded image used for the second forward pass
-- `generated.txt`: decoded answer generated from the original image
-- `token_probabilities.csv`: token-level probabilities and log probabilities
-- `word_probabilities.csv`: word/text-unit scores after grouping subword tokens
-- `token_probabilities.json`: structured run metadata and token scores
-- `token_probabilities.png`: compact probability comparison chart
-- `token_probabilities.html`: readable token table and color strips
-- `word_probabilities.html`: readable word/text-unit table and color strips
+- `generated.txt`: answer generated from the original image
+- `masked_generated.txt`: answer generated from the masked/degraded image
+- `token_probabilities.csv`: token probabilities for the original-image response under both image conditions
+- `word_probabilities.csv`: word/text-unit scores for the original-image response
+- `masked_response_token_probabilities.csv`: token probabilities for the masked-image response under both image conditions
+- `masked_response_word_probabilities.csv`: word/text-unit scores for the masked-image response
+- `token_probabilities.json`: structured run metadata and both response score sets
+- `token_probabilities.png`: compact probability comparison chart for the original-image response
+- `masked_response_token_probabilities.png`: compact probability comparison chart for the masked-image response
+- `token_probabilities.html`: readable token table for the original-image response
+- `masked_response_token_probabilities.html`: readable token table for the masked-image response
+- `word_probabilities.html`: readable word/text-unit table for the original-image response
+- `masked_response_word_probabilities.html`: readable word/text-unit table for the masked-image response
 
 ## Method
 
-The script first builds a multimodal chat prompt and calls `model.generate(...)` on the original image. It keeps the generated token ids, appends those exact token ids to the prompt, and runs two teacher-forcing forward passes. For each generated token `x_t`, it reads `softmax(logits[t - 1])[x_t]`.
+The script builds the same multimodal chat prompt for the original image and the masked/degraded image, then calls `model.generate(...)` on each. For each generated response, it keeps the generated token ids, appends those exact token ids to the prompt, and runs two teacher-forcing forward passes. For each generated token `x_t`, it reads `softmax(logits[t - 1])[x_t]`.
 
-That means the masked-image run scores the same generated answer under a different image condition instead of asking the model to generate a new answer.
+That gives two complementary views:
+
+- original-image response: whether the answer generated from the clean image remains likely when the image is degraded.
+- masked-image response: what the degraded image makes the model generate, and whether that degraded-image answer would also be likely under the clean image.
 
 ## Token Grouping
 

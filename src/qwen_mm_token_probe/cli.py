@@ -135,46 +135,81 @@ def main() -> None:
     )
 
     payload = result.to_json_payload()
-    write_generated_text(output_dir / "generated.txt", result.generated_text)
-    write_scores_csv(output_dir / "token_probabilities.csv", result.token_scores)
-    if result.word_scores:
-        write_word_scores_csv(output_dir / "word_probabilities.csv", result.word_scores)
     write_scores_json(output_dir / "token_probabilities.json", payload)
-    write_probability_plot(output_dir / "token_probabilities.png", result.token_scores)
-    write_html_report(
-        output_dir / "token_probabilities.html",
-        model_id=result.model_id,
-        prompt=result.prompt,
-        generated_text=result.generated_text,
-        scores=result.token_scores,
-        metadata={
+
+    def write_response_artifacts(
+        *,
+        response,
+        generated_filename: str,
+        token_csv_filename: str,
+        token_plot_filename: str,
+        token_html_filename: str,
+        word_csv_filename: str,
+        word_html_filename: str,
+    ) -> None:
+        metadata = {
+            "response_label": response.label,
+            "response_source_image": response.source_image,
             "original_image_path": str(result.original_image_path),
             "masked_image_path": str(result.masked_image_path),
             "mask_metadata": result.mask_metadata,
-            "num_generated_tokens": len(result.generated_token_ids),
-            "num_word_units": len(result.word_scores),
-        },
-    )
-    if result.word_scores:
-        write_word_html_report(
-            output_dir / "word_probabilities.html",
+            "num_generated_tokens": len(response.generated_token_ids),
+            "num_word_units": len(response.word_scores),
+            "score_meaning": (
+                "p_original/logp_original score this fixed response under the original image; "
+                "p_masked/logp_masked score the same fixed response under the masked image."
+            ),
+        }
+        write_generated_text(output_dir / generated_filename, response.generated_text)
+        write_scores_csv(output_dir / token_csv_filename, response.token_scores)
+        write_probability_plot(output_dir / token_plot_filename, response.token_scores)
+        write_html_report(
+            output_dir / token_html_filename,
             model_id=result.model_id,
             prompt=result.prompt,
-            generated_text=result.generated_text,
-            scores=result.word_scores,
-            metadata={
-                "original_image_path": str(result.original_image_path),
-                "masked_image_path": str(result.masked_image_path),
-                "mask_metadata": result.mask_metadata,
-                "num_word_units": len(result.word_scores),
-            },
+            generated_text=response.generated_text,
+            scores=response.token_scores,
+            metadata=metadata,
         )
+        if response.word_scores:
+            write_word_scores_csv(output_dir / word_csv_filename, response.word_scores)
+            write_word_html_report(
+                output_dir / word_html_filename,
+                model_id=result.model_id,
+                prompt=result.prompt,
+                generated_text=response.generated_text,
+                scores=response.word_scores,
+                metadata=metadata,
+            )
 
-    print(f"Generated {len(result.generated_token_ids)} tokens.")
+    write_response_artifacts(
+        response=result.original_response,
+        generated_filename="generated.txt",
+        token_csv_filename="token_probabilities.csv",
+        token_plot_filename="token_probabilities.png",
+        token_html_filename="token_probabilities.html",
+        word_csv_filename="word_probabilities.csv",
+        word_html_filename="word_probabilities.html",
+    )
+    write_response_artifacts(
+        response=result.masked_response,
+        generated_filename="masked_generated.txt",
+        token_csv_filename="masked_response_token_probabilities.csv",
+        token_plot_filename="masked_response_token_probabilities.png",
+        token_html_filename="masked_response_token_probabilities.html",
+        word_csv_filename="masked_response_word_probabilities.csv",
+        word_html_filename="masked_response_word_probabilities.html",
+    )
+
+    print(f"Original-image response tokens: {len(result.original_response.generated_token_ids)}")
+    print(f"Masked-image response tokens: {len(result.masked_response.generated_token_ids)}")
     print(f"Output directory: {output_dir}")
-    print(f"HTML report: {output_dir / 'token_probabilities.html'}")
-    if result.word_scores:
-        print(f"Word report: {output_dir / 'word_probabilities.html'}")
+    print(f"Original response report: {output_dir / 'token_probabilities.html'}")
+    print(f"Masked response report: {output_dir / 'masked_response_token_probabilities.html'}")
+    if result.original_response.word_scores:
+        print(f"Original word report: {output_dir / 'word_probabilities.html'}")
+    if result.masked_response.word_scores:
+        print(f"Masked word report: {output_dir / 'masked_response_word_probabilities.html'}")
 
 
 if __name__ == "__main__":

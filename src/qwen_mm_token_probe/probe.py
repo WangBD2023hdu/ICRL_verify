@@ -50,28 +50,74 @@ class TokenScore:
 
 
 @dataclass(frozen=True)
-class ProbeResult:
-    model_id: str
-    prompt: str
+class ResponseProbe:
+    label: str
+    source_image: str
     generated_text: str
     generated_token_ids: list[int]
     token_scores: list[TokenScore]
     word_scores: list[WordScore]
+
+    def to_dict(self) -> dict[str, object]:
+        return {
+            "label": self.label,
+            "source_image": self.source_image,
+            "generated_text": self.generated_text,
+            "generated_token_ids": self.generated_token_ids,
+            "token_scores": [score.to_dict() for score in self.token_scores],
+            "word_scores": [score.to_dict() for score in self.word_scores],
+        }
+
+
+@dataclass(frozen=True)
+class ProbeResult:
+    model_id: str
+    prompt: str
+    original_response: ResponseProbe
+    masked_response: ResponseProbe
     original_image_path: Path
     masked_image_path: Path
     mask_metadata: dict[str, object]
+
+    @property
+    def generated_text(self) -> str:
+        return self.original_response.generated_text
+
+    @property
+    def generated_token_ids(self) -> list[int]:
+        return self.original_response.generated_token_ids
+
+    @property
+    def token_scores(self) -> list[TokenScore]:
+        return self.original_response.token_scores
+
+    @property
+    def word_scores(self) -> list[WordScore]:
+        return self.original_response.word_scores
 
     def to_json_payload(self) -> dict[str, object]:
         return {
             "model_id": self.model_id,
             "prompt": self.prompt,
-            "generated_text": self.generated_text,
-            "generated_token_ids": self.generated_token_ids,
             "original_image_path": str(self.original_image_path),
             "masked_image_path": str(self.masked_image_path),
             "mask_metadata": self.mask_metadata,
+            "responses": {
+                "original_image_response": self.original_response.to_dict(),
+                "masked_image_response": self.masked_response.to_dict(),
+            },
+            "generated_text": self.original_response.generated_text,
+            "generated_token_ids": self.original_response.generated_token_ids,
             "token_scores": [score.to_dict() for score in self.token_scores],
             "word_scores": [score.to_dict() for score in self.word_scores],
+            "masked_generated_text": self.masked_response.generated_text,
+            "masked_generated_token_ids": self.masked_response.generated_token_ids,
+            "masked_token_scores": [
+                score.to_dict() for score in self.masked_response.token_scores
+            ],
+            "masked_word_scores": [
+                score.to_dict() for score in self.masked_response.word_scores
+            ],
         }
 
 
@@ -113,7 +159,14 @@ def run_probe(
         prompt=prompt,
         device=bundle.device,
     )
-    generated_token_ids, generated_text = generate_from_prompt(
+    masked_prompt_inputs = prepare_prompt_inputs(
+        processor=bundle.processor,
+        image_path=masked_out,
+        prompt=prompt,
+        device=bundle.device,
+    )
+
+    original_generated_token_ids, original_generated_text = generate_from_prompt(
         model=bundle.model,
         tokenizer=bundle.tokenizer,
         prompt_inputs=original_prompt_inputs,
@@ -123,23 +176,72 @@ def run_probe(
         top_p=top_p,
     )
 
-    if not generated_token_ids:
-        raise RuntimeError("model generated no scoreable text tokens")
-
-    masked_prompt_inputs = prepare_prompt_inputs(
-        processor=bundle.processor,
-        image_path=masked_out,
-        prompt=prompt,
-        device=bundle.device,
+    masked_generated_token_ids, masked_generated_text = generate_from_prompt(
+        model=bundle.model,
+        tokenizer=bundle.tokenizer,
+        prompt_inputs=masked_prompt_inputs,
+        max_new_tokens=max_new_tokens,
+        do_sample=do_sample,
+        temperature=temperature,
+        top_p=top_p,
     )
 
-    p_original, logp_original = token_probabilities_for_generated_ids(
+    original_response = _build_response_probe(
+        label="original_image_response",
+        source_image="original",
+        generated_text=original_generated_text,
+        generated_token_ids=original_generated_token_ids,
+        tokenizer=bundle.tokenizer,
         model=bundle.model,
+        original_prompt_inputs=original_prompt_inputs,
+        masked_prompt_inputs=masked_prompt_inputs,
+        group_tokens=group_tokens,
+    )
+    masked_response = _build_response_probe(
+        label="masked_image_response",
+        source_image="masked",
+        generated_text=masked_generated_text,
+        generated_token_ids=masked_generated_token_ids,
+        tokenizer=bundle.tokenizer,
+        model=bundle.model,
+        original_prompt_inputs=original_prompt_inputs,
+        masked_prompt_inputs=masked_prompt_inputs,
+        group_tokens=group_tokens,
+    )
+
+    return ProbeResult(
+        model_id=model_id,
+        prompt=prompt,
+        original_response=original_response,
+        masked_response=masked_response,
+        original_image_path=original_out,
+        masked_image_path=masked_out,
+        mask_metadata=mask_metadata.to_dict(),
+    )
+
+
+def _build_response_probe(
+    *,
+    label: str,
+    source_image: str,
+    generated_text: str,
+    generated_token_ids: list[int],
+    tokenizer,
+    model,
+    original_prompt_inputs: dict,
+    masked_prompt_inputs: dict,
+    group_tokens: str,
+) -> ResponseProbe:
+    if not generated_token_ids:
+        raise RuntimeError(f"{label} generated no scoreable text tokens")
+
+    p_original, logp_original = token_probabilities_for_generated_ids(
+        model=model,
         prompt_inputs=original_prompt_inputs,
         generated_token_ids=generated_token_ids,
     )
     p_masked, logp_masked = token_probabilities_for_generated_ids(
-        model=bundle.model,
+        model=model,
         prompt_inputs=masked_prompt_inputs,
         generated_token_ids=generated_token_ids,
     )
@@ -148,8 +250,8 @@ def run_probe(
         TokenScore(
             index=i,
             token_id=token_id,
-            token=display_token(bundle.tokenizer, token_id),
-            raw_token=decode_token_piece(bundle.tokenizer, token_id),
+            token=display_token(tokenizer, token_id),
+            raw_token=decode_token_piece(tokenizer, token_id),
             p_original=float(p_original[i]),
             p_masked=float(p_masked[i]),
             logp_original=float(logp_original[i]),
@@ -158,15 +260,11 @@ def run_probe(
         for i, token_id in enumerate(generated_token_ids)
     ]
     word_scores = group_token_scores(token_scores) if group_tokens == "word" else []
-
-    return ProbeResult(
-        model_id=model_id,
-        prompt=prompt,
+    return ResponseProbe(
+        label=label,
+        source_image=source_image,
         generated_text=generated_text,
         generated_token_ids=generated_token_ids,
         token_scores=token_scores,
         word_scores=word_scores,
-        original_image_path=original_out,
-        masked_image_path=masked_out,
-        mask_metadata=mask_metadata.to_dict(),
     )
