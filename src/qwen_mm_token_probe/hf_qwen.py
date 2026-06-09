@@ -248,7 +248,19 @@ def token_probabilities_for_generated_ids(
 
 
 def display_token(tokenizer: PreTrainedTokenizerBase, token_id: int) -> str:
-    piece = tokenizer.decode([token_id], skip_special_tokens=False)
+    piece = decode_token_piece(tokenizer, token_id)
+    return piece.replace("\n", "\\n").replace("\t", "\\t")
+
+
+def decode_token_piece(tokenizer: PreTrainedTokenizerBase, token_id: int) -> str:
+    try:
+        piece = tokenizer.decode(
+            [token_id],
+            skip_special_tokens=False,
+            clean_up_tokenization_spaces=False,
+        )
+    except TypeError:
+        piece = tokenizer.decode([token_id], skip_special_tokens=False)
     if piece == "":
         piece = tokenizer.convert_ids_to_tokens([token_id])[0]
-    return piece.replace("\n", "\\n").replace("\t", "\\t")
+    return piece

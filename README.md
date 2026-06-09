@@ -26,6 +26,7 @@ qwen-mm-token-probe \
   --prompt "Describe the image in detail." \
   --output-dir outputs/qwen_probe \
   --max-new-tokens 96 \
+  --group-tokens word \
   --mask-ratio 0.35 \
   --patch-size 32 \
   --seed 7
@@ -93,12 +94,31 @@ The output directory contains:
 - `masked.png`: masked or degraded image used for the second forward pass
 - `generated.txt`: decoded answer generated from the original image
 - `token_probabilities.csv`: token-level probabilities and log probabilities
+- `word_probabilities.csv`: word/text-unit scores after grouping subword tokens
 - `token_probabilities.json`: structured run metadata and token scores
 - `token_probabilities.png`: compact probability comparison chart
 - `token_probabilities.html`: readable token table and color strips
+- `word_probabilities.html`: readable word/text-unit table and color strips
 
 ## Method
 
 The script first builds a multimodal chat prompt and calls `model.generate(...)` on the original image. It keeps the generated token ids, appends those exact token ids to the prompt, and runs two teacher-forcing forward passes. For each generated token `x_t`, it reads `softmax(logits[t - 1])[x_t]`.
 
 That means the masked-image run scores the same generated answer under a different image condition instead of asking the model to generate a new answer.
+
+## Token Grouping
+
+Many words are split into multiple model tokens. The token-level output keeps the exact teacher-forced probabilities:
+
+```text
+p(x_t | image, prompt, x_1 ... x_{t-1})
+```
+
+By default, `--group-tokens word` also groups subword tokens into word/text units. For each unit, the script reports:
+
+- `image_dependency_logp`: `first_token_logp_original - first_token_logp_masked`. This is the primary word-level image-dependence score.
+- `first_token_*`: probability/log probability of the first token in the unit, before later subword tokens make the rest of the word easy to predict.
+- `sum_logp_*`: sum of token log probabilities, equivalent to the joint log probability of the full unit. This is useful for exact forced likelihood, but later subword tokens can dilute image-dependence interpretation.
+- `mean_logp_*`: average token log probability. Keep this as an auxiliary normalization, not as the main image-dependence score.
+
+The CSV includes `unit_type`, so you can filter to `unit_type=word` when you only want lexical words and not punctuation or whitespace.

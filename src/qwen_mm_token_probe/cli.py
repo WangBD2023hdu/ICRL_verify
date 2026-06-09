@@ -25,6 +25,14 @@ def build_parser() -> argparse.ArgumentParser:
     sampling.add_argument("--temperature", type=float, default=None)
     sampling.add_argument("--top-p", type=float, default=None)
 
+    analysis = parser.add_argument_group("probability analysis")
+    analysis.add_argument(
+        "--group-tokens",
+        choices=["none", "word"],
+        default="word",
+        help="Also aggregate subword tokens into word/text-unit scores.",
+    )
+
     masking = parser.add_argument_group("image masking and degradation")
     masking.add_argument(
         "--mask-strategy",
@@ -86,6 +94,8 @@ def main() -> None:
         write_probability_plot,
         write_scores_csv,
         write_scores_json,
+        write_word_html_report,
+        write_word_scores_csv,
     )
 
     output_dir = Path(args.output_dir).expanduser().resolve()
@@ -118,6 +128,7 @@ def main() -> None:
         do_sample=args.do_sample,
         temperature=args.temperature,
         top_p=args.top_p,
+        group_tokens=args.group_tokens,
         device_map=args.device_map,
         dtype=args.dtype,
         trust_remote_code=args.trust_remote_code,
@@ -126,6 +137,8 @@ def main() -> None:
     payload = result.to_json_payload()
     write_generated_text(output_dir / "generated.txt", result.generated_text)
     write_scores_csv(output_dir / "token_probabilities.csv", result.token_scores)
+    if result.word_scores:
+        write_word_scores_csv(output_dir / "word_probabilities.csv", result.word_scores)
     write_scores_json(output_dir / "token_probabilities.json", payload)
     write_probability_plot(output_dir / "token_probabilities.png", result.token_scores)
     write_html_report(
@@ -139,12 +152,29 @@ def main() -> None:
             "masked_image_path": str(result.masked_image_path),
             "mask_metadata": result.mask_metadata,
             "num_generated_tokens": len(result.generated_token_ids),
+            "num_word_units": len(result.word_scores),
         },
     )
+    if result.word_scores:
+        write_word_html_report(
+            output_dir / "word_probabilities.html",
+            model_id=result.model_id,
+            prompt=result.prompt,
+            generated_text=result.generated_text,
+            scores=result.word_scores,
+            metadata={
+                "original_image_path": str(result.original_image_path),
+                "masked_image_path": str(result.masked_image_path),
+                "mask_metadata": result.mask_metadata,
+                "num_word_units": len(result.word_scores),
+            },
+        )
 
     print(f"Generated {len(result.generated_token_ids)} tokens.")
     print(f"Output directory: {output_dir}")
     print(f"HTML report: {output_dir / 'token_probabilities.html'}")
+    if result.word_scores:
+        print(f"Word report: {output_dir / 'word_probabilities.html'}")
 
 
 if __name__ == "__main__":

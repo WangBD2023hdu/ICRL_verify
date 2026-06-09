@@ -4,6 +4,7 @@ from dataclasses import asdict, dataclass
 from pathlib import Path
 
 from .hf_qwen import (
+    decode_token_piece,
     display_token,
     generate_from_prompt,
     load_model_bundle,
@@ -11,6 +12,7 @@ from .hf_qwen import (
     token_probabilities_for_generated_ids,
 )
 from .image_mask import MaskConfig, apply_image_mask, load_rgb_image, save_rgb_image
+from .token_grouping import WordScore, group_token_scores
 
 
 @dataclass(frozen=True)
@@ -18,6 +20,7 @@ class TokenScore:
     index: int
     token_id: int
     token: str
+    raw_token: str
     p_original: float
     p_masked: float
     logp_original: float
@@ -53,6 +56,7 @@ class ProbeResult:
     generated_text: str
     generated_token_ids: list[int]
     token_scores: list[TokenScore]
+    word_scores: list[WordScore]
     original_image_path: Path
     masked_image_path: Path
     mask_metadata: dict[str, object]
@@ -67,6 +71,7 @@ class ProbeResult:
             "masked_image_path": str(self.masked_image_path),
             "mask_metadata": self.mask_metadata,
             "token_scores": [score.to_dict() for score in self.token_scores],
+            "word_scores": [score.to_dict() for score in self.word_scores],
         }
 
 
@@ -81,6 +86,7 @@ def run_probe(
     do_sample: bool = False,
     temperature: float | None = None,
     top_p: float | None = None,
+    group_tokens: str = "word",
     device_map: str | None = "auto",
     dtype: str = "auto",
     trust_remote_code: bool = False,
@@ -143,6 +149,7 @@ def run_probe(
             index=i,
             token_id=token_id,
             token=display_token(bundle.tokenizer, token_id),
+            raw_token=decode_token_piece(bundle.tokenizer, token_id),
             p_original=float(p_original[i]),
             p_masked=float(p_masked[i]),
             logp_original=float(logp_original[i]),
@@ -150,6 +157,7 @@ def run_probe(
         )
         for i, token_id in enumerate(generated_token_ids)
     ]
+    word_scores = group_token_scores(token_scores) if group_tokens == "word" else []
 
     return ProbeResult(
         model_id=model_id,
@@ -157,6 +165,7 @@ def run_probe(
         generated_text=generated_text,
         generated_token_ids=generated_token_ids,
         token_scores=token_scores,
+        word_scores=word_scores,
         original_image_path=original_out,
         masked_image_path=masked_out,
         mask_metadata=mask_metadata.to_dict(),
