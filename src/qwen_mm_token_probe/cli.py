@@ -8,7 +8,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description=(
             "Run Qwen-style multimodal inference, then compare generated-token "
-            "probabilities under original and randomly masked images."
+            "probabilities under original and masked/degraded images."
         )
     )
     parser.add_argument("--model-id", default="Qwen/Qwen3.5-2B")
@@ -25,13 +25,51 @@ def build_parser() -> argparse.ArgumentParser:
     sampling.add_argument("--temperature", type=float, default=None)
     sampling.add_argument("--top-p", type=float, default=None)
 
-    masking = parser.add_argument_group("random image masking")
+    masking = parser.add_argument_group("image masking and degradation")
+    masking.add_argument(
+        "--mask-strategy",
+        choices=["patch", "word"],
+        default="patch",
+        help="Select regions by random patches or word-level boxes.",
+    )
     masking.add_argument("--mask-ratio", type=float, default=0.35)
     masking.add_argument("--patch-size", type=int, default=32)
     masking.add_argument(
         "--mask-fill",
         choices=["mean", "black", "white", "noise"],
         default="mean",
+    )
+    masking.add_argument(
+        "--mask-effect",
+        choices=["replace", "fade", "blur", "noise", "blur_fade"],
+        default="replace",
+        help="How selected regions are degraded.",
+    )
+    masking.add_argument(
+        "--mask-opacity",
+        type=float,
+        default=1.0,
+        help="Blend strength for the degradation. 1.0 is full strength, 0.0 is no change.",
+    )
+    masking.add_argument("--blur-radius", type=float, default=1.2)
+    masking.add_argument("--noise-std", type=float, default=10.0)
+    masking.add_argument(
+        "--word-boxes",
+        default=None,
+        help=(
+            "Optional JSON file containing word boxes. Supported shapes include "
+            "[x1,y1,x2,y2], {'bbox': [...]}, {'box': [...]}, or {'x','y','w','h'}."
+        ),
+    )
+    masking.add_argument("--word-padding", type=int, default=2)
+    masking.add_argument("--word-gap", type=int, default=12)
+    masking.add_argument("--word-min-width", type=int, default=4)
+    masking.add_argument("--word-min-height", type=int, default=4)
+    masking.add_argument(
+        "--text-threshold",
+        type=int,
+        default=None,
+        help="Optional grayscale threshold for automatic word-like box detection.",
     )
     masking.add_argument("--seed", type=int, default=7)
     return parser
@@ -54,10 +92,21 @@ def main() -> None:
     output_dir.mkdir(parents=True, exist_ok=True)
 
     mask_config = MaskConfig(
+        strategy=args.mask_strategy,
         ratio=args.mask_ratio,
         patch_size=args.patch_size,
         fill=args.mask_fill,
+        effect=args.mask_effect,
+        opacity=args.mask_opacity,
+        blur_radius=args.blur_radius,
+        noise_std=args.noise_std,
         seed=args.seed,
+        word_boxes_path=args.word_boxes,
+        word_padding=args.word_padding,
+        word_gap=args.word_gap,
+        word_min_width=args.word_min_width,
+        word_min_height=args.word_min_height,
+        text_threshold=args.text_threshold,
     )
     result = run_probe(
         model_id=args.model_id,

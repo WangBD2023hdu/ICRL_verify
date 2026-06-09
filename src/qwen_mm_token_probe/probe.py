@@ -10,7 +10,7 @@ from .hf_qwen import (
     prepare_prompt_inputs,
     token_probabilities_for_generated_ids,
 )
-from .image_mask import MaskConfig, apply_random_patch_mask, load_rgb_image, save_rgb_image
+from .image_mask import MaskConfig, apply_image_mask, load_rgb_image, save_rgb_image
 
 
 @dataclass(frozen=True)
@@ -89,7 +89,7 @@ def run_probe(
     output_root.mkdir(parents=True, exist_ok=True)
 
     original_image = load_rgb_image(image_path)
-    masked_image, mask_metadata = apply_random_patch_mask(original_image, mask_config)
+    masked_image, mask_metadata = apply_image_mask(original_image, mask_config)
 
     original_out = save_rgb_image(original_image, output_root / "original.png")
     masked_out = save_rgb_image(masked_image, output_root / "masked.png")
