@@ -164,23 +164,24 @@ def prepare_qwen_vl_prompt_inputs(
         min_pixels=min_pixels,
         max_pixels=max_pixels,
     )
+    batch_messages = [messages]
     chat_template_kwargs = {"enable_thinking": enable_thinking}
 
     try:
         text = processor.apply_chat_template(
-            messages,
+            batch_messages,
             tokenize=False,
             add_generation_prompt=True,
             **chat_template_kwargs,
         )
     except TypeError:
         text = processor.apply_chat_template(
-            messages,
+            batch_messages,
             tokenize=False,
             add_generation_prompt=True,
         )
 
-    image_inputs, _ = process_vision_info(messages, image_patch_size=image_patch_size)
+    image_inputs, _ = process_vision_info(batch_messages, image_patch_size=image_patch_size)
     inputs = processor(
         text=text,
         images=image_inputs,
