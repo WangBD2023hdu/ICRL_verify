@@ -19,6 +19,30 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--device-map", default="auto")
     parser.add_argument("--dtype", default="auto")
     parser.add_argument("--trust-remote-code", action="store_true")
+    parser.add_argument(
+        "--min-pixels",
+        type=int,
+        default=2048,
+        help="Minimum image pixels for Qwen vision preprocessing.",
+    )
+    parser.add_argument(
+        "--max-pixels",
+        type=int,
+        default=16777216,
+        help="Maximum image pixels for Qwen vision preprocessing.",
+    )
+    parser.add_argument(
+        "--image-patch-size",
+        type=int,
+        default=16,
+        help="Patch size passed to qwen_vl_utils.process_vision_info.",
+    )
+    parser.add_argument(
+        "--enable-thinking",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Pass enable_thinking to the chat template. Disabled by default.",
+    )
 
     sampling = parser.add_argument_group("generation sampling")
     sampling.add_argument("--do-sample", action="store_true")
@@ -132,6 +156,10 @@ def main() -> None:
         device_map=args.device_map,
         dtype=args.dtype,
         trust_remote_code=args.trust_remote_code,
+        min_pixels=args.min_pixels,
+        max_pixels=args.max_pixels,
+        image_patch_size=args.image_patch_size,
+        enable_thinking=args.enable_thinking,
     )
 
     payload = result.to_json_payload()

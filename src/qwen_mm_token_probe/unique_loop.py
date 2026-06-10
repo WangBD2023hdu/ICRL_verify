@@ -25,6 +25,30 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--dtype", default="auto")
     parser.add_argument("--trust-remote-code", action="store_true")
     parser.add_argument(
+        "--min-pixels",
+        type=int,
+        default=2048,
+        help="Minimum image pixels for Qwen vision preprocessing.",
+    )
+    parser.add_argument(
+        "--max-pixels",
+        type=int,
+        default=16777216,
+        help="Maximum image pixels for Qwen vision preprocessing.",
+    )
+    parser.add_argument(
+        "--image-patch-size",
+        type=int,
+        default=16,
+        help="Patch size passed to qwen_vl_utils.process_vision_info.",
+    )
+    parser.add_argument(
+        "--enable-thinking",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Pass enable_thinking to the chat template. Disabled by default.",
+    )
+    parser.add_argument(
         "--num-runs",
         type=int,
         default=0,
@@ -154,6 +178,10 @@ def run_unique_loop(args: argparse.Namespace) -> None:
         image_path=args.image,
         prompt=args.prompt,
         device=bundle.device,
+        min_pixels=args.min_pixels,
+        max_pixels=args.max_pixels,
+        image_patch_size=args.image_patch_size,
+        enable_thinking=args.enable_thinking,
     )
 
     config_record = {
@@ -167,6 +195,10 @@ def run_unique_loop(args: argparse.Namespace) -> None:
         "top_p": args.top_p if args.do_sample else None,
         "compare_mode": args.compare_mode,
         "seed": args.seed,
+        "min_pixels": args.min_pixels,
+        "max_pixels": args.max_pixels,
+        "image_patch_size": args.image_patch_size,
+        "enable_thinking": args.enable_thinking,
     }
     (output_dir / "config.json").write_text(
         json.dumps(config_record, ensure_ascii=False, indent=2) + "\n",

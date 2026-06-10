@@ -136,6 +136,10 @@ def run_probe(
     device_map: str | None = "auto",
     dtype: str = "auto",
     trust_remote_code: bool = False,
+    min_pixels: int = 2048,
+    max_pixels: int = 16777216,
+    image_patch_size: int = 16,
+    enable_thinking: bool = False,
 ) -> ProbeResult:
     output_root = Path(output_dir).expanduser().resolve()
     output_root.mkdir(parents=True, exist_ok=True)
@@ -158,12 +162,20 @@ def run_probe(
         image_path=original_out,
         prompt=prompt,
         device=bundle.device,
+        min_pixels=min_pixels,
+        max_pixels=max_pixels,
+        image_patch_size=image_patch_size,
+        enable_thinking=enable_thinking,
     )
     masked_prompt_inputs = prepare_prompt_inputs(
         processor=bundle.processor,
         image_path=masked_out,
         prompt=prompt,
         device=bundle.device,
+        min_pixels=min_pixels,
+        max_pixels=max_pixels,
+        image_patch_size=image_patch_size,
+        enable_thinking=enable_thinking,
     )
 
     original_generated_token_ids, original_generated_text = generate_from_prompt(

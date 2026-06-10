@@ -3,6 +3,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
+import warnings
 
 import torch
 from PIL import Image
@@ -65,12 +66,29 @@ def _infer_input_device(model: torch.nn.Module) -> torch.device:
     return next(model.parameters()).device
 
 
-def build_user_messages(image_path: str | Path, prompt: str) -> list[dict[str, Any]]:
+def build_user_messages(
+    image: str | Path | Image.Image,
+    prompt: str,
+    *,
+    min_pixels: int = 2048,
+    max_pixels: int = 16777216,
+) -> list[dict[str, Any]]:
+    image_value: str | Image.Image
+    if isinstance(image, Image.Image):
+        image_value = image
+    else:
+        image_value = str(Path(image).expanduser().resolve())
+
     return [
         {
             "role": "user",
             "content": [
-                {"type": "image", "image": str(Path(image_path).resolve())},
+                {
+                    "type": "image",
+                    "image": image_value,
+                    "min_pixels": min_pixels,
+                    "max_pixels": max_pixels,
+                },
                 {"type": "text", "text": prompt},
             ],
         }
@@ -83,50 +101,130 @@ def prepare_prompt_inputs(
     image_path: str | Path,
     prompt: str,
     device: torch.device,
+    min_pixels: int = 2048,
+    max_pixels: int = 16777216,
+    image_patch_size: int = 16,
+    enable_thinking: bool = False,
 ) -> dict[str, Any]:
     """Tokenize a multimodal prompt with a generation marker.
 
-    Newer Transformers multimodal processors accept local image paths under the
-    `image` key. If a processor build expects an already-loaded PIL object, the
-    fallback keeps the CLI usable across nearby versions.
+    Infinity-Parser2 uses Qwen's vision utility path: PIL RGB image ->
+    `apply_chat_template(tokenize=False)` -> `process_vision_info` ->
+    `processor(..., do_resize=False)`. Using the same path keeps image patching
+    and resize behavior aligned with the model's reference inference code.
     """
 
-    messages = build_user_messages(image_path, prompt)
     try:
-        inputs = processor.apply_chat_template(
+        inputs = prepare_qwen_vl_prompt_inputs(
+            processor=processor,
+            image_path=image_path,
+            prompt=prompt,
+            min_pixels=min_pixels,
+            max_pixels=max_pixels,
+            image_patch_size=image_patch_size,
+            enable_thinking=enable_thinking,
+        )
+    except ImportError as import_error:
+        warnings.warn(
+            "qwen-vl-utils is not available; falling back to processor.apply_chat_template("
+            "tokenize=True). Install qwen-vl-utils>=0.0.14 for Infinity-Parser2-compatible "
+            f"image preprocessing. Original import error: {import_error}",
+            RuntimeWarning,
+        )
+        inputs = prepare_legacy_prompt_inputs(
+            processor=processor,
+            image_path=image_path,
+            prompt=prompt,
+            min_pixels=min_pixels,
+            max_pixels=max_pixels,
+            enable_thinking=enable_thinking,
+        )
+
+    return move_inputs_to_device(inputs, device)
+
+
+def prepare_qwen_vl_prompt_inputs(
+    *,
+    processor: Any,
+    image_path: str | Path,
+    prompt: str,
+    min_pixels: int = 2048,
+    max_pixels: int = 16777216,
+    image_patch_size: int = 16,
+    enable_thinking: bool = False,
+) -> dict[str, Any]:
+    from qwen_vl_utils import process_vision_info
+
+    with Image.open(image_path) as raw_image:
+        pil_image = raw_image.convert("RGB")
+
+    messages = build_user_messages(
+        pil_image,
+        prompt,
+        min_pixels=min_pixels,
+        max_pixels=max_pixels,
+    )
+    chat_template_kwargs = {"enable_thinking": enable_thinking}
+
+    try:
+        text = processor.apply_chat_template(
+            messages,
+            tokenize=False,
+            add_generation_prompt=True,
+            **chat_template_kwargs,
+        )
+    except TypeError:
+        text = processor.apply_chat_template(
+            messages,
+            tokenize=False,
+            add_generation_prompt=True,
+        )
+
+    image_inputs, _ = process_vision_info(messages, image_patch_size=image_patch_size)
+    inputs = processor(
+        text=text,
+        images=image_inputs,
+        do_resize=False,
+        padding=True,
+        return_tensors="pt",
+    )
+    inputs.pop("token_type_ids", None)
+    return inputs
+
+
+def prepare_legacy_prompt_inputs(
+    *,
+    processor: Any,
+    image_path: str | Path,
+    prompt: str,
+    min_pixels: int = 2048,
+    max_pixels: int = 16777216,
+    enable_thinking: bool = False,
+) -> dict[str, Any]:
+    messages = build_user_messages(
+        image_path,
+        prompt,
+        min_pixels=min_pixels,
+        max_pixels=max_pixels,
+    )
+    chat_template_kwargs = {"enable_thinking": enable_thinking}
+    try:
+        return processor.apply_chat_template(
+            messages,
+            add_generation_prompt=True,
+            tokenize=True,
+            return_dict=True,
+            return_tensors="pt",
+            **chat_template_kwargs,
+        )
+    except TypeError:
+        return processor.apply_chat_template(
             messages,
             add_generation_prompt=True,
             tokenize=True,
             return_dict=True,
             return_tensors="pt",
         )
-    except Exception as path_error:
-        try:
-            with Image.open(image_path) as raw_image:
-                pil_image = raw_image.convert("RGB")
-            fallback_messages = [
-                {
-                    "role": "user",
-                    "content": [
-                        {"type": "image", "image": pil_image},
-                        {"type": "text", "text": prompt},
-                    ],
-                }
-            ]
-            inputs = processor.apply_chat_template(
-                fallback_messages,
-                add_generation_prompt=True,
-                tokenize=True,
-                return_dict=True,
-                return_tensors="pt",
-            )
-        except Exception as pil_error:
-            raise RuntimeError(
-                "failed to prepare multimodal prompt with both local path and "
-                f"PIL image. Local-path attempt failed with: {path_error}"
-            ) from pil_error
-
-    return move_inputs_to_device(inputs, device)
 
 
 def move_inputs_to_device(inputs: dict[str, Any], device: torch.device) -> dict[str, Any]:
@@ -164,7 +262,11 @@ def generate_from_prompt(
 
     generated_ids = output_ids[0, prompt_len:].detach().cpu().tolist()
     score_ids = trim_tail_special_tokens(generated_ids, tokenizer)
-    generated_text = tokenizer.decode(score_ids, skip_special_tokens=True).strip()
+    generated_text = tokenizer.decode(
+        score_ids,
+        skip_special_tokens=True,
+        clean_up_tokenization_spaces=False,
+    ).strip()
     return score_ids, generated_text
 
 

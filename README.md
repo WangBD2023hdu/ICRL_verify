@@ -10,6 +10,7 @@ It exports per-token probabilities for both generated responses, so you can insp
 ## Install
 
 Qwen3.5 support currently requires a recent `transformers` build.
+Infinity-Parser2-compatible image preprocessing also requires `qwen-vl-utils`.
 
 ```bash
 python -m venv .venv
@@ -27,6 +28,9 @@ qwen-mm-token-probe \
   --output-dir outputs/qwen_probe \
   --max-new-tokens 96 \
   --group-tokens word \
+  --min-pixels 2048 \
+  --max-pixels 16777216 \
+  --image-patch-size 16 \
   --mask-ratio 0.35 \
   --patch-size 32 \
   --seed 7
@@ -97,12 +101,16 @@ qwen-mm-unique-loop \
   --image /inspire/sfs/project/inf-multimodal/public/wangbaode/03_innovate/ICRL_verify/yanbao.jpg \
   --prompt "$PDF_PROMPT" \
   --output-dir outputs/qwen_unique_yanbao \
-  --max-new-tokens 1024
+  --max-new-tokens 1024 \
+  --no-do-sample \
+  --temperature 0.0 \
+  --top-p 1.0
 ```
 
 The loop runs forever by default. Press `Ctrl+C` to stop it. Use `--num-runs N`
-for a finite run. The command samples by default with `--temperature 0.7
---top-p 0.95`; use `--no-do-sample` for greedy decoding.
+for a finite run. Use greedy decoding, as shown above, when you want behavior
+closest to Infinity-Parser2. Use `--do-sample --temperature 0.7 --top-p 0.95`
+when you intentionally want diverse repeated outputs.
 
 Saved files:
 
@@ -134,6 +142,12 @@ The output directory contains:
 ## Method
 
 The script builds the same multimodal chat prompt for the original image and the masked/degraded image, then calls `model.generate(...)` on each. For each generated response, it keeps the generated token ids, appends those exact token ids to the prompt, and runs two teacher-forcing forward passes. For each generated token `x_t`, it reads `softmax(logits[t - 1])[x_t]`.
+
+Image inputs follow Infinity-Parser2's reference Transformers path: load as RGB
+PIL, include `min_pixels` and `max_pixels` in the image message, call
+`apply_chat_template(tokenize=False, enable_thinking=False)`, process vision
+inputs with `qwen_vl_utils.process_vision_info(..., image_patch_size=16)`, then
+call the processor with `do_resize=False`.
 
 That gives two complementary views:
 
