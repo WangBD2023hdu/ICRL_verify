@@ -271,6 +271,105 @@ def generate_from_prompt(
     return score_ids, generated_text
 
 
+def generate_from_prefilled_tokens(
+    *,
+    model: torch.nn.Module,
+    tokenizer: PreTrainedTokenizerBase,
+    prompt_inputs: dict[str, Any],
+    generated_prefix_token_ids: list[int],
+    max_new_tokens: int,
+    do_sample: bool,
+    temperature: float | None,
+    top_p: float | None,
+) -> tuple[list[int], str, list[int], str]:
+    """Continue generation after already-emitted assistant tokens.
+
+    `generated_prefix_token_ids` are appended to the multimodal prompt as fixed
+    context. `model.generate` then produces only the continuation after that
+    fixed prefix.
+    """
+
+    prefilled_inputs = append_generated_tokens(prompt_inputs, generated_prefix_token_ids)
+    prompt_plus_prefix_len = int(prefilled_inputs["input_ids"].shape[-1])
+    generation_kwargs: dict[str, Any] = {
+        "max_new_tokens": max_new_tokens,
+        "do_sample": do_sample,
+    }
+    if do_sample and temperature is not None:
+        generation_kwargs["temperature"] = temperature
+    if do_sample and top_p is not None:
+        generation_kwargs["top_p"] = top_p
+
+    with torch.inference_mode():
+        output_ids = model.generate(**prefilled_inputs, **generation_kwargs)
+
+    continuation_ids = output_ids[0, prompt_plus_prefix_len:].detach().cpu().tolist()
+    continuation_ids = trim_tail_special_tokens(continuation_ids, tokenizer)
+    full_ids = generated_prefix_token_ids + continuation_ids
+    continuation_text = decode_generated_tokens(tokenizer, continuation_ids).strip()
+    full_text = decode_generated_tokens(tokenizer, full_ids).strip()
+    return continuation_ids, continuation_text, full_ids, full_text
+
+
+def next_token_topk(
+    *,
+    model: torch.nn.Module,
+    tokenizer: PreTrainedTokenizerBase,
+    prompt_inputs: dict[str, Any],
+    generated_prefix_token_ids: list[int],
+    top_k: int = 10,
+    inspect_token_ids: list[int] | None = None,
+) -> dict[str, object]:
+    prefilled_inputs = append_generated_tokens(prompt_inputs, generated_prefix_token_ids)
+
+    with torch.inference_mode():
+        outputs = model(**prefilled_inputs)
+
+    logits = outputs.logits[0, -1]
+    probs = torch.softmax(logits.float(), dim=-1)
+    top_probs, top_ids = torch.topk(probs, k=top_k)
+
+    top_tokens = [
+        {
+            "rank": rank + 1,
+            "token_id": int(token_id),
+            "token": display_token(tokenizer, int(token_id)),
+            "raw_token": decode_token_piece(tokenizer, int(token_id)),
+            "probability": float(prob),
+        }
+        for rank, (token_id, prob) in enumerate(zip(top_ids.tolist(), top_probs.tolist()))
+    ]
+
+    inspected = []
+    for token_id in inspect_token_ids or []:
+        inspected.append(
+            {
+                "token_id": int(token_id),
+                "token": display_token(tokenizer, int(token_id)),
+                "raw_token": decode_token_piece(tokenizer, int(token_id)),
+                "probability": float(probs[int(token_id)].detach().cpu()),
+            }
+        )
+
+    return {
+        "top_tokens": top_tokens,
+        "inspected_tokens": inspected,
+    }
+
+
+def decode_generated_tokens(
+    tokenizer: PreTrainedTokenizerBase,
+    token_ids: list[int],
+) -> str:
+    if not token_ids:
+        return ""
+    return tokenizer.decode(
+        token_ids,
+        skip_special_tokens=True,
+        clean_up_tokenization_spaces=False,
+    )
+
+
 def trim_tail_special_tokens(
     token_ids: list[int],
     tokenizer: PreTrainedTokenizerBase,
