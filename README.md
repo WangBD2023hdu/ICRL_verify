@@ -86,6 +86,31 @@ For a larger model, pass another checkpoint:
 qwen-mm-token-probe --model-id Qwen/Qwen3.5-9B ...
 ```
 
+## Repeated Unique Inference
+
+To repeatedly sample one image and prompt, saving only responses that have not
+appeared before:
+
+```bash
+qwen-mm-unique-loop \
+  --model-id /home/ma-user/work/share_base_models/Infinity-Parser2/Infinity-Parser2-Flash \
+  --image /inspire/sfs/project/inf-multimodal/public/wangbaode/03_innovate/ICRL_verify/yanbao.jpg \
+  --prompt "$PDF_PROMPT" \
+  --output-dir outputs/qwen_unique_yanbao \
+  --max-new-tokens 1024
+```
+
+The loop runs forever by default. Press `Ctrl+C` to stop it. Use `--num-runs N`
+for a finite run. The command samples by default with `--temperature 0.7
+--top-p 0.95`; use `--no-do-sample` for greedy decoding.
+
+Saved files:
+
+- `unique_000001.txt`, `unique_000002.txt`, ...: unique responses
+- `unique_000001.json`, `unique_000002.json`, ...: response metadata
+- `manifest.jsonl`: one record per unique response
+- `runs.jsonl`: one record per inference attempt, including duplicates
+
 ## Outputs
 
 The output directory contains:
