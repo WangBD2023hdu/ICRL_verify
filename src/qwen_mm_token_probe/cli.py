@@ -56,6 +56,23 @@ def build_parser() -> argparse.ArgumentParser:
         default="word",
         help="Also aggregate subword tokens into word/text-unit scores.",
     )
+    analysis.add_argument(
+        "--privileged-info-file",
+        default=None,
+        help=(
+            "Optional text file used only for the masked/degraded-image scoring "
+            "condition. Relative paths are resolved against --output-dir, so "
+            "GT.txt means <output-dir>/GT.txt."
+        ),
+    )
+    analysis.add_argument(
+        "--skip-masked-generation",
+        action="store_true",
+        help=(
+            "Do not generate a separate response from the masked/degraded condition; "
+            "only score the original-image response under both conditions."
+        ),
+    )
 
     masking = parser.add_argument_group("image masking and degradation")
     masking.add_argument(
@@ -160,6 +177,8 @@ def main() -> None:
         max_pixels=args.max_pixels,
         image_patch_size=args.image_patch_size,
         enable_thinking=args.enable_thinking,
+        privileged_info_file=args.privileged_info_file,
+        skip_masked_generation=args.skip_masked_generation,
     )
 
     payload = result.to_json_payload()
@@ -180,17 +199,26 @@ def main() -> None:
             "response_source_image": response.source_image,
             "original_image_path": str(result.original_image_path),
             "masked_image_path": str(result.masked_image_path),
+            "original_condition_label": result.original_condition_label,
+            "masked_condition_label": result.masked_condition_label,
+            "privileged_info": result.privileged_info_metadata,
             "mask_metadata": result.mask_metadata,
             "num_generated_tokens": len(response.generated_token_ids),
             "num_word_units": len(response.word_scores),
             "score_meaning": (
-                "p_original/logp_original score this fixed response under the original image; "
-                "p_masked/logp_masked score the same fixed response under the masked image."
+                "p_original/logp_original score this fixed response under "
+                f"{result.original_condition_label}; p_masked/logp_masked score the same "
+                f"fixed response under {result.masked_condition_label}."
             ),
         }
         write_generated_text(output_dir / generated_filename, response.generated_text)
         write_scores_csv(output_dir / token_csv_filename, response.token_scores)
-        write_probability_plot(output_dir / token_plot_filename, response.token_scores)
+        write_probability_plot(
+            output_dir / token_plot_filename,
+            response.token_scores,
+            original_label=result.original_condition_label,
+            masked_label=result.masked_condition_label,
+        )
         write_html_report(
             output_dir / token_html_filename,
             model_id=result.model_id,
@@ -198,6 +226,8 @@ def main() -> None:
             generated_text=response.generated_text,
             scores=response.token_scores,
             metadata=metadata,
+            original_condition_label=result.original_condition_label,
+            masked_condition_label=result.masked_condition_label,
         )
         if response.word_scores:
             write_word_scores_csv(output_dir / word_csv_filename, response.word_scores)
@@ -208,6 +238,8 @@ def main() -> None:
                 generated_text=response.generated_text,
                 scores=response.word_scores,
                 metadata=metadata,
+                original_condition_label=result.original_condition_label,
+                masked_condition_label=result.masked_condition_label,
             )
 
     write_response_artifacts(
@@ -219,24 +251,29 @@ def main() -> None:
         word_csv_filename="word_probabilities.csv",
         word_html_filename="word_probabilities.html",
     )
-    write_response_artifacts(
-        response=result.masked_response,
-        generated_filename="masked_generated.txt",
-        token_csv_filename="masked_response_token_probabilities.csv",
-        token_plot_filename="masked_response_token_probabilities.png",
-        token_html_filename="masked_response_token_probabilities.html",
-        word_csv_filename="masked_response_word_probabilities.csv",
-        word_html_filename="masked_response_word_probabilities.html",
-    )
+    if result.masked_response is not None:
+        write_response_artifacts(
+            response=result.masked_response,
+            generated_filename="masked_generated.txt",
+            token_csv_filename="masked_response_token_probabilities.csv",
+            token_plot_filename="masked_response_token_probabilities.png",
+            token_html_filename="masked_response_token_probabilities.html",
+            word_csv_filename="masked_response_word_probabilities.csv",
+            word_html_filename="masked_response_word_probabilities.html",
+        )
 
     print(f"Original-image response tokens: {len(result.original_response.generated_token_ids)}")
-    print(f"Masked-image response tokens: {len(result.masked_response.generated_token_ids)}")
+    if result.masked_response is not None:
+        print(f"Masked-image response tokens: {len(result.masked_response.generated_token_ids)}")
+    else:
+        print("Masked-image response generation: skipped")
     print(f"Output directory: {output_dir}")
     print(f"Original response report: {output_dir / 'token_probabilities.html'}")
-    print(f"Masked response report: {output_dir / 'masked_response_token_probabilities.html'}")
+    if result.masked_response is not None:
+        print(f"Masked response report: {output_dir / 'masked_response_token_probabilities.html'}")
     if result.original_response.word_scores:
         print(f"Original word report: {output_dir / 'word_probabilities.html'}")
-    if result.masked_response.word_scores:
+    if result.masked_response is not None and result.masked_response.word_scores:
         print(f"Masked word report: {output_dir / 'masked_response_word_probabilities.html'}")
 
 

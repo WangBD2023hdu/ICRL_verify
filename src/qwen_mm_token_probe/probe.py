@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 from dataclasses import asdict, dataclass
 from pathlib import Path
 
@@ -13,6 +14,17 @@ from .hf_qwen import (
 )
 from .image_mask import MaskConfig, apply_image_mask, load_rgb_image, save_rgb_image
 from .token_grouping import WordScore, group_token_scores
+
+
+DEFAULT_PRIVILEGED_INFO_TEMPLATE = """{prompt}
+
+[Privileged information]
+The following ground-truth answer is provided as privileged information for probability probing. Use it as reference information for the answer.
+
+{privileged_info}
+
+[End privileged information]
+"""
 
 
 @dataclass(frozen=True)
@@ -74,10 +86,13 @@ class ProbeResult:
     model_id: str
     prompt: str
     original_response: ResponseProbe
-    masked_response: ResponseProbe
+    masked_response: ResponseProbe | None
     original_image_path: Path
     masked_image_path: Path
     mask_metadata: dict[str, object]
+    original_condition_label: str = "original image"
+    masked_condition_label: str = "masked image"
+    privileged_info_metadata: dict[str, object] | None = None
 
     @property
     def generated_text(self) -> str:
@@ -96,29 +111,41 @@ class ProbeResult:
         return self.original_response.word_scores
 
     def to_json_payload(self) -> dict[str, object]:
-        return {
+        responses = {
+            "original_image_response": self.original_response.to_dict(),
+        }
+        if self.masked_response is not None:
+            responses["masked_image_response"] = self.masked_response.to_dict()
+
+        payload: dict[str, object] = {
             "model_id": self.model_id,
             "prompt": self.prompt,
             "original_image_path": str(self.original_image_path),
             "masked_image_path": str(self.masked_image_path),
+            "original_condition_label": self.original_condition_label,
+            "masked_condition_label": self.masked_condition_label,
+            "privileged_info": self.privileged_info_metadata,
             "mask_metadata": self.mask_metadata,
-            "responses": {
-                "original_image_response": self.original_response.to_dict(),
-                "masked_image_response": self.masked_response.to_dict(),
-            },
+            "responses": responses,
             "generated_text": self.original_response.generated_text,
             "generated_token_ids": self.original_response.generated_token_ids,
             "token_scores": [score.to_dict() for score in self.token_scores],
             "word_scores": [score.to_dict() for score in self.word_scores],
-            "masked_generated_text": self.masked_response.generated_text,
-            "masked_generated_token_ids": self.masked_response.generated_token_ids,
-            "masked_token_scores": [
-                score.to_dict() for score in self.masked_response.token_scores
-            ],
-            "masked_word_scores": [
-                score.to_dict() for score in self.masked_response.word_scores
-            ],
         }
+        if self.masked_response is not None:
+            payload.update(
+                {
+                    "masked_generated_text": self.masked_response.generated_text,
+                    "masked_generated_token_ids": self.masked_response.generated_token_ids,
+                    "masked_token_scores": [
+                        score.to_dict() for score in self.masked_response.token_scores
+                    ],
+                    "masked_word_scores": [
+                        score.to_dict() for score in self.masked_response.word_scores
+                    ],
+                }
+            )
+        return payload
 
 
 def run_probe(
@@ -140,6 +167,9 @@ def run_probe(
     max_pixels: int = 16777216,
     image_patch_size: int = 16,
     enable_thinking: bool = False,
+    privileged_info_file: str | Path | None = None,
+    privileged_info_template: str = DEFAULT_PRIVILEGED_INFO_TEMPLATE,
+    skip_masked_generation: bool = False,
 ) -> ProbeResult:
     output_root = Path(output_dir).expanduser().resolve()
     output_root.mkdir(parents=True, exist_ok=True)
@@ -157,6 +187,27 @@ def run_probe(
         trust_remote_code=trust_remote_code,
     )
 
+    masked_prompt = prompt
+    masked_condition_label = "masked image"
+    privileged_info_metadata = None
+    if privileged_info_file is not None:
+        privileged_info_path, privileged_info = _load_privileged_info(
+            privileged_info_file,
+            output_root=output_root,
+        )
+        masked_prompt = _format_privileged_prompt(
+            prompt=prompt,
+            privileged_info=privileged_info,
+            template=privileged_info_template,
+        )
+        masked_condition_label = "masked image + privileged info"
+        privileged_info_metadata = {
+            "path": str(privileged_info_path),
+            "num_chars": len(privileged_info),
+            "sha256": hashlib.sha256(privileged_info.encode("utf-8")).hexdigest(),
+            "applied_to": "masked_condition_prompt",
+        }
+
     original_prompt_inputs = prepare_prompt_inputs(
         processor=bundle.processor,
         image_path=original_out,
@@ -170,7 +221,7 @@ def run_probe(
     masked_prompt_inputs = prepare_prompt_inputs(
         processor=bundle.processor,
         image_path=masked_out,
-        prompt=prompt,
+        prompt=masked_prompt,
         device=bundle.device,
         min_pixels=min_pixels,
         max_pixels=max_pixels,
@@ -188,16 +239,6 @@ def run_probe(
         top_p=top_p,
     )
 
-    masked_generated_token_ids, masked_generated_text = generate_from_prompt(
-        model=bundle.model,
-        tokenizer=bundle.tokenizer,
-        prompt_inputs=masked_prompt_inputs,
-        max_new_tokens=max_new_tokens,
-        do_sample=do_sample,
-        temperature=temperature,
-        top_p=top_p,
-    )
-
     original_response = _build_response_probe(
         label="original_image_response",
         source_image="original",
@@ -209,17 +250,29 @@ def run_probe(
         masked_prompt_inputs=masked_prompt_inputs,
         group_tokens=group_tokens,
     )
-    masked_response = _build_response_probe(
-        label="masked_image_response",
-        source_image="masked",
-        generated_text=masked_generated_text,
-        generated_token_ids=masked_generated_token_ids,
-        tokenizer=bundle.tokenizer,
-        model=bundle.model,
-        original_prompt_inputs=original_prompt_inputs,
-        masked_prompt_inputs=masked_prompt_inputs,
-        group_tokens=group_tokens,
-    )
+
+    masked_response = None
+    if not skip_masked_generation:
+        masked_generated_token_ids, masked_generated_text = generate_from_prompt(
+            model=bundle.model,
+            tokenizer=bundle.tokenizer,
+            prompt_inputs=masked_prompt_inputs,
+            max_new_tokens=max_new_tokens,
+            do_sample=do_sample,
+            temperature=temperature,
+            top_p=top_p,
+        )
+        masked_response = _build_response_probe(
+            label="masked_image_response",
+            source_image="masked",
+            generated_text=masked_generated_text,
+            generated_token_ids=masked_generated_token_ids,
+            tokenizer=bundle.tokenizer,
+            model=bundle.model,
+            original_prompt_inputs=original_prompt_inputs,
+            masked_prompt_inputs=masked_prompt_inputs,
+            group_tokens=group_tokens,
+        )
 
     return ProbeResult(
         model_id=model_id,
@@ -229,7 +282,37 @@ def run_probe(
         original_image_path=original_out,
         masked_image_path=masked_out,
         mask_metadata=mask_metadata.to_dict(),
+        masked_condition_label=masked_condition_label,
+        privileged_info_metadata=privileged_info_metadata,
     )
+
+
+def _load_privileged_info(
+    path: str | Path,
+    *,
+    output_root: Path,
+) -> tuple[Path, str]:
+    info_path = Path(path).expanduser()
+    if not info_path.is_absolute():
+        info_path = output_root / info_path
+    info_path = info_path.resolve()
+    if not info_path.exists():
+        raise FileNotFoundError(f"privileged info file not found: {info_path}")
+    return info_path, info_path.read_text(encoding="utf-8")
+
+
+def _format_privileged_prompt(
+    *,
+    prompt: str,
+    privileged_info: str,
+    template: str,
+) -> str:
+    try:
+        return template.format(prompt=prompt, privileged_info=privileged_info)
+    except KeyError as error:
+        raise ValueError(
+            "privileged info template must contain only {prompt} and {privileged_info}"
+        ) from error
 
 
 def _build_response_probe(

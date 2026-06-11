@@ -95,7 +95,13 @@ def write_scores_json(path: str | Path, payload: dict[str, object]) -> Path:
     return out_path
 
 
-def write_probability_plot(path: str | Path, scores: list["TokenScore"]) -> Path:
+def write_probability_plot(
+    path: str | Path,
+    scores: list["TokenScore"],
+    *,
+    original_label: str = "original image",
+    masked_label: str = "masked image",
+) -> Path:
     out_path = Path(path)
     if not scores:
         raise ValueError("cannot plot empty token scores")
@@ -106,8 +112,8 @@ def write_probability_plot(path: str | Path, scores: list["TokenScore"]) -> Path
 
     width = max(10.0, min(28.0, len(scores) * 0.28))
     fig, ax = plt.subplots(figsize=(width, 5.5), constrained_layout=True)
-    ax.plot(x, p_original, marker="o", markersize=3, linewidth=1.6, label="original image")
-    ax.plot(x, p_masked, marker="o", markersize=3, linewidth=1.6, label="masked image")
+    ax.plot(x, p_original, marker="o", markersize=3, linewidth=1.6, label=original_label)
+    ax.plot(x, p_masked, marker="o", markersize=3, linewidth=1.6, label=masked_label)
     ax.fill_between(x, p_original, p_masked, alpha=0.12)
 
     tick_stride = max(1, len(scores) // 40)
@@ -116,7 +122,7 @@ def write_probability_plot(path: str | Path, scores: list["TokenScore"]) -> Path
     ax.set_ylim(-0.02, 1.02)
     ax.set_xlabel("generated token")
     ax.set_ylabel("teacher-forced probability")
-    ax.set_title("Per-token probability under original vs randomly masked image")
+    ax.set_title(f"Per-token probability: {original_label} vs {masked_label}")
     ax.grid(axis="y", alpha=0.25)
     ax.legend()
 
@@ -133,6 +139,8 @@ def write_word_html_report(
     generated_text: str,
     scores: list["WordScore"],
     metadata: dict[str, object],
+    original_condition_label: str = "Original Image",
+    masked_condition_label: str = "Masked Image",
 ) -> Path:
     out_path = Path(path)
     rows = "\n".join(_word_table_row(score) for score in scores)
@@ -247,12 +255,12 @@ def write_word_html_report(
   </section>
 
   <section class="panel">
-    <h2>Original Image Word/Unit Scores</h2>
+    <h2>{html.escape(original_condition_label.title())} Word/Unit Scores</h2>
     <div class="strip">{original_strip}</div>
   </section>
 
   <section class="panel">
-    <h2>Masked Image Word/Unit Scores</h2>
+    <h2>{html.escape(masked_condition_label.title())} Word/Unit Scores</h2>
     <div class="strip">{masked_strip}</div>
   </section>
 
@@ -304,6 +312,8 @@ def write_html_report(
     generated_text: str,
     scores: list["TokenScore"],
     metadata: dict[str, object],
+    original_condition_label: str = "Original Image",
+    masked_condition_label: str = "Masked Image",
 ) -> Path:
     out_path = Path(path)
     token_rows = "\n".join(_table_row(score) for score in scores)
@@ -418,12 +428,12 @@ def write_html_report(
   </section>
 
   <section class="panel">
-    <h2>Original Image Token Probabilities</h2>
+    <h2>{html.escape(original_condition_label.title())} Token Probabilities</h2>
     <div class="strip">{original_strip}</div>
   </section>
 
   <section class="panel">
-    <h2>Masked Image Token Probabilities</h2>
+    <h2>{html.escape(masked_condition_label.title())} Token Probabilities</h2>
     <div class="strip">{masked_strip}</div>
   </section>
 

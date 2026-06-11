@@ -90,6 +90,38 @@ For a larger model, pass another checkpoint:
 qwen-mm-token-probe --model-id Qwen/Qwen3.5-9B ...
 ```
 
+## Privileged GT Probe
+
+If you want to test whether the original-image response is still likely when the
+image is blank but a ground-truth answer is provided as privileged information,
+put that answer at `GT.txt` inside the output directory and pass
+`--privileged-info-file GT.txt`. The GT text is appended only to the
+masked/degraded-image prompt; it is not treated as the response to score.
+
+```bash
+qwen-mm-token-probe \
+  --model-id /home/ma-user/work/share_base_models/Infinity-Parser2/Infinity-Parser2-Flash \
+  --image /absolute/path/to/image.png \
+  --prompt "$PDF_PROMPT" \
+  --output-dir outputs/qwen_blank_with_gt \
+  --dtype bfloat16 \
+  --trust-remote-code \
+  --min-pixels 2048 \
+  --max-pixels 16777216 \
+  --image-patch-size 16 \
+  --mask-strategy patch \
+  --mask-effect replace \
+  --mask-fill white \
+  --mask-ratio 1.0 \
+  --mask-opacity 1.0 \
+  --privileged-info-file GT.txt \
+  --skip-masked-generation
+```
+
+In this mode, `token_probabilities.csv` compares the original-image response
+under the clean image (`p_original`) against the same response under the blank
+image plus privileged GT (`p_masked`).
+
 ## Repeated Unique Inference
 
 To repeatedly sample one image and prompt, saving only responses that have not
@@ -126,18 +158,18 @@ The output directory contains:
 - `original.png`: normalized RGB input image
 - `masked.png`: masked or degraded image used for the second forward pass
 - `generated.txt`: answer generated from the original image
-- `masked_generated.txt`: answer generated from the masked/degraded image
+- `masked_generated.txt`: answer generated from the masked/degraded image, unless `--skip-masked-generation` is used
 - `token_probabilities.csv`: token probabilities for the original-image response under both image conditions
 - `word_probabilities.csv`: word/text-unit scores for the original-image response
-- `masked_response_token_probabilities.csv`: token probabilities for the masked-image response under both image conditions
-- `masked_response_word_probabilities.csv`: word/text-unit scores for the masked-image response
+- `masked_response_token_probabilities.csv`: token probabilities for the masked-image response under both image conditions, unless `--skip-masked-generation` is used
+- `masked_response_word_probabilities.csv`: word/text-unit scores for the masked-image response, unless `--skip-masked-generation` is used
 - `token_probabilities.json`: structured run metadata and both response score sets
 - `token_probabilities.png`: compact probability comparison chart for the original-image response
-- `masked_response_token_probabilities.png`: compact probability comparison chart for the masked-image response
+- `masked_response_token_probabilities.png`: compact probability comparison chart for the masked-image response, unless `--skip-masked-generation` is used
 - `token_probabilities.html`: readable token table for the original-image response
-- `masked_response_token_probabilities.html`: readable token table for the masked-image response
+- `masked_response_token_probabilities.html`: readable token table for the masked-image response, unless `--skip-masked-generation` is used
 - `word_probabilities.html`: readable word/text-unit table for the original-image response
-- `masked_response_word_probabilities.html`: readable word/text-unit table for the masked-image response
+- `masked_response_word_probabilities.html`: readable word/text-unit table for the masked-image response, unless `--skip-masked-generation` is used
 
 ## Method
 
