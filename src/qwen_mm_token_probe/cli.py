@@ -61,8 +61,8 @@ def build_parser() -> argparse.ArgumentParser:
         default=None,
         help=(
             "Optional text file used only for the masked/degraded-image scoring "
-            "condition. Relative paths are resolved against --output-dir, so "
-            "GT.txt means <output-dir>/GT.txt."
+            "condition. Absolute paths are used as-is; relative paths are resolved "
+            "against the current working directory."
         ),
     )
     analysis.add_argument(

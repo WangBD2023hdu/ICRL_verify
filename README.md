@@ -94,9 +94,11 @@ qwen-mm-token-probe --model-id Qwen/Qwen3.5-9B ...
 
 If you want to test whether the original-image response is still likely when the
 image is blank but a ground-truth answer is provided as privileged information,
-put that answer at `GT.txt` inside the output directory and pass
-`--privileged-info-file GT.txt`. The GT text is appended only to the
-masked/degraded-image prompt; it is not treated as the response to score.
+put the full privileged prompt text in a file and pass it with
+`--privileged-info-file`. Absolute paths are used as-is; relative paths are
+resolved against the current working directory. The file contents are appended
+directly to the masked/degraded-image prompt without any built-in wrapper text,
+and are not treated as the response to score.
 
 ```bash
 qwen-mm-token-probe \
@@ -114,7 +116,7 @@ qwen-mm-token-probe \
   --mask-fill white \
   --mask-ratio 1.0 \
   --mask-opacity 1.0 \
-  --privileged-info-file GT.txt \
+  --privileged-info-file /absolute/path/to/GT.txt \
   --skip-masked-generation
 ```
 

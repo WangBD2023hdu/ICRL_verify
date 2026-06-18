@@ -16,17 +16,6 @@ from .image_mask import MaskConfig, apply_image_mask, load_rgb_image, save_rgb_i
 from .token_grouping import WordScore, group_token_scores
 
 
-DEFAULT_PRIVILEGED_INFO_TEMPLATE = """{prompt}
-
-[Privileged information]
-The following ground-truth answer is provided as privileged information for probability probing. Use it as reference information for the answer.
-
-{privileged_info}
-
-[End privileged information]
-"""
-
-
 @dataclass(frozen=True)
 class TokenScore:
     index: int
@@ -193,7 +182,6 @@ def run_probe(
     image_patch_size: int = 16,
     enable_thinking: bool = False,
     privileged_info_file: str | Path | None = None,
-    privileged_info_template: str = DEFAULT_PRIVILEGED_INFO_TEMPLATE,
     skip_masked_generation: bool = False,
 ) -> ProbeResult:
     output_root = Path(output_dir).expanduser().resolve()
@@ -216,14 +204,10 @@ def run_probe(
     masked_condition_label = "masked image"
     privileged_info_metadata = None
     if privileged_info_file is not None:
-        privileged_info_path, privileged_info = _load_privileged_info(
-            privileged_info_file,
-            output_root=output_root,
-        )
-        masked_prompt = _format_privileged_prompt(
+        privileged_info_path, privileged_info = _load_privileged_info(privileged_info_file)
+        masked_prompt = _append_privileged_info(
             prompt=prompt,
             privileged_info=privileged_info,
-            template=privileged_info_template,
         )
         masked_condition_label = "masked image + privileged info"
         privileged_info_metadata = {
@@ -314,30 +298,20 @@ def run_probe(
 
 def _load_privileged_info(
     path: str | Path,
-    *,
-    output_root: Path,
 ) -> tuple[Path, str]:
     info_path = Path(path).expanduser()
-    if not info_path.is_absolute():
-        info_path = output_root / info_path
     info_path = info_path.resolve()
     if not info_path.exists():
         raise FileNotFoundError(f"privileged info file not found: {info_path}")
     return info_path, info_path.read_text(encoding="utf-8")
 
 
-def _format_privileged_prompt(
+def _append_privileged_info(
     *,
     prompt: str,
     privileged_info: str,
-    template: str,
 ) -> str:
-    try:
-        return template.format(prompt=prompt, privileged_info=privileged_info)
-    except KeyError as error:
-        raise ValueError(
-            "privileged info template must contain only {prompt} and {privileged_info}"
-        ) from error
+    return f"{prompt}\n\n{privileged_info}"
 
 
 def _build_response_probe(
