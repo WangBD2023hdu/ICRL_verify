@@ -10,7 +10,7 @@ from .hf_qwen import (
     generate_from_prompt,
     load_model_bundle,
     prepare_prompt_inputs,
-    token_probabilities_for_generated_ids,
+    token_statistics_for_generated_ids,
 )
 from .image_mask import MaskConfig, apply_image_mask, load_rgb_image, save_rgb_image
 from .token_grouping import WordScore, group_token_scores
@@ -37,6 +37,16 @@ class TokenScore:
     p_masked: float
     logp_original: float
     logp_masked: float
+    top_token_id_original: int
+    top_token_original: str
+    top_raw_token_original: str
+    top_p_original: float
+    top_logp_original: float
+    top_token_id_masked: int
+    top_token_masked: str
+    top_raw_token_masked: str
+    top_p_masked: float
+    top_logp_masked: float
 
     @property
     def delta_p(self) -> float:
@@ -47,6 +57,18 @@ class TokenScore:
         return self.logp_original - self.logp_masked
 
     @property
+    def top_token_changed(self) -> bool:
+        return self.top_token_id_original != self.top_token_id_masked
+
+    @property
+    def target_is_top_original(self) -> bool:
+        return self.token_id == self.top_token_id_original
+
+    @property
+    def target_is_top_masked(self) -> bool:
+        return self.token_id == self.top_token_id_masked
+
+    @property
     def compact_token(self) -> str:
         token = self.token
         token = token.replace(" ", "·")
@@ -54,10 +76,13 @@ class TokenScore:
             return token[:11] + "…"
         return token
 
-    def to_dict(self) -> dict[str, float | int | str]:
+    def to_dict(self) -> dict[str, bool | float | int | str]:
         data = asdict(self)
         data["delta_p"] = self.delta_p
         data["delta_logp"] = self.delta_logp
+        data["top_token_changed"] = self.top_token_changed
+        data["target_is_top_original"] = self.target_is_top_original
+        data["target_is_top_masked"] = self.target_is_top_masked
         return data
 
 
@@ -330,12 +355,12 @@ def _build_response_probe(
     if not generated_token_ids:
         raise RuntimeError(f"{label} generated no scoreable text tokens")
 
-    p_original, logp_original = token_probabilities_for_generated_ids(
+    original_stats = token_statistics_for_generated_ids(
         model=model,
         prompt_inputs=original_prompt_inputs,
         generated_token_ids=generated_token_ids,
     )
-    p_masked, logp_masked = token_probabilities_for_generated_ids(
+    masked_stats = token_statistics_for_generated_ids(
         model=model,
         prompt_inputs=masked_prompt_inputs,
         generated_token_ids=generated_token_ids,
@@ -347,10 +372,26 @@ def _build_response_probe(
             token_id=token_id,
             token=display_token(tokenizer, token_id),
             raw_token=decode_token_piece(tokenizer, token_id),
-            p_original=float(p_original[i]),
-            p_masked=float(p_masked[i]),
-            logp_original=float(logp_original[i]),
-            logp_masked=float(logp_masked[i]),
+            p_original=float(original_stats.probabilities[i]),
+            p_masked=float(masked_stats.probabilities[i]),
+            logp_original=float(original_stats.log_probabilities[i]),
+            logp_masked=float(masked_stats.log_probabilities[i]),
+            top_token_id_original=original_stats.top_token_ids[i],
+            top_token_original=display_token(tokenizer, original_stats.top_token_ids[i]),
+            top_raw_token_original=decode_token_piece(
+                tokenizer,
+                original_stats.top_token_ids[i],
+            ),
+            top_p_original=float(original_stats.top_probabilities[i]),
+            top_logp_original=float(original_stats.top_log_probabilities[i]),
+            top_token_id_masked=masked_stats.top_token_ids[i],
+            top_token_masked=display_token(tokenizer, masked_stats.top_token_ids[i]),
+            top_raw_token_masked=decode_token_piece(
+                tokenizer,
+                masked_stats.top_token_ids[i],
+            ),
+            top_p_masked=float(masked_stats.top_probabilities[i]),
+            top_logp_masked=float(masked_stats.top_log_probabilities[i]),
         )
         for i, token_id in enumerate(generated_token_ids)
     ]

@@ -36,6 +36,19 @@ def write_scores_csv(path: str | Path, scores: Iterable["TokenScore"]) -> Path:
                 "logp_original",
                 "logp_masked",
                 "delta_logp",
+                "top_token_id_original",
+                "top_token_original",
+                "top_raw_token_original",
+                "top_p_original",
+                "top_logp_original",
+                "top_token_id_masked",
+                "top_token_masked",
+                "top_raw_token_masked",
+                "top_p_masked",
+                "top_logp_masked",
+                "top_token_changed",
+                "target_is_top_original",
+                "target_is_top_masked",
             ],
         )
         writer.writeheader()
@@ -451,6 +464,13 @@ def write_html_report(
         <th>logp original</th>
         <th>logp masked</th>
         <th>delta logp</th>
+        <th>top token original</th>
+        <th>top p original</th>
+        <th>top token masked</th>
+        <th>top p masked</th>
+        <th>top changed</th>
+        <th>target top original</th>
+        <th>target top masked</th>
       </tr>
     </thead>
     <tbody>
@@ -482,6 +502,13 @@ def _table_row(score: "TokenScore") -> str:
   <td>{score.logp_original:.6f}</td>
   <td>{score.logp_masked:.6f}</td>
   <td>{score.delta_logp:+.6f}</td>
+  <td class="token">{score.top_token_id_original}: {html.escape(score.top_token_original)}</td>
+  <td>{score.top_p_original:.6f}</td>
+  <td class="token">{score.top_token_id_masked}: {html.escape(score.top_token_masked)}</td>
+  <td>{score.top_p_masked:.6f}</td>
+  <td>{score.top_token_changed}</td>
+  <td>{score.target_is_top_original}</td>
+  <td>{score.target_is_top_masked}</td>
 </tr>"""
 
 

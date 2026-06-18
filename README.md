@@ -122,6 +122,11 @@ In this mode, `token_probabilities.csv` compares the original-image response
 under the clean image (`p_original`) against the same response under the blank
 image plus privileged GT (`p_masked`).
 
+The same CSV also includes `top_token_*` columns. These show the highest
+probability token at each response position under the clean-image condition and
+under the blank-image-plus-GT condition, so `top_token_changed=true` marks where
+the privileged information changes the model's most likely next token.
+
 ## Repeated Unique Inference
 
 To repeatedly sample one image and prompt, saving only responses that have not

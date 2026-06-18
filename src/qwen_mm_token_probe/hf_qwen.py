@@ -19,6 +19,15 @@ class ModelBundle:
     device: torch.device
 
 
+@dataclass(frozen=True)
+class GeneratedTokenStats:
+    probabilities: list[float]
+    log_probabilities: list[float]
+    top_token_ids: list[int]
+    top_probabilities: list[float]
+    top_log_probabilities: list[float]
+
+
 def load_model_bundle(
     model_id: str,
     *,
@@ -431,6 +440,20 @@ def token_probabilities_for_generated_ids(
     prompt_inputs: dict[str, Any],
     generated_token_ids: list[int],
 ) -> tuple[list[float], list[float]]:
+    stats = token_statistics_for_generated_ids(
+        model=model,
+        prompt_inputs=prompt_inputs,
+        generated_token_ids=generated_token_ids,
+    )
+    return stats.probabilities, stats.log_probabilities
+
+
+def token_statistics_for_generated_ids(
+    *,
+    model: torch.nn.Module,
+    prompt_inputs: dict[str, Any],
+    generated_token_ids: list[int],
+) -> GeneratedTokenStats:
     prompt_len = int(prompt_inputs["input_ids"].shape[-1])
     scoring_inputs = append_generated_tokens(prompt_inputs, generated_token_ids)
     target_ids = torch.tensor(generated_token_ids, device=scoring_inputs["input_ids"].device)
@@ -442,10 +465,15 @@ def token_probabilities_for_generated_ids(
     log_probs = torch.log_softmax(logits.float(), dim=-1)
     selected_log_probs = log_probs.gather(1, target_ids[:, None]).squeeze(1)
     selected_probs = selected_log_probs.exp()
+    top_log_probs, top_token_ids = torch.max(log_probs, dim=-1)
+    top_probs = top_log_probs.exp()
 
-    return (
-        selected_probs.detach().cpu().tolist(),
-        selected_log_probs.detach().cpu().tolist(),
+    return GeneratedTokenStats(
+        probabilities=selected_probs.detach().cpu().tolist(),
+        log_probabilities=selected_log_probs.detach().cpu().tolist(),
+        top_token_ids=[int(token_id) for token_id in top_token_ids.detach().cpu().tolist()],
+        top_probabilities=top_probs.detach().cpu().tolist(),
+        top_log_probabilities=top_log_probs.detach().cpu().tolist(),
     )
 
 
