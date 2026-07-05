@@ -12,7 +12,13 @@ from .hf_qwen import (
     prepare_prompt_inputs,
     token_statistics_for_generated_ids,
 )
-from .image_mask import MaskConfig, apply_image_mask, load_rgb_image, save_rgb_image
+from .image_mask import (
+    MaskConfig,
+    apply_image_mask,
+    load_rgb_image,
+    resize_rgb_image,
+    save_rgb_image,
+)
 from .token_grouping import WordScore, group_token_scores
 
 
@@ -104,6 +110,7 @@ class ProbeResult:
     original_image_path: Path
     masked_image_path: Path
     mask_metadata: dict[str, object]
+    condition_image_metadata: dict[str, object]
     original_condition_label: str = "original image"
     masked_condition_label: str = "masked image"
     privileged_info_metadata: dict[str, object] | None = None
@@ -140,6 +147,7 @@ class ProbeResult:
             "masked_condition_label": self.masked_condition_label,
             "privileged_info": self.privileged_info_metadata,
             "mask_metadata": self.mask_metadata,
+            "condition_image_metadata": self.condition_image_metadata,
             "responses": responses,
             "generated_text": self.original_response.generated_text,
             "generated_token_ids": self.original_response.generated_token_ids,
@@ -182,6 +190,7 @@ def run_probe(
     image_patch_size: int = 16,
     enable_thinking: bool = False,
     privileged_info_file: str | Path | None = None,
+    condition_image_scale: float = 1.0,
     skip_masked_generation: bool = False,
 ) -> ProbeResult:
     output_root = Path(output_dir).expanduser().resolve()
@@ -189,9 +198,18 @@ def run_probe(
 
     original_image = load_rgb_image(image_path)
     masked_image, mask_metadata = apply_image_mask(original_image, mask_config)
+    condition_image = resize_rgb_image(masked_image, condition_image_scale)
 
     original_out = save_rgb_image(original_image, output_root / "original.png")
-    masked_out = save_rgb_image(masked_image, output_root / "masked.png")
+    masked_out = save_rgb_image(condition_image, output_root / "masked.png")
+    condition_image_metadata = {
+        "scale": condition_image_scale,
+        "pre_scale_width": masked_image.size[0],
+        "pre_scale_height": masked_image.size[1],
+        "output_width": condition_image.size[0],
+        "output_height": condition_image.size[1],
+        "path": str(masked_out),
+    }
 
     bundle = load_model_bundle(
         model_id,
@@ -201,7 +219,11 @@ def run_probe(
     )
 
     masked_prompt = prompt
-    masked_condition_label = "masked image"
+    masked_condition_label = _condition_label(
+        mask_config=mask_config,
+        condition_image_scale=condition_image_scale,
+        has_privileged_info=False,
+    )
     privileged_info_metadata = None
     if privileged_info_file is not None:
         privileged_info_path, privileged_info = _load_privileged_info(privileged_info_file)
@@ -209,7 +231,11 @@ def run_probe(
             prompt=prompt,
             privileged_info=privileged_info,
         )
-        masked_condition_label = "masked image + privileged info"
+        masked_condition_label = _condition_label(
+            mask_config=mask_config,
+            condition_image_scale=condition_image_scale,
+            has_privileged_info=True,
+        )
         privileged_info_metadata = {
             "path": str(privileged_info_path),
             "num_chars": len(privileged_info),
@@ -291,9 +317,31 @@ def run_probe(
         original_image_path=original_out,
         masked_image_path=masked_out,
         mask_metadata=mask_metadata.to_dict(),
+        condition_image_metadata=condition_image_metadata,
         masked_condition_label=masked_condition_label,
         privileged_info_metadata=privileged_info_metadata,
     )
+
+
+def _condition_label(
+    *,
+    mask_config: MaskConfig,
+    condition_image_scale: float,
+    has_privileged_info: bool,
+) -> str:
+    scale_changed = condition_image_scale != 1.0
+    if mask_config.ratio > 0.0 and scale_changed:
+        label = f"masked image + scaled x{condition_image_scale:g}"
+    elif mask_config.ratio > 0.0:
+        label = "masked image"
+    elif scale_changed:
+        label = f"scaled image x{condition_image_scale:g}"
+    else:
+        label = "original image copy"
+
+    if has_privileged_info:
+        label += " + privileged info"
+    return label
 
 
 def _load_privileged_info(

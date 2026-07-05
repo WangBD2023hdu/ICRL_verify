@@ -100,6 +100,15 @@ def build_parser() -> argparse.ArgumentParser:
         default=1.0,
         help="Blend strength for the degradation. 1.0 is full strength, 0.0 is no change.",
     )
+    masking.add_argument(
+        "--condition-image-scale",
+        type=float,
+        default=1.0,
+        help=(
+            "Scale the comparison image before the second scoring/generation pass. "
+            "For example, 1.5 enlarges width and height by 50%%."
+        ),
+    )
     masking.add_argument("--blur-radius", type=float, default=1.2)
     masking.add_argument("--noise-std", type=float, default=10.0)
     masking.add_argument(
@@ -178,6 +187,7 @@ def main() -> None:
         image_patch_size=args.image_patch_size,
         enable_thinking=args.enable_thinking,
         privileged_info_file=args.privileged_info_file,
+        condition_image_scale=args.condition_image_scale,
         skip_masked_generation=args.skip_masked_generation,
     )
 
@@ -203,6 +213,7 @@ def main() -> None:
             "masked_condition_label": result.masked_condition_label,
             "privileged_info": result.privileged_info_metadata,
             "mask_metadata": result.mask_metadata,
+            "condition_image_metadata": result.condition_image_metadata,
             "num_generated_tokens": len(response.generated_token_ids),
             "num_word_units": len(response.word_scores),
             "score_meaning": (

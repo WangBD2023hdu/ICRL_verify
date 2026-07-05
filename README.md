@@ -90,6 +90,34 @@ For a larger model, pass another checkpoint:
 qwen-mm-token-probe --model-id Qwen/Qwen3.5-9B ...
 ```
 
+## Scaled Image Probe
+
+To generate from the original image, then score the same response under an
+enlarged copy of the image, disable masking and set
+`--condition-image-scale`. For example, `1.5` scales both width and height by
+50%.
+
+```bash
+qwen-mm-token-probe \
+  --model-id /home/ma-user/work/share_base_models/Infinity-Parser2/Infinity-Parser2-Flash \
+  --image /absolute/path/to/image.png \
+  --prompt "$PDF_PROMPT" \
+  --output-dir outputs/qwen_scaled_1p5 \
+  --dtype bfloat16 \
+  --trust-remote-code \
+  --min-pixels 2048 \
+  --max-pixels 16777216 \
+  --image-patch-size 16 \
+  --mask-ratio 0 \
+  --condition-image-scale 1.5 \
+  --skip-masked-generation
+```
+
+In this mode, `p_original` scores the original response under the original
+image, while `p_masked` scores the same response under the scaled image. The
+scaled comparison image is still saved as `masked.png` for backward-compatible
+output naming.
+
 ## Privileged GT Probe
 
 If you want to test whether the original-image response is still likely when the

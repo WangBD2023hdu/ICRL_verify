@@ -127,6 +127,22 @@ def save_rgb_image(image: Image.Image, path: str | Path) -> Path:
     return out_path
 
 
+def resize_rgb_image(image: Image.Image, scale: float) -> Image.Image:
+    if scale <= 0:
+        raise ValueError(f"image scale must be positive, got {scale}")
+    rgb_image = image.convert("RGB")
+    if scale == 1.0:
+        return rgb_image.copy()
+
+    width, height = rgb_image.size
+    new_size = (
+        max(1, int(round(width * scale))),
+        max(1, int(round(height * scale))),
+    )
+    resampling = getattr(Image, "Resampling", Image).LANCZOS
+    return rgb_image.resize(new_size, resample=resampling)
+
+
 def apply_image_mask(
     image: Image.Image,
     config: MaskConfig,
