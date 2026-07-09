@@ -90,6 +90,33 @@ For a larger model, pass another checkpoint:
 qwen-mm-token-probe --model-id Qwen/Qwen3.5-9B ...
 ```
 
+## Fixed Response Scoring
+
+To inspect the probability distribution of an existing parsing result, save the
+text to a file and pass it with `--score-response-file`. The model will not
+generate a new response; it will teacher-force the file contents as the
+assistant output and report token probabilities, top-1 tokens, and word-level
+scores.
+
+```bash
+qwen-mm-token-probe \
+  --model-id /home/ma-user/work/share_base_models/Infinity-Parser2/Infinity-Parser2-Flash \
+  --image /absolute/path/to/image.png \
+  --prompt "$PDF_PROMPT" \
+  --output-dir outputs/qwen_score_response \
+  --dtype bfloat16 \
+  --trust-remote-code \
+  --min-pixels 2048 \
+  --max-pixels 16777216 \
+  --image-patch-size 16 \
+  --mask-ratio 0 \
+  --score-response-file /absolute/path/to/response.txt
+```
+
+In this mode, `generated.txt` is a copy of the scored text. Use
+`token_probabilities.html` or `token_probabilities.csv` to inspect low-probability
+tokens and positions where `top_token_changed=true`.
+
 ## Scaled Image Probe
 
 To generate from the original image, then score the same response under an

@@ -66,6 +66,14 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     analysis.add_argument(
+        "--score-response-file",
+        default=None,
+        help=(
+            "Score this fixed response text instead of generating a response. "
+            "The file contents are treated as assistant output tokens."
+        ),
+    )
+    analysis.add_argument(
         "--skip-masked-generation",
         action="store_true",
         help=(
@@ -187,6 +195,7 @@ def main() -> None:
         image_patch_size=args.image_patch_size,
         enable_thinking=args.enable_thinking,
         privileged_info_file=args.privileged_info_file,
+        score_response_file=args.score_response_file,
         condition_image_scale=args.condition_image_scale,
         skip_masked_generation=args.skip_masked_generation,
     )
@@ -212,6 +221,7 @@ def main() -> None:
             "original_condition_label": result.original_condition_label,
             "masked_condition_label": result.masked_condition_label,
             "privileged_info": result.privileged_info_metadata,
+            "fixed_response": result.fixed_response_metadata,
             "mask_metadata": result.mask_metadata,
             "condition_image_metadata": result.condition_image_metadata,
             "num_generated_tokens": len(response.generated_token_ids),

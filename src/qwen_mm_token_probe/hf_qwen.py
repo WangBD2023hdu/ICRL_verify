@@ -379,6 +379,21 @@ def decode_generated_tokens(
     )
 
 
+def encode_generated_text(
+    tokenizer: PreTrainedTokenizerBase,
+    text: str,
+) -> list[int]:
+    try:
+        token_ids = tokenizer.encode(text, add_special_tokens=False)
+    except TypeError:
+        encoded = tokenizer(text, add_special_tokens=False)
+        token_ids = encoded["input_ids"]
+
+    if hasattr(token_ids, "tolist"):
+        token_ids = token_ids.tolist()
+    return [int(token_id) for token_id in token_ids]
+
+
 def trim_tail_special_tokens(
     token_ids: list[int],
     tokenizer: PreTrainedTokenizerBase,

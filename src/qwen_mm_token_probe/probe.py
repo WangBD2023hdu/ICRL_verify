@@ -7,6 +7,7 @@ from pathlib import Path
 from .hf_qwen import (
     decode_token_piece,
     display_token,
+    encode_generated_text,
     generate_from_prompt,
     load_model_bundle,
     prepare_prompt_inputs,
@@ -114,6 +115,7 @@ class ProbeResult:
     original_condition_label: str = "original image"
     masked_condition_label: str = "masked image"
     privileged_info_metadata: dict[str, object] | None = None
+    fixed_response_metadata: dict[str, object] | None = None
 
     @property
     def generated_text(self) -> str:
@@ -146,6 +148,7 @@ class ProbeResult:
             "original_condition_label": self.original_condition_label,
             "masked_condition_label": self.masked_condition_label,
             "privileged_info": self.privileged_info_metadata,
+            "fixed_response": self.fixed_response_metadata,
             "mask_metadata": self.mask_metadata,
             "condition_image_metadata": self.condition_image_metadata,
             "responses": responses,
@@ -190,6 +193,7 @@ def run_probe(
     image_patch_size: int = 16,
     enable_thinking: bool = False,
     privileged_info_file: str | Path | None = None,
+    score_response_file: str | Path | None = None,
     condition_image_scale: float = 1.0,
     skip_masked_generation: bool = False,
 ) -> ProbeResult:
@@ -264,19 +268,40 @@ def run_probe(
         enable_thinking=enable_thinking,
     )
 
-    original_generated_token_ids, original_generated_text = generate_from_prompt(
-        model=bundle.model,
-        tokenizer=bundle.tokenizer,
-        prompt_inputs=original_prompt_inputs,
-        max_new_tokens=max_new_tokens,
-        do_sample=do_sample,
-        temperature=temperature,
-        top_p=top_p,
-    )
+    fixed_response_metadata = None
+    original_response_label = "original_image_response"
+    original_response_source = "original"
+    if score_response_file is not None:
+        response_path, original_generated_text = _load_text_file(score_response_file)
+        original_generated_token_ids = encode_generated_text(
+            bundle.tokenizer,
+            original_generated_text,
+        )
+        if not original_generated_token_ids:
+            raise RuntimeError(f"score response file has no scoreable text tokens: {response_path}")
+        original_response_label = "score_response_file"
+        original_response_source = f"response_file:{response_path}"
+        fixed_response_metadata = {
+            "path": str(response_path),
+            "num_chars": len(original_generated_text),
+            "num_tokens": len(original_generated_token_ids),
+            "sha256": hashlib.sha256(original_generated_text.encode("utf-8")).hexdigest(),
+            "applied_to": "original_response",
+        }
+    else:
+        original_generated_token_ids, original_generated_text = generate_from_prompt(
+            model=bundle.model,
+            tokenizer=bundle.tokenizer,
+            prompt_inputs=original_prompt_inputs,
+            max_new_tokens=max_new_tokens,
+            do_sample=do_sample,
+            temperature=temperature,
+            top_p=top_p,
+        )
 
     original_response = _build_response_probe(
-        label="original_image_response",
-        source_image="original",
+        label=original_response_label,
+        source_image=original_response_source,
         generated_text=original_generated_text,
         generated_token_ids=original_generated_token_ids,
         tokenizer=bundle.tokenizer,
@@ -287,7 +312,7 @@ def run_probe(
     )
 
     masked_response = None
-    if not skip_masked_generation:
+    if score_response_file is None and not skip_masked_generation:
         masked_generated_token_ids, masked_generated_text = generate_from_prompt(
             model=bundle.model,
             tokenizer=bundle.tokenizer,
@@ -320,6 +345,7 @@ def run_probe(
         condition_image_metadata=condition_image_metadata,
         masked_condition_label=masked_condition_label,
         privileged_info_metadata=privileged_info_metadata,
+        fixed_response_metadata=fixed_response_metadata,
     )
 
 
@@ -347,10 +373,16 @@ def _condition_label(
 def _load_privileged_info(
     path: str | Path,
 ) -> tuple[Path, str]:
+    return _load_text_file(path)
+
+
+def _load_text_file(
+    path: str | Path,
+) -> tuple[Path, str]:
     info_path = Path(path).expanduser()
     info_path = info_path.resolve()
     if not info_path.exists():
-        raise FileNotFoundError(f"privileged info file not found: {info_path}")
+        raise FileNotFoundError(f"text file not found: {info_path}")
     return info_path, info_path.read_text(encoding="utf-8")
 
 
