@@ -3,9 +3,10 @@ from __future__ import annotations
 import argparse
 import os
 from pathlib import Path
+import sys
 from typing import Sequence
 
-from pdf_hallu_eval.batch import BatchConfig, run_batch
+from pdf_hallu_eval.batch import FAILED_PAGE_STATUSES, BatchConfig, run_batch
 from pdf_hallu_eval.chat_client import ChatConfig, OpenAIChatClient
 
 
@@ -71,10 +72,16 @@ def _run(args: argparse.Namespace) -> int:
 
     chat_client = None
     if not args.dry_run:
+        api_key = os.environ.get(args.api_key_env, "")
+        if not api_key:
+            print(
+                f"Warning: environment variable {args.api_key_env} is not set; using Bearer EMPTY.",
+                file=sys.stderr,
+            )
         chat_config = ChatConfig(
             model=args.model,
             base_url=args.base_url,
-            api_key=os.environ.get(args.api_key_env, ""),
+            api_key=api_key,
             temperature=args.temperature,
             max_tokens=args.max_tokens,
             timeout_s=args.timeout_s,
@@ -86,6 +93,21 @@ def _run(args: argparse.Namespace) -> int:
     result = run_batch(batch_config, chat_client=chat_client)
     print(f"Processed {result.total_pages} pages from {result.total_pdfs} PDFs.")
     print(f"Review index: {result.output_dir / 'review' / 'index.html'}")
+    failed_records = [
+        record for record in result.page_records if str(record.get("status")) in FAILED_PAGE_STATUSES
+    ]
+    if failed_records:
+        print(f"Model/render failures: {len(failed_records)} page(s).", file=sys.stderr)
+        for record in failed_records[:10]:
+            page_number = int(record.get("page_index", 0)) + 1
+            print(
+                f"  {record.get('pdf_name', record.get('pdf_id', 'unknown'))} page {page_number}: "
+                f"{record.get('status')} - {record.get('error') or 'no error detail'}",
+                file=sys.stderr,
+            )
+        if len(failed_records) > 10:
+            print(f"  ... and {len(failed_records) - 10} more failure(s).", file=sys.stderr)
+        return 1
     return 0
 
 

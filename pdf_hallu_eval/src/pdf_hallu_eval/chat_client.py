@@ -102,7 +102,7 @@ class OpenAIChatClient:
         try:
             response = self._client.chat.completions.create(**payload)
         except Exception as exc:
-            raise ChatClientError("OpenAI chat completion request failed") from exc
+            raise ChatClientError(f"OpenAI chat completion request failed: {exc}") from exc
         return parse_chat_response(response)
 
     def _build_client(self) -> Any:

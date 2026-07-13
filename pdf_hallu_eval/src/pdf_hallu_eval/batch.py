@@ -19,6 +19,9 @@ from .report_html import write_review_site
 from .storage import OutputLayout, make_pdf_id, write_json, write_jsonl, write_text
 
 
+FAILED_PAGE_STATUSES = frozenset({"model_error", "model_empty", "render_missing"})
+
+
 class ChatClient(Protocol):
     def transcribe_image(self, image_path: Path) -> str:
         ...
@@ -181,8 +184,12 @@ def _process_page(
         model_text,
         NormalizeConfig(preserve_newlines=config.preserve_newlines),
     )
-    if status == "ok" and not normalized_reference:
-        status = "parser_empty"
+    if status == "ok":
+        if not normalized_reference:
+            status = "parser_empty"
+        elif not normalized_prediction:
+            status = "model_empty"
+            error = "Model returned an empty transcription for a non-empty parser reference."
 
     alignment = align_text(normalized_reference, normalized_prediction)
     metrics = compute_page_metrics(alignment)
@@ -243,6 +250,14 @@ def _write_pdf_summary(path: Path, records: list[dict[str, Any]]) -> None:
 def _dataset_summary(records: list[dict[str, Any]]) -> dict[str, Any]:
     summary = _summary_from_records(records)
     summary["pdfs"] = len({record.get("pdf_id") for record in records})
+    status_counts: dict[str, int] = {}
+    for record in records:
+        status = str(record.get("status", "unknown"))
+        status_counts[status] = status_counts.get(status, 0) + 1
+    summary["status_counts"] = dict(sorted(status_counts.items()))
+    summary["failed_pages"] = sum(
+        count for status, count in status_counts.items() if status in FAILED_PAGE_STATUSES
+    )
     return summary
 
 
