@@ -110,10 +110,15 @@ class OpenAIChatClient:
             from openai import OpenAI
         except ImportError as exc:
             raise ChatClientError("Install the openai package to call chat models: pip install openai") from exc
+        api_key = self.config.api_key or "EMPTY"
+        default_headers = {
+            **self.config.extra_headers,
+            "Authorization": f"Bearer {api_key}",
+        }
         return OpenAI(
-            api_key=self.config.api_key or "EMPTY",
+            api_key=api_key,
             base_url=self.config.base_url,
             timeout=self.config.timeout_s,
             max_retries=self.config.retries,
-            default_headers=self.config.extra_headers or None,
+            default_headers=default_headers,
         )

@@ -21,7 +21,11 @@ def build_parser() -> argparse.ArgumentParser:
     run.add_argument("--output-dir", required=True, type=Path)
     run.add_argument("--base-url", default="http://localhost:8000/v1")
     run.add_argument("--model", required=True)
-    run.add_argument("--api-key-env", default="OPENAI_API_KEY")
+    run.add_argument(
+        "--api-key-env",
+        default="OPENAI_API_KEY",
+        help="Environment variable containing the Bearer API key (for example, INF_API_KEY).",
+    )
     run.add_argument("--prompt", default=None)
     run.add_argument("--temperature", type=float, default=0.0)
     run.add_argument("--max-tokens", type=int, default=4096)
@@ -87,4 +91,3 @@ def _run(args: argparse.Namespace) -> int:
 
 if __name__ == "__main__":
     raise SystemExit(main())
-

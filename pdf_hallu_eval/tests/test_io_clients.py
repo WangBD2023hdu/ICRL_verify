@@ -1,9 +1,12 @@
 from __future__ import annotations
 
 import json
+import sys
 import tempfile
+import types
 from pathlib import Path
 import unittest
+from unittest.mock import patch
 
 from pdf_hallu_eval.chat_client import ChatConfig, OpenAIChatClient, build_chat_payload, parse_chat_response
 from pdf_hallu_eval.pdf_parser import PDFProcessingError, extract_text_pages
@@ -43,6 +46,28 @@ class StorageTest(unittest.TestCase):
 
 
 class ChatClientPayloadTest(unittest.TestCase):
+    def test_openai_client_sets_explicit_bearer_authorization_header(self) -> None:
+        captured_kwargs = {}
+
+        class FakeOpenAI:
+            def __init__(self, **kwargs) -> None:
+                captured_kwargs.update(kwargs)
+
+        fake_openai_module = types.SimpleNamespace(OpenAI=FakeOpenAI)
+        config = ChatConfig(
+            model="vision-model",
+            base_url="https://example.invalid/v1",
+            api_key="inf-secret",
+            extra_headers={"X-Tenant": "test-tenant"},
+        )
+
+        with patch.dict(sys.modules, {"openai": fake_openai_module}):
+            OpenAIChatClient(config)
+
+        self.assertEqual(captured_kwargs["api_key"], "inf-secret")
+        self.assertEqual(captured_kwargs["default_headers"]["Authorization"], "Bearer inf-secret")
+        self.assertEqual(captured_kwargs["default_headers"]["X-Tenant"], "test-tenant")
+
     def test_builds_openai_compatible_vision_payload(self) -> None:
         config = ChatConfig(model="vision-model", base_url="http://localhost:8000/v1", api_key="token")
 

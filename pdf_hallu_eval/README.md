@@ -72,6 +72,39 @@ messages[0].content = [
 ]
 ```
 
+### INF Bearer Authentication
+
+Set the API key in the shell. Do not put the key itself in the command, config file, or output directory:
+
+```bash
+export INF_API_KEY='your-api-key'
+```
+
+The equivalent authentication headers can be checked with curl:
+
+```bash
+curl -k https://eopjcpemcecbc8p8hgcec9ocgbpqqhep.openapi-hw.infly.cn \
+  -H "Content-Type: application/json" \
+  -H "Authorization: Bearer $INF_API_KEY"
+```
+
+`-k` is a curl-only option that disables TLS certificate verification. The evaluator keeps normal TLS verification enabled.
+
+Pass the environment variable name to the evaluator with `--api-key-env`:
+
+```bash
+pdf-hallu-eval run \
+  --pdf-dir /path/to/pdfs \
+  --output-dir outputs/inf_eval \
+  --base-url https://eopjcpemcecbc8p8hgcec9ocgbpqqhep.openapi-hw.infly.cn \
+  --model your-vision-model \
+  --api-key-env INF_API_KEY \
+  --workers 8 \
+  --resume
+```
+
+The OpenAI client automatically adds `Content-Type: application/json` and `Authorization: Bearer <INF_API_KEY>`. It treats `--base-url` as an API root and sends Chat Completions requests below that root at `chat/completions`. If the INF URL above is already the complete inference endpoint rather than an OpenAI-compatible API root, use the provider's OpenAI-compatible base URL instead.
+
 Use `--dry-run` to exercise parser/render/report generation without model calls.
 
 ## Important Options
