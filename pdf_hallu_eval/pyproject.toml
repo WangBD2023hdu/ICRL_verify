@@ -1,0 +1,24 @@
+[build-system]
+requires = ["setuptools>=69", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "pdf-hallu-eval"
+version = "0.1.0"
+description = "Batch PDF transcription hallucination evaluation with OpenAI-compatible chat models and HTML review reports."
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+    "openai>=1.0.0",
+    "pdfplumber>=0.11.0",
+    "pypdf>=5.0.0",
+]
+
+[project.optional-dependencies]
+pymupdf = ["pymupdf>=1.24.0"]
+
+[project.scripts]
+pdf-hallu-eval = "pdf_hallu_eval.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
