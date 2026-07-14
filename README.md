@@ -117,6 +117,42 @@ In this mode, `generated.txt` is a copy of the scored text. Use
 `token_probabilities.html` or `token_probabilities.csv` to inspect low-probability
 tokens and positions where `top_token_changed=true`.
 
+If you want to ignore image and prompt completely, add `--text-only-forward`.
+This scores the response as plain autoregressive text:
+
+```bash
+qwen-mm-token-probe \
+  --model-id /home/ma-user/work/share_base_models/Infinity-Parser2/Infinity-Parser2-Flash \
+  --output-dir outputs/qwen_text_only_forward \
+  --dtype bfloat16 \
+  --trust-remote-code \
+  --score-response-file /absolute/path/to/response.txt \
+  --text-only-forward
+```
+
+To first generate with the image and prompt, then compare those generated tokens
+against a second forward pass that uses only the generated text as context, use
+`--compare-text-only-forward`:
+
+```bash
+qwen-mm-token-probe \
+  --model-id /home/ma-user/work/share_base_models/Infinity-Parser2/Infinity-Parser2-Flash \
+  --image /absolute/path/to/image.png \
+  --prompt "$PDF_PROMPT" \
+  --output-dir outputs/qwen_image_prompt_vs_text_only \
+  --dtype bfloat16 \
+  --trust-remote-code \
+  --min-pixels 2048 \
+  --max-pixels 16777216 \
+  --image-patch-size 16 \
+  --max-new-tokens 1024 \
+  --compare-text-only-forward
+```
+
+In this comparison, `p_original` is conditioned on image + prompt + previous
+generated tokens, while `p_masked` is conditioned only on previous generated
+tokens.
+
 ## Scaled Image Probe
 
 To generate from the original image, then score the same response under an

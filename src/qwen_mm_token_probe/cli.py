@@ -12,8 +12,8 @@ def build_parser() -> argparse.ArgumentParser:
         )
     )
     parser.add_argument("--model-id", default="Qwen/Qwen3.5-2B")
-    parser.add_argument("--image", required=True, help="Path to the input image.")
-    parser.add_argument("--prompt", required=True, help="User prompt for the image.")
+    parser.add_argument("--image", default=None, help="Path to the input image.")
+    parser.add_argument("--prompt", default=None, help="User prompt for the image.")
     parser.add_argument("--output-dir", default="outputs/qwen_probe")
     parser.add_argument("--max-new-tokens", type=int, default=128)
     parser.add_argument("--device-map", default="auto")
@@ -71,6 +71,22 @@ def build_parser() -> argparse.ArgumentParser:
         help=(
             "Score this fixed response text instead of generating a response. "
             "The file contents are treated as assistant output tokens."
+        ),
+    )
+    analysis.add_argument(
+        "--text-only-forward",
+        action="store_true",
+        help=(
+            "With --score-response-file, forward the response text only. "
+            "No image or prompt is used."
+        ),
+    )
+    analysis.add_argument(
+        "--compare-text-only-forward",
+        action="store_true",
+        help=(
+            "Generate or score a response with image+prompt, then compare its "
+            "token probabilities against a second text-only forward pass."
         ),
     )
     analysis.add_argument(
@@ -145,7 +161,7 @@ def main() -> None:
     args = build_parser().parse_args()
 
     from .image_mask import MaskConfig
-    from .probe import run_probe
+    from .probe import run_probe, run_text_only_probe
     from .visualize import (
         write_generated_text,
         write_html_report,
@@ -158,47 +174,67 @@ def main() -> None:
 
     output_dir = Path(args.output_dir).expanduser().resolve()
     output_dir.mkdir(parents=True, exist_ok=True)
+    if args.text_only_forward and args.compare_text_only_forward:
+        raise SystemExit("--text-only-forward and --compare-text-only-forward are mutually exclusive")
 
-    mask_config = MaskConfig(
-        strategy=args.mask_strategy,
-        ratio=args.mask_ratio,
-        patch_size=args.patch_size,
-        fill=args.mask_fill,
-        effect=args.mask_effect,
-        opacity=args.mask_opacity,
-        blur_radius=args.blur_radius,
-        noise_std=args.noise_std,
-        seed=args.seed,
-        word_boxes_path=args.word_boxes,
-        word_padding=args.word_padding,
-        word_gap=args.word_gap,
-        word_min_width=args.word_min_width,
-        word_min_height=args.word_min_height,
-        text_threshold=args.text_threshold,
-    )
-    result = run_probe(
-        model_id=args.model_id,
-        image_path=args.image,
-        prompt=args.prompt,
-        output_dir=output_dir,
-        mask_config=mask_config,
-        max_new_tokens=args.max_new_tokens,
-        do_sample=args.do_sample,
-        temperature=args.temperature,
-        top_p=args.top_p,
-        group_tokens=args.group_tokens,
-        device_map=args.device_map,
-        dtype=args.dtype,
-        trust_remote_code=args.trust_remote_code,
-        min_pixels=args.min_pixels,
-        max_pixels=args.max_pixels,
-        image_patch_size=args.image_patch_size,
-        enable_thinking=args.enable_thinking,
-        privileged_info_file=args.privileged_info_file,
-        score_response_file=args.score_response_file,
-        condition_image_scale=args.condition_image_scale,
-        skip_masked_generation=args.skip_masked_generation,
-    )
+    if args.text_only_forward:
+        if args.score_response_file is None:
+            raise SystemExit("--text-only-forward requires --score-response-file")
+        result = run_text_only_probe(
+            model_id=args.model_id,
+            response_file=args.score_response_file,
+            output_dir=output_dir,
+            group_tokens=args.group_tokens,
+            device_map=args.device_map,
+            dtype=args.dtype,
+            trust_remote_code=args.trust_remote_code,
+        )
+    else:
+        if args.image is None:
+            raise SystemExit("--image is required unless --text-only-forward is used")
+        if args.prompt is None:
+            raise SystemExit("--prompt is required unless --text-only-forward is used")
+        mask_config = MaskConfig(
+            strategy=args.mask_strategy,
+            ratio=args.mask_ratio,
+            patch_size=args.patch_size,
+            fill=args.mask_fill,
+            effect=args.mask_effect,
+            opacity=args.mask_opacity,
+            blur_radius=args.blur_radius,
+            noise_std=args.noise_std,
+            seed=args.seed,
+            word_boxes_path=args.word_boxes,
+            word_padding=args.word_padding,
+            word_gap=args.word_gap,
+            word_min_width=args.word_min_width,
+            word_min_height=args.word_min_height,
+            text_threshold=args.text_threshold,
+        )
+        result = run_probe(
+            model_id=args.model_id,
+            image_path=args.image,
+            prompt=args.prompt,
+            output_dir=output_dir,
+            mask_config=mask_config,
+            max_new_tokens=args.max_new_tokens,
+            do_sample=args.do_sample,
+            temperature=args.temperature,
+            top_p=args.top_p,
+            group_tokens=args.group_tokens,
+            device_map=args.device_map,
+            dtype=args.dtype,
+            trust_remote_code=args.trust_remote_code,
+            min_pixels=args.min_pixels,
+            max_pixels=args.max_pixels,
+            image_patch_size=args.image_patch_size,
+            enable_thinking=args.enable_thinking,
+            privileged_info_file=args.privileged_info_file,
+            score_response_file=args.score_response_file,
+            compare_text_only_forward=args.compare_text_only_forward,
+            condition_image_scale=args.condition_image_scale,
+            skip_masked_generation=args.skip_masked_generation,
+        )
 
     payload = result.to_json_payload()
     write_scores_json(output_dir / "token_probabilities.json", payload)
@@ -216,12 +252,17 @@ def main() -> None:
         metadata = {
             "response_label": response.label,
             "response_source_image": response.source_image,
-            "original_image_path": str(result.original_image_path),
-            "masked_image_path": str(result.masked_image_path),
+            "original_image_path": (
+                str(result.original_image_path) if result.original_image_path is not None else None
+            ),
+            "masked_image_path": (
+                str(result.masked_image_path) if result.masked_image_path is not None else None
+            ),
             "original_condition_label": result.original_condition_label,
             "masked_condition_label": result.masked_condition_label,
             "privileged_info": result.privileged_info_metadata,
             "fixed_response": result.fixed_response_metadata,
+            "text_only_forward": result.text_only_forward_metadata,
             "mask_metadata": result.mask_metadata,
             "condition_image_metadata": result.condition_image_metadata,
             "num_generated_tokens": len(response.generated_token_ids),
@@ -283,7 +324,7 @@ def main() -> None:
             word_html_filename="masked_response_word_probabilities.html",
         )
 
-    print(f"Original-image response tokens: {len(result.original_response.generated_token_ids)}")
+    print(f"Primary response tokens: {len(result.original_response.generated_token_ids)}")
     if result.masked_response is not None:
         print(f"Masked-image response tokens: {len(result.masked_response.generated_token_ids)}")
     else:

@@ -492,6 +492,72 @@ def token_statistics_for_generated_ids(
     )
 
 
+def token_statistics_for_text_only_ids(
+    *,
+    model: torch.nn.Module,
+    tokenizer: PreTrainedTokenizerBase,
+    token_ids: list[int],
+    device: torch.device,
+) -> tuple[list[int], GeneratedTokenStats, dict[str, int | str | None]]:
+    if not token_ids:
+        raise ValueError("no text tokens to score")
+
+    prefix_token_id = _text_only_prefix_token_id(tokenizer)
+    if prefix_token_id is None:
+        if len(token_ids) < 2:
+            raise ValueError("at least two text tokens are required when no BOS/EOS prefix exists")
+        input_token_ids = token_ids
+        target_token_ids = token_ids[1:]
+        logit_start = 0
+        logit_end = len(target_token_ids)
+        prefix_metadata = {"prefix_token_id": None, "prefix_token": None}
+    else:
+        input_token_ids = [prefix_token_id] + token_ids
+        target_token_ids = token_ids
+        logit_start = 0
+        logit_end = len(target_token_ids)
+        prefix_metadata = {
+            "prefix_token_id": prefix_token_id,
+            "prefix_token": decode_token_piece(tokenizer, prefix_token_id),
+        }
+
+    input_ids = torch.tensor([input_token_ids], dtype=torch.long, device=device)
+    attention_mask = torch.ones_like(input_ids)
+    target_ids = torch.tensor(target_token_ids, dtype=torch.long, device=device)
+
+    with torch.inference_mode():
+        outputs = model(input_ids=input_ids, attention_mask=attention_mask)
+
+    logits = outputs.logits[0, logit_start:logit_end]
+    log_probs = torch.log_softmax(logits.float(), dim=-1)
+    selected_log_probs = log_probs.gather(1, target_ids[:, None]).squeeze(1)
+    selected_probs = selected_log_probs.exp()
+    top_log_probs, top_ids = torch.max(log_probs, dim=-1)
+    top_probs = top_log_probs.exp()
+
+    return (
+        target_token_ids,
+        GeneratedTokenStats(
+            probabilities=selected_probs.detach().cpu().tolist(),
+            log_probabilities=selected_log_probs.detach().cpu().tolist(),
+            top_token_ids=[int(token_id) for token_id in top_ids.detach().cpu().tolist()],
+            top_probabilities=top_probs.detach().cpu().tolist(),
+            top_log_probabilities=top_log_probs.detach().cpu().tolist(),
+        ),
+        prefix_metadata,
+    )
+
+
+def _text_only_prefix_token_id(tokenizer: PreTrainedTokenizerBase) -> int | None:
+    bos_token_id = getattr(tokenizer, "bos_token_id", None)
+    if bos_token_id is not None:
+        return int(bos_token_id)
+    eos_token_id = getattr(tokenizer, "eos_token_id", None)
+    if eos_token_id is not None:
+        return int(eos_token_id)
+    return None
+
+
 def display_token(tokenizer: PreTrainedTokenizerBase, token_id: int) -> str:
     piece = decode_token_piece(tokenizer, token_id)
     return piece.replace("\n", "\\n").replace("\t", "\\t")
