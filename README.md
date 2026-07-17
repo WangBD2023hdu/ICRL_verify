@@ -249,6 +249,72 @@ Saved files:
 - `manifest.jsonl`: one record per unique response
 - `runs.jsonl`: one record per inference attempt, including duplicates
 
+## JSONL OCR Blur Batch
+
+`qwen-mm-blur-batch` reads local image paths from a JSONL file, generates one
+OCR response from each original image, and teacher-forces that same token
+sequence under several whole-image Gaussian blur levels. The model is loaded
+once for the complete batch.
+
+The default field is `images`. It accepts a path string, a list of paths, or
+objects containing `path`. Relative paths are resolved against the JSONL file:
+
+```jsonl
+{"id":"page-001","images":["images/page-001.png"]}
+{"id":"page-002","images":"/absolute/path/page-002.jpg"}
+```
+
+The command uses the PDF-to-Markdown OCR prompt from this project by default:
+
+```bash
+qwen-mm-blur-batch \
+  --model-id /home/ma-user/work/share_base_models/Infinity-Parser2/Infinity-Parser2-Flash \
+  --input-jsonl /absolute/path/pages.jsonl \
+  --output-dir outputs/ocr_blur_batch \
+  --blur-radii 0.5 1 2 4 8 \
+  --max-new-tokens 4096 \
+  --dtype bfloat16 \
+  --trust-remote-code \
+  --min-pixels 2048 \
+  --max-pixels 16777216 \
+  --image-patch-size 16
+```
+
+Use `--prompt-file PROMPT.txt` to replace the built-in prompt, or
+`--prompt-field instruction` to read a different prompt from every JSONL
+record. Add `--generate-blurred-responses` when you also want a free-running OCR
+response from every blurred image. This is separate from the fixed-response
+probability comparison and costs one extra generation per blur level.
+
+The batch resumes by default. A completed sample is reused only when its image
+state, prompt, model, blur levels, and inference settings still match. Use
+`--no-resume` to run every sample again. Errors are recorded in
+`failures.jsonl`, while other samples continue unless `--fail-fast` is set.
+
+Important outputs:
+
+- `report.html`: aggregate charts and links to every sample report.
+- `aggregate_summary.csv`: one row per blur radius, weighted across tokens.
+- `sample_summary.csv`: one row per image and blur radius.
+- `token_probabilities.csv`: every token at every blur radius.
+- `word_probabilities.csv`: word/text-unit first-token and joint statistics.
+- `samples/*/report.html`: original/blurred images, token heatmap, largest
+  probability gains after blur, and largest probability drops after blur.
+- `samples/*/result.json`: an atomic checkpoint used by resume and report
+  rebuilding.
+
+Aggregate means, counts, and rates are exact. To keep report rebuilding bounded
+on very large datasets, aggregate medians and percentile metrics use a
+deterministic reservoir of at most 100,000 tokens per blur radius; the CSV marks
+this with `quantiles_approximate` and records `quantile_sample_size`. Per-sample
+quantiles remain exact.
+
+For the signed metrics, `delta_logp = logp_original - logp_blurred`. Positive
+values mean blur reduced the fixed token's probability. Negative values mean the
+token became more likely after blur. The CSV exposes the latter directly as
+positive `blur_minus_original_p` and `blur_minus_original_logp`, together with
+`probability_increased_after_blur` and aggregate gain-rate statistics.
+
 ## Outputs
 
 The output directory contains:

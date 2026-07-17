@@ -10,7 +10,7 @@ from typing import TYPE_CHECKING, Iterable
 import matplotlib.pyplot as plt
 
 if TYPE_CHECKING:
-    from .probe import TokenScore
+    from .score_types import TokenScore
     from .token_grouping import WordScore
 
 
