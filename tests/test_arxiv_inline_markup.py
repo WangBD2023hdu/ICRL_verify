@@ -212,7 +212,7 @@ class ArxivInlineMarkupTest(unittest.TestCase):
         latex = r"Use \& and \_ plus \verb|a_b|."
         self.assertEqual(
             self.render(latex, "Use & and _ plus a_b."),
-            "Use & and _ plus `a_b`.",
+            r"Use & and \_ plus `a_b`.",
         )
         plan = MODULE.parse_inline_plan(latex)
         self.assertEqual(plan.feature_counts["escape"], 2)
@@ -351,6 +351,15 @@ class ArxivInlineMarkupTest(unittest.TestCase):
         opaque = MODULE.parse_inline_plan(r"See \cite{hidden} and $x$.")
         with self.assertRaises(ValueError):
             MODULE.render_inline_source(opaque)
+
+    def test_source_render_escapes_literal_markdown_characters(self) -> None:
+        plan = MODULE.parse_inline_plan(
+            r"A *literal* \_value\_ <x> \#1 and \textbf{bold*text}."
+        )
+        self.assertEqual(
+            MODULE.render_inline_source(plan),
+            r"A \*literal\* \_value\_ \<x\> \#1 and **bold\*text**.",
+        )
 
     def test_malformed_inputs_fail_closed(self) -> None:
         broken = [

@@ -84,7 +84,7 @@ class ConfusableRecompilePilotTests(unittest.TestCase):
     def test_selection_policy_declares_page_exact_contract(self) -> None:
         self.assertEqual(
             MODULE.SELECTION_POLICY_VERSION,
-            "page_exact_source_paragraph_v5_fail_closed_current_gt_no_bibliography",
+            "page_exact_source_paragraph_v6_rendered_line_spread_current_gt_no_bibliography",
         )
         self.assertEqual(
             MODULE.BIBLIOGRAPHY_POLICY_VERSION,
@@ -232,6 +232,100 @@ class ConfusableRecompilePilotTests(unittest.TestCase):
             markdown_path.write_text("changed after validation", encoding="utf-8")
             reasons = MODULE.strict_input_rejection_reasons(root, row)
             self.assertIn("markdown_sha256_mismatch", reasons)
+
+    def test_source_first_input_rejects_markdown_hash_drift_before_compile(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            pages = root / "result/pages"
+            pages.mkdir(parents=True)
+            markdown_path = pages / "page_0001.md"
+            image_path = pages / "page_0001.png"
+            markdown_path.write_text("changed after validation", encoding="utf-8")
+            image_path.write_bytes(b"image")
+            markdown_path.with_suffix(".json").write_text(
+                json.dumps(
+                    {
+                        "data_id": "paper_page_0001",
+                        "markdown_sha256": hashlib.sha256(
+                            b"original validated Markdown"
+                        ).hexdigest(),
+                    }
+                ),
+                encoding="utf-8",
+            )
+            manifest = root / "cases.json"
+            manifest.write_text(
+                json.dumps(
+                    [
+                        {
+                            "pair_id": "paper_page_0001",
+                            "markdown_path": str(markdown_path),
+                            "image": str(image_path),
+                        }
+                    ]
+                ),
+                encoding="utf-8",
+            )
+            audit_path = root / "source_first_input_audit.json"
+            accepted = MODULE.load_source_first_case_rows(
+                manifest,
+                audit_path=audit_path,
+            )
+            self.assertEqual(accepted, [])
+            audit = json.loads(audit_path.read_text(encoding="utf-8"))
+            self.assertEqual(audit["reason_counts"]["markdown_sha256_mismatch"], 1)
+
+    def test_source_first_resume_fingerprint_tracks_every_generation_input(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source_root = root / "source"
+            source_root.mkdir()
+            main_tex = source_root / "main.tex"
+            main_tex.write_text("original source", encoding="utf-8")
+            markdown = root / "page.md"
+            markdown.write_text("Original Markdown.", encoding="utf-8")
+            source_units = root / "source_units.jsonl"
+            source_units.write_text('{"unit_id":"src-1"}\n', encoding="utf-8")
+            source_pdf = root / "clean.pdf"
+            source_pdf.write_bytes(b"clean-pdf")
+            row = {
+                "data_id": "paper_page_0001",
+                "page_number": 1,
+                "markdown": str(markdown),
+                "source_pdf": str(source_pdf),
+                "source_units_path": str(source_units),
+                "source_root_override": str(source_root),
+                "main_tex_override": "main.tex",
+                "source_paragraph_ids": ["sp-1"],
+                "source_probe_ids": ["probe-1"],
+                "source_first_input_policy_version": (
+                    MODULE.SOURCE_FIRST_INPUT_POLICY_VERSION
+                ),
+            }
+            baseline = MODULE.source_first_resume_fingerprint([row])
+            self.assertIsNotNone(baseline)
+
+            for path, changed, original in (
+                (markdown, b"Changed Markdown.", b"Original Markdown."),
+                (source_units, b'{"unit_id":"src-2"}\n', b'{"unit_id":"src-1"}\n'),
+                (source_pdf, b"changed-pdf", b"clean-pdf"),
+                (main_tex, b"changed source", b"original source"),
+            ):
+                path.write_bytes(changed)
+                with self.subTest(path=path.name):
+                    self.assertNotEqual(
+                        MODULE.source_first_resume_fingerprint([row]),
+                        baseline,
+                    )
+                path.write_bytes(original)
+                self.assertEqual(
+                    MODULE.source_first_resume_fingerprint([row]),
+                    baseline,
+                )
+
+            legacy = dict(row)
+            legacy.pop("source_root_override")
+            self.assertIsNone(MODULE.source_first_resume_fingerprint([legacy]))
 
     def test_bibliography_heading_detector_is_section_only(self) -> None:
         positives = (
@@ -452,11 +546,15 @@ class ConfusableRecompilePilotTests(unittest.TestCase):
 
     def test_mutation_selection_uses_page_local_uniqueness(self) -> None:
         words = ["general", "method", "visual", "source"]
-        page_words = [
-            MODULE.PdfWord(word, 1, index, 10 + index * 50, 10, 45 + index * 50, 20)
-            for index, word in enumerate(words)
-        ]
-        page_words.append(MODULE.PdfWord("tail", 1, len(words), 230, 10, 250, 20))
+        page_words = []
+        for index, word in enumerate(words):
+            top = 10 + index * 20
+            page_words.extend(
+                [
+                    MODULE.PdfWord(word, 1, index * 2, 10, top, 45, top + 10),
+                    MODULE.PdfWord("tail", 1, index * 2 + 1, 50, top, 70, top + 10),
+                ]
+            )
         source_by_word = {
             word: [
                 MODULE.SourceOccurrence(
@@ -487,11 +585,15 @@ class ConfusableRecompilePilotTests(unittest.TestCase):
 
     def test_mutation_selection_disambiguates_repeated_word_by_page_paragraph(self) -> None:
         words = ["general", "method", "visual", "source"]
-        page_words = [
-            MODULE.PdfWord(word, 1, index, 10 + index * 50, 10, 45 + index * 50, 20)
-            for index, word in enumerate(words)
-        ]
-        page_words.append(MODULE.PdfWord("tail", 1, len(words), 230, 10, 250, 20))
+        page_words = []
+        for index, word in enumerate(words):
+            top = 10 + index * 20
+            page_words.extend(
+                [
+                    MODULE.PdfWord(word, 1, index * 2, 10, top, 45, top + 10),
+                    MODULE.PdfWord("tail", 1, index * 2 + 1, 50, top, 70, top + 10),
+                ]
+            )
         source_by_word = {
             word: [
                 MODULE.SourceOccurrence(
@@ -530,6 +632,39 @@ class ConfusableRecompilePilotTests(unittest.TestCase):
         )
         self.assertIn(len(selected), (3, 4))
         self.assertTrue(all(item.source_line < 20 for item in selected))
+
+    def test_mutation_selection_allows_one_source_line_across_visual_lines(self) -> None:
+        words = ["general", "method", "visual", "source"]
+        page_words = []
+        source_by_word = {}
+        for index, word in enumerate(words):
+            top = 10 + index * 20
+            page_words.extend(
+                [
+                    MODULE.PdfWord(word, 1, index * 2, 10, top, 45, top + 10),
+                    MODULE.PdfWord("tail", 1, index * 2 + 1, 50, top, 70, top + 10),
+                ]
+            )
+            source_by_word[word] = [
+                MODULE.SourceOccurrence(
+                    word=word,
+                    source_file="main.tex",
+                    word_offset=index * 20,
+                    source_line=1,
+                    source_column=index * 20 + 1,
+                )
+            ]
+        selected = MODULE.choose_mutations_for_page(
+            row={"data_id": "one-source-line", "page_number": 1},
+            clean_markdown=" ".join(words),
+            page_words=page_words,
+            source_by_word=source_by_word,
+            paper_word_vocabulary=set(words) | {"tail"},
+            excluded_source_positions=set(),
+            seed=83,
+        )
+        self.assertIn(len(selected), (3, 4))
+        self.assertEqual({item.source_line for item in selected}, {1})
 
     def test_comment_scanner_preserves_escaped_percent(self) -> None:
         self.assertEqual(MODULE.tex_comment_start(r"visible \% value % hidden"), 17)

@@ -49,14 +49,22 @@ PDFTOPPM = Path(shutil.which("pdftoppm") or "/opt/homebrew/bin/pdftoppm")
 SCHEMA_VERSION = 2
 MUTATION_POLICY_VERSION = "chaos_visual_v2"
 SELECTION_POLICY_VERSION = (
-    "page_exact_source_paragraph_v5_fail_closed_current_gt_no_bibliography"
+    "page_exact_source_paragraph_v6_rendered_line_spread_current_gt_no_bibliography"
 )
 BIBLIOGRAPHY_POLICY_VERSION = "exclude_bibliography_tail_v1"
 STRICT_INPUT_FILTER_POLICY_VERSION = "strict_gt_current_contract_v1"
 STRICT_INPUT_STRICT_TEXT_CONTRACT_VERSION = 2
 STRICT_INPUT_AUTHOR_SUPERSCRIPT_CONTRACT_VERSION = 5
 STRICT_INPUT_FOOTNOTE_REPRESENTATION = "html_sup"
-SOURCE_FIRST_INPUT_POLICY_VERSION = "source_first_color_v2_verified_pages_v1"
+SOURCE_FIRST_INPUT_POLICY_VERSION = "source_first_color_v6_literal_markdown_v5"
+SOURCE_FIRST_SCHEMA_VERSION = 6
+SOURCE_FIRST_CONTRACT = "source_first_color_v6"
+SOURCE_FIRST_VERIFIER_CONTRACT_VERSION = 4
+SOURCE_FIRST_PROBE_POLICY_VERSION = (
+    "paragraph_list_payload_then_paragraph_then_whole_v2"
+)
+SOURCE_FIRST_SHADOW_INVARIANT_POLICY_VERSION = "exact_page_character_sequence_v1"
+SOURCE_FIRST_HEADING_LABEL_POLICY_VERSION = "aux_number_unique_titleformat_label_v1"
 PAIR_POLICY_TAG = "chaosv4"
 HEARTBEAT_SECONDS = 15.0
 WORD_RE = re.compile(r"[A-Za-z]{4,}")
@@ -461,7 +469,7 @@ def choose_mutations_for_page(
     selected: list[Mutation] = []
     selected_words: set[str] = set()
     selected_mutated_words: set[str] = set()
-    selected_lines: set[tuple[str, int]] = set()
+    selected_visual_lines: list[tuple[int, float]] = []
     for source, pdf_word, md_start, md_end in candidates:
         if source.word in selected_words:
             continue
@@ -508,13 +516,21 @@ def choose_mutations_for_page(
                 break
         if mutation is None:
             continue
-        line_key = (mutation.source_file, mutation.source_line)
-        if line_key in selected_lines:
+        # A TeX author often writes an entire paragraph on one source line, so
+        # source-line uniqueness can make a visually dense page impossible to
+        # mutate.  Spread edits over distinct rendered lines instead.  This is
+        # the layout property that matters, and the post-compile document gate
+        # still rejects any resulting reflow or word-sequence change.
+        if any(
+            page_number == mutation.page_number
+            and abs(top - pdf_word.top) <= 1.0
+            for page_number, top in selected_visual_lines
+        ):
             continue
         selected.append(mutation)
         selected_words.add(mutation.original_word)
         selected_mutated_words.add(mutation.mutated_word)
-        selected_lines.add(line_key)
+        selected_visual_lines.append((mutation.page_number, pdf_word.top))
         if len(selected) >= requested:
             break
     if len(selected) < 3:
@@ -1527,6 +1543,87 @@ def strict_input_policy_for_rows(rows: Sequence[dict[str, Any]]) -> str:
     return next(iter(policies))
 
 
+def source_first_resume_fingerprint(
+    rows: Sequence[dict[str, Any]],
+) -> str | None:
+    """Hash every source-first artifact that can affect edit generation.
+
+    Older strict manifests do not carry these paths and therefore deliberately
+    return ``None``: they may still be processed, but their paper checkpoint is
+    never reused without a complete content identity proof.
+    """
+
+    if not rows:
+        return None
+    required = (
+        "markdown",
+        "source_pdf",
+        "source_units_path",
+        "source_root_override",
+        "main_tex_override",
+    )
+    if any(not row.get(key) for row in rows for key in required):
+        return None
+    source_roots = {
+        Path(str(row["source_root_override"])).resolve() for row in rows
+    }
+    source_units_paths = {
+        Path(str(row["source_units_path"])).resolve() for row in rows
+    }
+    source_pdfs = {Path(str(row["source_pdf"])).resolve() for row in rows}
+    main_tex_paths = {str(row["main_tex_override"]) for row in rows}
+    if not (
+        len(source_roots)
+        == len(source_units_paths)
+        == len(source_pdfs)
+        == len(main_tex_paths)
+        == 1
+    ):
+        return None
+    source_root = next(iter(source_roots))
+    source_units_path = next(iter(source_units_paths))
+    source_pdf = next(iter(source_pdfs))
+    main_tex = next(iter(main_tex_paths))
+    if not (
+        source_root.is_dir()
+        and (source_root / main_tex).is_file()
+        and source_units_path.is_file()
+        and source_pdf.is_file()
+    ):
+        return None
+    row_payloads: list[dict[str, Any]] = []
+    for row in sorted(rows, key=lambda item: str(item.get("data_id", ""))):
+        markdown_path = Path(str(row["markdown"])).resolve()
+        if not markdown_path.is_file():
+            return None
+        row_payloads.append(
+            {
+                "data_id": str(row.get("data_id", "")),
+                "page_number": int(row.get("page_number", 0)),
+                "markdown_sha256": sha256_file(markdown_path),
+                "source_paragraph_ids": row.get("source_paragraph_ids"),
+                "source_probe_ids": row.get("source_probe_ids"),
+                "source_first_input_policy_version": row.get(
+                    "source_first_input_policy_version"
+                ),
+            }
+        )
+    payload = {
+        "rows": row_payloads,
+        "source_tree_sha256": tree_hash(source_root),
+        "source_units_sha256": sha256_file(source_units_path),
+        "source_pdf_sha256": sha256_file(source_pdf),
+        "main_tex": main_tex,
+    }
+    serialized = json.dumps(
+        payload,
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+    return hashlib.sha256(serialized.encode("utf-8")).hexdigest()
+
+
 def load_source_first_case_rows(
     manifest_path: Path,
     *,
@@ -1581,15 +1678,59 @@ def load_source_first_case_rows(
             continue
 
         sidecar = read_json(sidecar_path)
+        if markdown_path.is_file():
+            require(
+                sidecar.get("markdown_sha256") == sha256_file(markdown_path),
+                "markdown_sha256_mismatch",
+            )
         result_root = markdown_path.parent.parent
         report_path = result_root / "validation_report.json"
         source_units_path = result_root / "source_units.jsonl"
+        source_probes_path = result_root / "source_probes.jsonl"
         source_root = result_root / "source_clean"
         require(report_path.is_file(), "validation_report_missing")
         require(source_units_path.is_file(), "source_units_missing")
+        require(source_probes_path.is_file(), "source_probes_missing")
         require(source_root.is_dir(), "source_clean_missing")
         report = read_json(report_path) if report_path.is_file() else {}
+        source_probes = read_jsonl(source_probes_path) if source_probes_path.is_file() else []
+        known_probe_ids = [str(row.get("probe_id") or "") for row in source_probes]
         verifier = sidecar.get("verifier")
+        shadow_invariant = sidecar.get("shadow_invariant")
+        figure_policy = report.get("figure_policy")
+        figure_status = (report.get("figure_removal") or {}).get("status")
+        valid_figure_policy = (
+            (figure_policy == "drop_figures" and figure_status == "passed")
+            or (figure_policy == "keep_figures" and figure_status == "disabled")
+        )
+        require(sidecar.get("schema_version") == SOURCE_FIRST_SCHEMA_VERSION, "page_schema_mismatch")
+        require(sidecar.get("contract") == SOURCE_FIRST_CONTRACT, "page_contract_mismatch")
+        require(
+            sidecar.get("probe_policy_version") == SOURCE_FIRST_PROBE_POLICY_VERSION,
+            "page_probe_policy_mismatch",
+        )
+        require(
+            sidecar.get("shadow_invariant_policy_version")
+            == SOURCE_FIRST_SHADOW_INVARIANT_POLICY_VERSION,
+            "page_shadow_invariant_policy_mismatch",
+        )
+        require(
+            sidecar.get("heading_label_policy_version")
+            == SOURCE_FIRST_HEADING_LABEL_POLICY_VERSION,
+            "page_heading_label_policy_mismatch",
+        )
+        require(isinstance(shadow_invariant, dict), "page_shadow_invariant_missing")
+        if isinstance(shadow_invariant, dict):
+            require(
+                shadow_invariant.get("character_count_equal") is True
+                and shadow_invariant.get("character_text_equal") is True,
+                "page_shadow_text_not_identical",
+            )
+            require(
+                shadow_invariant.get("geometry_role") == "diagnostic_only",
+                "page_shadow_geometry_role_mismatch",
+            )
+        require(sidecar.get("figure_policy") == figure_policy, "page_figure_policy_mismatch")
         require(sidecar.get("status") == "passed", "page_status_not_passed")
         require(sidecar.get("generation_source") == "latex_source", "generation_not_latex_source")
         require(sidecar.get("page_provenance") == "compiled_vector_color", "page_provenance_mismatch")
@@ -1597,8 +1738,36 @@ def load_source_first_case_rows(
         require(isinstance(verifier, dict), "verifier_missing")
         if isinstance(verifier, dict):
             require(verifier.get("status") == "passed", "verifier_not_passed")
-            require(verifier.get("exact_ordered_token_match") is True, "ordered_token_match_not_exact")
-        require(report.get("contract") == "source_first_color_v2", "source_first_contract_mismatch")
+            require(
+                verifier.get("contract_version")
+                == SOURCE_FIRST_VERIFIER_CONTRACT_VERSION,
+                "verifier_contract_version_mismatch",
+            )
+            require(
+                verifier.get("exact_ordered_character_stream_match") is True,
+                "ordered_content_match_not_exact",
+            )
+        require(report.get("schema_version") == SOURCE_FIRST_SCHEMA_VERSION, "source_first_schema_mismatch")
+        require(report.get("contract") == SOURCE_FIRST_CONTRACT, "source_first_contract_mismatch")
+        require(
+            report.get("probe_policy_version") == SOURCE_FIRST_PROBE_POLICY_VERSION,
+            "source_first_probe_policy_mismatch",
+        )
+        require(
+            report.get("shadow_invariant_policy_version")
+            == SOURCE_FIRST_SHADOW_INVARIANT_POLICY_VERSION,
+            "source_first_shadow_invariant_policy_mismatch",
+        )
+        require(
+            report.get("heading_label_policy_version")
+            == SOURCE_FIRST_HEADING_LABEL_POLICY_VERSION,
+            "source_first_heading_label_policy_mismatch",
+        )
+        require(valid_figure_policy, "source_first_figure_policy_mismatch")
+        require(
+            (report.get("reference_removal") or {}).get("status") == "passed",
+            "source_first_reference_removal_mismatch",
+        )
         require(report.get("status") == "passed", "source_first_report_not_passed")
         require(report.get("pdf_used_for_generation") is False, "pdf_used_for_generation")
         require(report.get("pdf_used_for_verification") is True, "pdf_not_used_for_verification")
@@ -1616,6 +1785,19 @@ def load_source_first_case_rows(
         require(bool(clean_pdf_value) and clean_pdf.is_file(), "clean_pdf_missing")
         source_paragraph_ids = sidecar.get("source_paragraph_ids")
         require(isinstance(source_paragraph_ids, list) and bool(source_paragraph_ids), "source_paragraph_ids_missing")
+        source_probe_ids = sidecar.get("source_probe_ids")
+        require(isinstance(source_probe_ids, list) and bool(source_probe_ids), "source_probe_ids_missing")
+        require(
+            bool(known_probe_ids)
+            and all(known_probe_ids)
+            and len(known_probe_ids) == len(set(known_probe_ids)),
+            "source_probe_inventory_invalid",
+        )
+        if isinstance(source_probe_ids, list):
+            require(
+                set(map(str, source_probe_ids)) <= set(known_probe_ids),
+                "source_probe_ids_unknown",
+            )
 
         data_id = str(sidecar.get("data_id", ""))
         paper_id = str(sidecar.get("paper_id", ""))
@@ -1696,6 +1878,7 @@ def build_paper(
     checkpoint = paper_output / "paper_result.json"
     expected_data_ids = sorted(str(row["data_id"]) for row in strict_rows)
     strict_input_policy_version = strict_input_policy_for_rows(strict_rows)
+    source_first_input_sha256 = source_first_resume_fingerprint(strict_rows)
     if checkpoint.is_file():
         stored = read_json(checkpoint)
         stored_rows = stored.get("pairs", [])
@@ -1708,6 +1891,9 @@ def build_paper(
             and stored.get("bibliography_policy_version")
             == BIBLIOGRAPHY_POLICY_VERSION
             and stored.get("strict_data_ids_considered") == expected_data_ids
+            and source_first_input_sha256 is not None
+            and stored.get("source_first_input_sha256")
+            == source_first_input_sha256
             and all(
             (output_dir / row["edited_image"]).is_file()
             and (output_dir / row["edited_markdown"]).is_file()
@@ -1827,6 +2013,7 @@ def build_paper(
             "strict_input_filter_policy_version": strict_input_policy_version,
             "bibliography_policy_version": BIBLIOGRAPHY_POLICY_VERSION,
             "strict_data_ids_considered": expected_data_ids,
+            "source_first_input_sha256": source_first_input_sha256,
             "preflight_rejections": preflight_rejections,
             "pairs": [],
         }
@@ -2013,6 +2200,7 @@ def build_paper(
         "strict_input_filter_policy_version": strict_input_policy_version,
         "bibliography_policy_version": BIBLIOGRAPHY_POLICY_VERSION,
         "strict_data_ids_considered": expected_data_ids,
+        "source_first_input_sha256": source_first_input_sha256,
         "source_tree_sha256_before": original_tree_sha256,
         "source_tree_sha256_after": original_tree_after,
         "edited_source_tree_sha256": tree_hash(source_edited),

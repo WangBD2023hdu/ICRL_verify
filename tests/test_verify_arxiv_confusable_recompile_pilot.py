@@ -50,7 +50,7 @@ class VerifyArxivConfusableRecompilePilotTests(unittest.TestCase):
     def test_verifier_policy_matches_page_exact_builder_contract(self) -> None:
         self.assertEqual(
             MODULE.SELECTION_POLICY_VERSION,
-            "page_exact_source_paragraph_v5_fail_closed_current_gt_no_bibliography",
+            "page_exact_source_paragraph_v6_rendered_line_spread_current_gt_no_bibliography",
         )
         self.assertEqual(
             MODULE.BIBLIOGRAPHY_POLICY_VERSION,

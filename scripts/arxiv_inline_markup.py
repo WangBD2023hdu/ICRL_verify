@@ -1045,6 +1045,23 @@ def _markdown_style(value: str, delimiter: str) -> str:
     return f"{leading}{delimiter}{core}{delimiter}{trailing}"
 
 
+def escape_markdown_text(value: str) -> str:
+    """Escape literal text that could otherwise be mistaken for Markdown.
+
+    Style, math, and code delimiters are emitted by their dedicated renderers.
+    Escaping these characters only in text nodes makes those generated
+    delimiters distinguishable from characters that TeX actually printed.
+    """
+
+    parts = re.split(r"(</?sup>|<br\s*/?>)", value, flags=re.IGNORECASE)
+    return "".join(
+        part
+        if re.fullmatch(r"</?sup>|<br\s*/?>", part, flags=re.IGNORECASE)
+        else re.sub(r"([\\`*_#$!\[\]<>])", r"\\\1", part)
+        for part in parts
+    )
+
+
 def render_inline_match(
     plan: InlinePlan, match: Match[str], regex: InlineRegex
 ) -> str:
@@ -1064,7 +1081,9 @@ def render_inline_match(
         if node.kind == "root":
             return "".join(render(child) for child in node.children)
         if node.kind == "text":
-            return _repair_literal_hyphens(node.value, captured(node))
+            return escape_markdown_text(
+                _repair_literal_hyphens(node.value, captured(node))
+            )
         if node.kind == "opaque":
             visible = captured(node)
             if node.opaque_role == "footnote" and re.fullmatch(r"[0-9]+", visible):
@@ -1106,7 +1125,7 @@ def render_inline_source(plan: InlinePlan) -> str:
         if node.kind == "root":
             return "".join(render(child) for child in node.children)
         if node.kind == "text":
-            return node.value
+            return escape_markdown_text(node.value)
         if node.kind == "math":
             return f"${node.value}$"
         if node.kind == "strong":

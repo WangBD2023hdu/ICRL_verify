@@ -23,7 +23,7 @@ import signal
 import subprocess
 import sys
 import time
-from typing import Any, Iterable
+from typing import Any, Iterable, Sequence
 
 
 SCRIPT_DIR = Path(__file__).resolve().parent
@@ -39,7 +39,22 @@ from build_arxiv_latex_recompile_pilot import (  # noqa: E402
 
 
 HEARTBEAT_SECONDS = 30.0
-PIPELINE_VERSION = "source_bins_to_source_first_confusable_verl_v1"
+PIPELINE_VERSION = (
+    "source_bins_to_source_first_confusable_verl_v10_list_payload_math_minus"
+)
+SOURCE_FIRST_SCHEMA_VERSION = 6
+SOURCE_FIRST_CONTRACT = "source_first_color_v6"
+SOURCE_FIRST_VERIFIER_CONTRACT_VERSION = 4
+SOURCE_FIRST_PROBE_POLICY_VERSION = (
+    "paragraph_list_payload_then_paragraph_then_whole_v2"
+)
+SOURCE_FIRST_SHADOW_INVARIANT_POLICY_VERSION = "exact_page_character_sequence_v1"
+SOURCE_FIRST_HEADING_LABEL_POLICY_VERSION = "aux_number_unique_titleformat_label_v1"
+SOURCE_FIRST_PROBE_TIERS = {
+    "paragraph_and_list_tokens",
+    "paragraph_tokens",
+    "whole_units",
+}
 SAFE_STEM_RE = re.compile(r"^[A-Za-z0-9._-]+$")
 
 
@@ -139,7 +154,9 @@ def archive_expected_sha256(row: dict[str, Any]) -> str | None:
 def move_incomplete(path: Path, diagnostics_root: Path, label: str) -> Path:
     diagnostics_root.mkdir(parents=True, exist_ok=True)
     timestamp = time.strftime("%Y%m%dT%H%M%S", time.gmtime())
-    destination = diagnostics_root / f"{label}_{timestamp}_{os.getpid()}"
+    destination = diagnostics_root / (
+        f"{label}_{timestamp}_{os.getpid()}_{time.time_ns()}"
+    )
     shutil.move(str(path), str(destination))
     return destination
 
@@ -190,16 +207,78 @@ def run_logged_subprocess(
 def source_first_artifacts_valid(source_first_root: Path) -> bool:
     report_path = source_first_root / "validation_report.json"
     pages_path = source_first_root / "pages_passed.jsonl"
-    if not report_path.is_file() or not pages_path.is_file():
+    probes_path = source_first_root / "source_probes.jsonl"
+    if not report_path.is_file() or not pages_path.is_file() or not probes_path.is_file():
         return False
     try:
         report = read_json(report_path)
         rows = read_jsonl(pages_path)
+        probes = read_jsonl(probes_path)
     except (OSError, ValueError, json.JSONDecodeError):
         return False
-    if report.get("status") != "passed" or not rows:
+    probe_ids = [str(probe.get("probe_id") or "") for probe in probes]
+    if not probe_ids or any(not probe_id for probe_id in probe_ids):
+        return False
+    if len(probe_ids) != len(set(probe_ids)):
+        return False
+    known_probe_ids = set(probe_ids)
+    figure_policy = report.get("figure_policy")
+    figure_status = (report.get("figure_removal") or {}).get("status")
+    valid_figure_policy = (
+        (figure_policy == "drop_figures" and figure_status == "passed")
+        or (figure_policy == "keep_figures" and figure_status == "disabled")
+    )
+    selected_probe_tier = (report.get("localization") or {}).get(
+        "selected_probe_tier"
+    )
+    if (
+        report.get("status") != "passed"
+        or report.get("schema_version") != SOURCE_FIRST_SCHEMA_VERSION
+        or report.get("contract") != SOURCE_FIRST_CONTRACT
+        or report.get("probe_policy_version")
+        != SOURCE_FIRST_PROBE_POLICY_VERSION
+        or report.get("shadow_invariant_policy_version")
+        != SOURCE_FIRST_SHADOW_INVARIANT_POLICY_VERSION
+        or report.get("heading_label_policy_version")
+        != SOURCE_FIRST_HEADING_LABEL_POLICY_VERSION
+        or report.get("verifier_contract_version")
+        != SOURCE_FIRST_VERIFIER_CONTRACT_VERSION
+        or (report.get("reference_removal") or {}).get("status") != "passed"
+        or not valid_figure_policy
+        or selected_probe_tier not in SOURCE_FIRST_PROBE_TIERS
+        or report.get("pages_passed") != len(rows)
+        or not rows
+    ):
         return False
     for row in rows:
+        verifier = row.get("verifier")
+        shadow_invariant = row.get("shadow_invariant")
+        row_probe_ids = row.get("source_probe_ids")
+        if (
+            row.get("schema_version") != SOURCE_FIRST_SCHEMA_VERSION
+            or row.get("contract") != SOURCE_FIRST_CONTRACT
+            or row.get("probe_policy_version")
+            != SOURCE_FIRST_PROBE_POLICY_VERSION
+            or row.get("shadow_invariant_policy_version")
+            != SOURCE_FIRST_SHADOW_INVARIANT_POLICY_VERSION
+            or row.get("heading_label_policy_version")
+            != SOURCE_FIRST_HEADING_LABEL_POLICY_VERSION
+            or row.get("figure_policy") != figure_policy
+            or row.get("status") != "passed"
+            or not isinstance(row_probe_ids, list)
+            or not row_probe_ids
+            or not set(map(str, row_probe_ids)) <= known_probe_ids
+            or not isinstance(verifier, dict)
+            or not isinstance(shadow_invariant, dict)
+            or shadow_invariant.get("character_count_equal") is not True
+            or shadow_invariant.get("character_text_equal") is not True
+            or shadow_invariant.get("geometry_role") != "diagnostic_only"
+            or verifier.get("status") != "passed"
+            or verifier.get("contract_version")
+            != SOURCE_FIRST_VERIFIER_CONTRACT_VERSION
+            or verifier.get("exact_ordered_character_stream_match") is not True
+        ):
+            return False
         for key in ("markdown", "image"):
             path = source_first_root / str(row.get(key, ""))
             if not path.is_file() or path.stat().st_size == 0:
@@ -208,6 +287,24 @@ def source_first_artifacts_valid(source_first_root: Path) -> bool:
         if not sidecar.with_suffix(".json").is_file():
             return False
     return True
+
+
+def source_first_compile_variants(
+    latex_engines: Sequence[str],
+) -> list[tuple[str, bool]]:
+    """Prefer each engine's figure-free build, then its intact fallback.
+
+    Figure removal can expose more prose, but it can also break a class or
+    package under one engine.  Keeping the fallback adjacent to the same engine
+    avoids accepting a lower-fidelity engine merely because its edited source
+    happened to compile first.
+    """
+
+    return [
+        (engine, drop_figures)
+        for engine in latex_engines
+        for drop_figures in (True, False)
+    ]
 
 
 def build_source_first_paper(task: dict[str, Any]) -> dict[str, Any]:
@@ -234,27 +331,97 @@ def build_source_first_paper(task: dict[str, Any]) -> dict[str, Any]:
         "started_at_epoch": time.time(),
     }
     recompile_paper.mkdir(parents=True, exist_ok=True)
-    if bool(task["resume"]) and metadata_path.is_file():
-        stored = read_json(metadata_path)
-        if stored.get("status") == "success" and source_first_artifacts_valid(source_first_root):
-            return {**stored, "resume_state": "reused_success"}
-        if stored.get("status") in {"failed", "rejected"} and not bool(task["retry_failed"]):
-            return {**stored, "resume_state": "reused_failure"}
-
     expected_sha256 = task.get("expected_sha256")
     actual_sha256 = sha256_file(archive)
+    result["archive_sha256"] = actual_sha256
     if expected_sha256 and actual_sha256 != expected_sha256:
         result.update(
             status="rejected",
             stage="archive_validation",
             failure_reason="source archive SHA-256 mismatch",
-            archive_sha256=actual_sha256,
         )
         atomic_write_json(metadata_path, result)
         return result
-    result["archive_sha256"] = actual_sha256
+
+    latex_engines = list(task.get("latex_engines") or [])
+    if not latex_engines:
+        result.update(
+            status="failed",
+            stage="configuration",
+            failure_reason="no LaTeX compile engines configured",
+        )
+        atomic_write_json(metadata_path, result)
+        return result
+
+    resume_archive_matches = False
+    resume_invalidation_reason: str | None = None
+    if bool(task["resume"]) and metadata_path.is_file():
+        stored = read_json(metadata_path)
+        current_pipeline = stored.get("pipeline_version") == PIPELINE_VERSION
+        stored_archive_matches = stored.get("archive_sha256") == actual_sha256
+        if not current_pipeline:
+            resume_invalidation_reason = "pipeline_version_mismatch"
+        elif not stored_archive_matches:
+            resume_invalidation_reason = "archive_mismatch"
+        else:
+            resume_archive_matches = True
+        if (
+            current_pipeline
+            and stored_archive_matches
+            and stored.get("status") == "success"
+            and source_first_artifacts_valid(source_first_root)
+        ):
+            return {**stored, "resume_state": "reused_success"}
+        if (
+            current_pipeline
+            and stored_archive_matches
+            and stored.get("status") in {"failed", "rejected"}
+            and not bool(task["retry_failed"])
+        ):
+            return {**stored, "resume_state": "reused_failure"}
 
     extraction_path = recompile_paper / "extraction.json"
+    if bool(task["resume"]) and extraction_path.is_file():
+        try:
+            extraction_checkpoint = read_json(extraction_path)
+        except (OSError, ValueError, json.JSONDecodeError):
+            extraction_checkpoint = {}
+        checkpoint_matches = (
+            resume_invalidation_reason is None
+            and extraction_checkpoint.get("status") == "passed"
+            and extraction_checkpoint.get("archive_sha256") == actual_sha256
+            and extraction_checkpoint.get("pipeline_version") == PIPELINE_VERSION
+        )
+        if checkpoint_matches:
+            resume_archive_matches = True
+        else:
+            checkpoint_reason = (
+                resume_invalidation_reason or "extraction_checkpoint_mismatch"
+            )
+            result["stale_extraction_checkpoint_moved_to"] = str(
+                move_incomplete(
+                    extraction_path,
+                    diagnostics_root,
+                    f"extraction_{checkpoint_reason}",
+                )
+            )
+    if bool(task["resume"]) and (
+        resume_invalidation_reason is not None or not resume_archive_matches
+    ):
+        stale_reason = resume_invalidation_reason or "archive_mismatch"
+        result["resume_invalidation_reason"] = stale_reason
+        if source_dir.exists():
+            result["stale_source_moved_to"] = str(
+                move_incomplete(source_dir, diagnostics_root, f"source_{stale_reason}")
+            )
+        if source_first_root.exists():
+            result["stale_source_first_moved_to"] = str(
+                move_incomplete(
+                    source_first_root,
+                    diagnostics_root,
+                    f"source_first_{stale_reason}",
+                )
+            )
     if not bool(task["resume"]):
         if extraction_path.exists():
             result["previous_extraction_checkpoint_moved_to"] = str(
@@ -283,7 +450,15 @@ def build_source_first_paper(task: dict[str, Any]) -> dict[str, Any]:
             )
             atomic_write_json(metadata_path, result)
             return result
-        atomic_write_json(extraction_path, {"status": "passed", **extraction})
+        atomic_write_json(
+            extraction_path,
+            {
+                "status": "passed",
+                "archive_sha256": actual_sha256,
+                "pipeline_version": PIPELINE_VERSION,
+                **extraction,
+            },
+        )
     result["extraction"] = read_json(extraction_path)
     result["stage"] = "extracted"
 
@@ -321,12 +496,19 @@ def build_source_first_paper(task: dict[str, Any]) -> dict[str, Any]:
         )
     if not source_first_artifacts_valid(source_first_root):
         runs: list[dict[str, Any]] = []
-        for engine_index, engine in enumerate(task["latex_engines"], start=1):
+        attempt = 0
+        complete = False
+        # Try the intact source under the same engine before moving to a less
+        # preferred engine.  Figure removal can make an otherwise compatible
+        # class fail or can substantially change pagination.
+        for engine, drop_figures in source_first_compile_variants(latex_engines):
+            figure_policy = "drop_figures" if drop_figures else "keep_figures_fallback"
+            attempt += 1
             if source_first_root.exists():
                 moved = move_incomplete(
                     source_first_root,
                     diagnostics_root,
-                    f"source_first_{engine}_failed",
+                    f"source_first_{engine}_{figure_policy}_failed",
                 )
                 result.setdefault("source_first_failed_attempts", []).append(str(moved))
             command = [
@@ -354,15 +536,25 @@ def build_source_first_paper(task: dict[str, Any]) -> dict[str, Any]:
                 "--pdftoppm",
                 str(task["pdftoppm"]),
             ]
+            if drop_figures:
+                command.append("--drop-figures")
             run = run_logged_subprocess(
                 command,
-                log_path=Path(str(task["log_root"])) / f"{stem}.{engine}.log",
+                log_path=(
+                    Path(str(task["log_root"]))
+                    / f"{stem}.{engine}.{figure_policy}.log"
+                ),
                 timeout_seconds=int(task["paper_timeout"]),
             )
             run["engine"] = engine
-            run["attempt"] = engine_index
+            run["figure_policy"] = figure_policy
+            run["attempt"] = attempt
             runs.append(run)
-            if run["return_code"] == 0 and source_first_artifacts_valid(source_first_root):
+            if run["return_code"] == 0 and source_first_artifacts_valid(
+                source_first_root
+            ):
+                complete = True
+            if complete:
                 break
         result["source_first_runs"] = runs
         if not source_first_artifacts_valid(source_first_root):
@@ -372,7 +564,7 @@ def build_source_first_paper(task: dict[str, Any]) -> dict[str, Any]:
                 status="failed",
                 stage="source_first_gt",
                 failure_reason=(
-                    f"all source-first engines failed engines={task['latex_engines']} "
+                    f"all source-first variants failed engines={latex_engines} "
                     f"last_rc={last_run['return_code']} timed_out={last_run['timed_out']} "
                     f"tail={tail}"
                 ),

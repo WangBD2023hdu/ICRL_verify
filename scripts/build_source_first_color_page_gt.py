@@ -1,20 +1,23 @@
 #!/usr/bin/env python3
 """Build page-level Markdown from LaTeX source with color-only page provenance.
 
-Ordinary prose is serialized from LaTeX source.  Unique paragraph colors in a
-shadow compile determine page membership and reading order.  Text extracted
-from the clean PDF is used only by an independent verifier; it never supplies
-Markdown content.  The first contract is intentionally conservative: pages
-with cross-page paragraphs, unresolved source constructs, unclaimed visible
-text, or verifier disagreement are rejected.
+Ordinary prose is serialized from LaTeX source.  Color probes in a shadow
+compile determine page membership and reading order; word probes can localize
+source-derived fragments when a paragraph crosses a page boundary.  Text
+extracted from the clean PDF is used only by an independent verifier; it never
+supplies Markdown content.  The contract is intentionally conservative: pages
+with unresolved source constructs, unclaimed visible text, or verifier
+disagreement are rejected.
 """
 
 from __future__ import annotations
 
 import argparse
+import bisect
 import collections
 import dataclasses
 import hashlib
+import html
 import json
 import os
 from pathlib import Path
@@ -23,6 +26,7 @@ import shutil
 import sys
 import time
 from typing import Any, Iterable, Sequence
+import unicodedata
 
 import pdfplumber
 
@@ -36,8 +40,22 @@ import build_arxiv_page_markdown_gt as page_gt  # noqa: E402
 import build_latex_color_alignment_pilot as color_pilot  # noqa: E402
 
 
-SCHEMA_VERSION = 2
-CONTRACT = "source_first_color_v2"
+SCHEMA_VERSION = 6
+CONTRACT = "source_first_color_v6"
+VERIFIER_CONTRACT_VERSION = 4
+PROBE_POLICY_VERSION = "paragraph_list_payload_then_paragraph_then_whole_v2"
+SHADOW_INVARIANT_POLICY_VERSION = "exact_page_character_sequence_v1"
+HEADING_LABEL_POLICY_VERSION = "aux_number_unique_titleformat_label_v1"
+WORD_PROBE_FORBIDDEN = re.compile(r"(?<!\\)[%&#]")
+NONWHITESPACE_TOKEN = re.compile(r"\S+")
+FIGURE_ENVIRONMENTS = {"figure", "figure*"}
+FIGURE_ENVIRONMENT_TOKEN = re.compile(
+    r"\\(?P<action>begin|end)\s*\{(?P<environment>figure\*?)\}"
+)
+FIGURE_REFERENCE_COMMAND = re.compile(
+    r"\\(?P<command>ref|pageref|autoref|cref|Cref)\s*\{(?P<labels>[^{}]+)\}"
+)
+OPTIONAL_LINE_END_HYPHEN = "\uFFF4"
 
 
 @dataclasses.dataclass(frozen=True)
@@ -77,6 +95,71 @@ class SourceUnit:
 
 
 @dataclasses.dataclass(frozen=True)
+class SourceProbe:
+    """One color-only locator for a source-derived semantic unit.
+
+    ``whole`` probes preserve the previous paragraph/heading localization.
+    ``plain_word`` probes are used only when every whitespace-delimited source
+    token aligns exactly with one source-derived Markdown token.  A probe may
+    safely wrap compact inline math or a formatting command such as
+    ``\\textbf{...}``; PDF characters establish page and geometry only, while
+    ``markdown_fragment`` always comes from the already source-rendered parent
+    :class:`SourceUnit`.
+    """
+
+    probe_id: str
+    unit_id: str
+    paragraph_id: str
+    kind: str
+    source_file: Path
+    source_lines: tuple[int, ...]
+    markdown_fragment: str
+    rgb: tuple[int, int, int]
+    ordinal: int
+    total: int
+    localization_mode: str
+    token_span: tuple[int, int, int] | None = None
+
+    def as_json(self, source_root: Path) -> dict[str, Any]:
+        value: dict[str, Any] = {
+            "probe_id": self.probe_id,
+            "source_unit_id": self.unit_id,
+            "source_paragraph_id": self.paragraph_id,
+            "kind": self.kind,
+            "source_file": self.source_file.relative_to(source_root).as_posix(),
+            "source_line_numbers": list(self.source_lines),
+            "markdown_fragment": self.markdown_fragment,
+            "rgb": list(self.rgb),
+            "hex": "#" + "".join(f"{channel:02x}" for channel in self.rgb),
+            "ordinal": self.ordinal,
+            "total": self.total,
+            "localization_mode": self.localization_mode,
+        }
+        if self.token_span is not None:
+            line, start, end = self.token_span
+            value["source_token_span"] = {
+                "line": line,
+                "start_column": start + 1,
+                "end_column": end + 1,
+            }
+        return value
+
+
+@dataclasses.dataclass(frozen=True)
+class PageFragment:
+    """A source-only Markdown fragment localized to exactly one page."""
+
+    fragment_id: str
+    unit_id: str
+    paragraph_id: str
+    kind: str
+    markdown: str
+    probe_ids: tuple[str, ...]
+    source_file: Path
+    source_start_line: int
+
+
+@dataclasses.dataclass(frozen=True)
 class AuxReference:
     """One compiler-resolved LaTeX cross-reference from ``.aux`` metadata."""
 
@@ -93,6 +176,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--output-dir", type=Path, required=True)
     parser.add_argument("--paper-id", required=True)
     parser.add_argument("--drop-references", action="store_true")
+    parser.add_argument(
+        "--drop-figures",
+        action="store_true",
+        help="remove figure/figure* environments before both clean and shadow compilation",
+    )
     parser.add_argument("--max-pages", type=int, default=10000)
     parser.add_argument("--dpi", type=int, default=144)
     parser.add_argument("--compile-timeout", type=int, default=300)
@@ -124,6 +212,126 @@ def atomic_write_text(path: Path, value: str) -> None:
         handle.flush()
         os.fsync(handle.fileno())
     os.replace(temporary, path)
+
+
+def _tex_token_is_visible(source: str, offset: int) -> bool:
+    line_start = source.rfind("\n", 0, offset) + 1
+    line_end = source.find("\n", offset)
+    if line_end < 0:
+        line_end = len(source)
+    line = source[line_start:line_end]
+    return offset - line_start < color_pilot.tex_comment_start(line)
+
+
+def strip_ignored_figures(source: str) -> tuple[str, dict[str, Any]]:
+    """Remove visible figure floats while preserving source line numbers.
+
+    Figures, plots and flowcharts are outside this dataset contract.  The
+    removal happens before *both* clean and colored compilation, so generated
+    images and source GT remain the same document.  References whose every
+    label belongs to a removed figure are also removed; mixed-label commands
+    remain untouched and will fail closed later if unresolved.
+    """
+
+    ranges: list[tuple[int, int]] = []
+    stack: list[tuple[str, int]] = []
+    for match in FIGURE_ENVIRONMENT_TOKEN.finditer(source):
+        if not _tex_token_is_visible(source, match.start()):
+            continue
+        action = match.group("action")
+        environment = match.group("environment")
+        if action == "begin":
+            stack.append((environment, match.start()))
+            continue
+        if not stack:
+            raise ValueError(f"unmatched \\end{{{environment}}}")
+        opened_environment, start = stack.pop()
+        if opened_environment != environment:
+            raise ValueError(
+                f"mismatched figure environments: {opened_environment} -> {environment}"
+            )
+        if not stack:
+            ranges.append((start, match.end()))
+    if stack:
+        raise ValueError(f"unclosed figure environment: {stack[-1][0]}")
+
+    removed_labels: set[str] = set()
+    for start, end in ranges:
+        fragment = source[start:end]
+        for label_match in re.finditer(r"\\label\s*\{([^{}]+)\}", fragment):
+            if _tex_token_is_visible(fragment, label_match.start()):
+                removed_labels.add(label_match.group(1).strip())
+    transformed = source
+    for start, end in reversed(ranges):
+        transformed = (
+            transformed[:start]
+            + color_pilot.tex_blank_preserving_lines(transformed[start:end])
+            + transformed[end:]
+        )
+
+    references_removed = 0
+    mixed_references = 0
+
+    def replace_reference(match: re.Match[str]) -> str:
+        nonlocal references_removed, mixed_references
+        if not _tex_token_is_visible(transformed, match.start()):
+            return match.group(0)
+        labels = {
+            label.strip() for label in match.group("labels").split(",") if label.strip()
+        }
+        if labels and labels <= removed_labels:
+            references_removed += 1
+            return color_pilot.tex_blank_preserving_lines(match.group(0))
+        if labels & removed_labels:
+            mixed_references += 1
+        return match.group(0)
+
+    transformed = FIGURE_REFERENCE_COMMAND.sub(replace_reference, transformed)
+    return transformed, {
+        "status": "passed",
+        "figure_environments_removed": len(ranges),
+        "figure_labels_removed": len(removed_labels),
+        "figure_references_removed": references_removed,
+        "mixed_figure_references_retained": mixed_references,
+    }
+
+
+def strip_ignored_figures_tree(source_root: Path) -> dict[str, Any]:
+    files: list[dict[str, Any]] = []
+    totals: collections.Counter[str] = collections.Counter()
+    candidates = sorted(
+        path
+        for path in source_root.rglob("*")
+        if path.is_file() and path.suffix.casefold() in {".tex", ".ltx"}
+    )
+    for index, path in enumerate(candidates, start=1):
+        original = path.read_text(encoding="utf-8", errors="replace")
+        transformed, report = strip_ignored_figures(original)
+        if transformed != original:
+            atomic_write_text(path, transformed)
+        for key in (
+            "figure_environments_removed",
+            "figure_labels_removed",
+            "figure_references_removed",
+            "mixed_figure_references_retained",
+        ):
+            totals[key] += int(report[key])
+        totals["files_changed"] += int(transformed != original)
+        files.append(
+            {
+                "source_file": path.relative_to(source_root).as_posix(),
+                "changed": transformed != original,
+                **report,
+            }
+        )
+        print(
+            f"[figure_strip] file={index}/{len(candidates)} "
+            f"removed={report['figure_environments_removed']} "
+            f"references={report['figure_references_removed']} "
+            f"current={path.relative_to(source_root)}",
+            flush=True,
+        )
+    return {"status": "passed", **dict(sorted(totals.items())), "files": files}
 
 
 def atomic_write_json(path: Path, value: Any) -> None:
@@ -177,7 +385,7 @@ def pdf_literal_restore(engine: str = "pdflatex") -> str:
     return pdf_literal_color((0, 0, 0), engine)
 
 
-def compiled_tex_sources(source_root: Path, build_dir: Path) -> list[Path]:
+def compiled_project_sources(source_root: Path, build_dir: Path) -> list[Path]:
     values: set[Path] = set()
     root = source_root.resolve()
     for fls_path in build_dir.glob("*.fls"):
@@ -192,9 +400,17 @@ def compiled_tex_sources(source_root: Path, build_dir: Path) -> list[Path]:
                 candidate.relative_to(root)
             except ValueError:
                 continue
-            if candidate.suffix.casefold() == ".tex" and candidate.is_file():
+            if candidate.suffix.casefold() in {".tex", ".ltx", ".sty", ".cls"} and candidate.is_file():
                 values.add(candidate)
     return sorted(values)
+
+
+def compiled_tex_sources(source_root: Path, build_dir: Path) -> list[Path]:
+    return [
+        path
+        for path in compiled_project_sources(source_root, build_dir)
+        if path.suffix.casefold() in {".tex", ".ltx"}
+    ]
 
 
 def replace_balanced_command(
@@ -243,7 +459,26 @@ def normalize_source_deterministic_commands(raw: str) -> str:
         " ",
         value,
     )
-    value = re.sub(r"\\(?:allowbreak|break|smallskip|medskip|bigskip)\b", " ", value)
+    value = re.sub(
+        r"\\(?:allowbreak|break|smallskip|medskip|bigskip|newpage|clearpage|vfill)\b",
+        " ",
+        value,
+    )
+    value = re.sub(
+        r"\\(?:vspace|hspace)\*?\s*\{[^{}]*\}",
+        " ",
+        value,
+    )
+    value = re.sub(
+        r"\\(?:thispagestyle|pagestyle)\s*\{[^{}]*\}",
+        " ",
+        value,
+    )
+    value = re.sub(
+        r"\\(?:tiny|scriptsize|footnotesize|small|normalsize|large|Large|LARGE|huge|Huge)\b",
+        " ",
+        value,
+    )
     for command in (
         "mbox",
         "hbox",
@@ -252,6 +487,7 @@ def normalize_source_deterministic_commands(raw: str) -> str:
         "textsc",
         "underline",
         "uline",
+        "fbox",
     ):
         value = replace_balanced_command(
             value,
@@ -259,6 +495,18 @@ def normalize_source_deterministic_commands(raw: str) -> str:
             argument_count=1,
             visible_argument=0,
         )
+    value = replace_balanced_command(
+        value,
+        "parbox",
+        argument_count=2,
+        visible_argument=1,
+    )
+    value = replace_balanced_command(
+        value,
+        "resizebox",
+        argument_count=3,
+        visible_argument=2,
+    )
     value = replace_balanced_command(
         value,
         "href",
@@ -291,6 +539,59 @@ def normalize_source_deterministic_commands(raw: str) -> str:
         visible_argument=0,
     )
     return value
+
+
+def tex_text_punctuation_to_unicode(value: str) -> str:
+    """Convert TeX text punctuation while leaving inline math untouched."""
+
+    output: list[str] = []
+    index = 0
+    in_dollar_math = False
+    in_paren_math = False
+    while index < len(value):
+        if value.startswith(r"\(", index):
+            in_paren_math = True
+            output.append(r"\(")
+            index += 2
+            continue
+        if value.startswith(r"\)", index):
+            in_paren_math = False
+            output.append(r"\)")
+            index += 2
+            continue
+        character = value[index]
+        escaped = index > 0 and value[index - 1] == "\\"
+        if character == "$" and not escaped and not in_paren_math:
+            in_dollar_math = not in_dollar_math
+            output.append(character)
+            index += 1
+            continue
+        in_math = in_dollar_math or in_paren_math
+        if not in_math and value.startswith("---", index):
+            output.append("—")
+            index += 3
+        elif not in_math and value.startswith("--", index):
+            output.append("–")
+            index += 2
+        elif not in_math and value.startswith("``", index):
+            output.append("“")
+            index += 2
+        elif not in_math and value.startswith("''", index):
+            output.append("”")
+            index += 2
+        elif not in_math and character == "`" and not escaped:
+            output.append("‘")
+            index += 1
+        elif not in_math and character == "'" and not escaped:
+            output.append("’")
+            index += 1
+        elif not in_math and value.startswith(r"\,", index):
+            output.append(" ")
+            index += 2
+        else:
+            output.append(character)
+            index += 1
+    return "".join(output)
 
 
 def _aux_fields(payload: str) -> list[str]:
@@ -431,6 +732,8 @@ def source_paragraph_to_markdown(
     ).strip()
     raw = normalize_source_deterministic_commands(raw)
     raw = resolve_source_references(raw, references or {})
+    raw = tex_text_punctuation_to_unicode(raw)
+    raw = raw.lstrip()
     raw = re.sub(r"^(?:\\(?:noindent|leavevmode)\b\s*)+", "", raw)
     if paragraph.kind.endswith("_item"):
         item_match = re.match(r"^\\item(?:\s*\[[^\]]*\])?\s*", raw)
@@ -493,61 +796,394 @@ def build_source_units(
     return units, rejections
 
 
-def parse_aux_heading_numbers(aux_path: Path) -> dict[tuple[str, str], list[str]]:
-    """Return compiler-assigned heading numbers from the LaTeX aux stream."""
+def _plain_word_probes(
+    unit: SourceUnit,
+    *,
+    color_index_start: int,
+) -> list[SourceProbe]:
+    """Return word probes only when source/Markdown spans are unambiguous.
 
-    values: dict[tuple[str, str], list[str]] = collections.defaultdict(list)
-    if not aux_path.is_file():
-        return values
-    for line in aux_path.read_text(encoding="utf-8", errors="replace").splitlines():
-        marker = re.search(r"\\contentsline\s*", line)
-        if marker is None:
+    Exact token-wise source/Markdown alignment is the safety gate.  This keeps
+    source markup (bold, emphasis, code and compact inline math) while allowing
+    the color locator to follow the rendered token across a page boundary.
+    Alignment characters, macro parameters, comments and whitespace-bearing
+    inline math remain whole-unit fallbacks.
+    """
+
+    if unit.kind not in {"paragraph", "itemize_item", "enumerate_item"}:
+        return []
+    if WORD_PROBE_FORBIDDEN.search(unit.raw_latex):
+        return []
+    raw_dollars = [
+        match.start()
+        for match in re.finditer(r"(?<!\\)\$", unit.raw_latex)
+    ]
+    if len(raw_dollars) % 2 or "$$" in unit.raw_latex:
+        return []
+    if any(
+        re.search(r"\s", unit.raw_latex[left + 1 : right])
+        for left, right in zip(raw_dollars[::2], raw_dollars[1::2])
+    ):
+        return []
+    if r"\[" in unit.raw_latex or r"\]" in unit.raw_latex:
+        return []
+    paren_math = list(
+        re.finditer(r"\\\((.*?)\\\)", unit.raw_latex, flags=re.DOTALL)
+    )
+    if (
+        unit.raw_latex.count(r"\(") != len(paren_math)
+        or unit.raw_latex.count(r"\)") != len(paren_math)
+    ):
+        return []
+    if any(re.search(r"\s", match.group(1)) for match in paren_math):
+        return []
+    expected_lines = tuple(range(unit.start_line, unit.end_line + 1))
+    if unit.source_lines != expected_lines:
+        return []
+    source = unit.source_file.read_text(encoding="utf-8", errors="replace")
+    lines = source.splitlines(keepends=True)
+    if unit.start_line < 1 or unit.end_line > len(lines):
+        return []
+    line_starts: list[int] = []
+    cursor = 0
+    for line in lines:
+        line_starts.append(cursor)
+        cursor += len(line)
+    range_start = line_starts[unit.start_line - 1]
+    range_end = (
+        line_starts[unit.end_line]
+        if unit.end_line < len(line_starts)
+        else len(source)
+    )
+    selected = source[range_start:range_end]
+    raw = unit.raw_latex
+    relative = selected.find(raw)
+    if relative < 0 or selected.find(raw, relative + 1) >= 0:
+        return []
+    raw_start = range_start + relative
+    raw_visible_offset = 0
+    markdown_visible_offset = 0
+    if unit.kind.endswith("_item"):
+        item_match = re.match(r"^\s*\\item(?:\s*\[[^\]]*\])?\s*", raw)
+        if item_match is None:
+            return []
+        markdown_prefix = "- " if unit.kind == "itemize_item" else re.match(
+            r"^\d+\.\s+", unit.markdown
+        )
+        if unit.kind == "itemize_item":
+            if not unit.markdown.startswith(markdown_prefix):
+                return []
+            markdown_visible_offset = len(markdown_prefix)
+        else:
+            if markdown_prefix is None:
+                return []
+            markdown_visible_offset = markdown_prefix.end()
+        raw_visible_offset = item_match.end()
+    source_visible = raw[raw_visible_offset:]
+    markdown_visible = unit.markdown[markdown_visible_offset:]
+    source_tokens = list(NONWHITESPACE_TOKEN.finditer(source_visible))
+    markdown_tokens = list(NONWHITESPACE_TOKEN.finditer(markdown_visible))
+    if len(source_tokens) < 2 or len(source_tokens) != len(markdown_tokens):
+        return []
+    for source_token, markdown_token in zip(source_tokens, markdown_tokens):
+        if page_gt.normalize_tokens(source_token.group(0)) != page_gt.normalize_tokens(
+            markdown_token.group(0)
+        ):
+            return []
+
+    probes: list[SourceProbe] = []
+    total = len(source_tokens)
+    for ordinal, (source_token, markdown_token) in enumerate(
+        zip(source_tokens, markdown_tokens), start=1
+    ):
+        absolute_start = raw_start + raw_visible_offset + source_token.start()
+        absolute_end = raw_start + raw_visible_offset + source_token.end()
+        line_index = bisect.bisect_right(line_starts, absolute_start) - 1
+        if line_index < 0 or absolute_end > line_starts[line_index] + len(lines[line_index]):
+            return []
+        start_column = absolute_start - line_starts[line_index]
+        end_column = absolute_end - line_starts[line_index]
+        markdown_start = (
+            0
+            if ordinal == 1
+            else markdown_visible_offset + markdown_token.start()
+        )
+        markdown_end = (
+            len(unit.markdown)
+            if ordinal == total
+            else markdown_visible_offset + markdown_tokens[ordinal].start()
+        )
+        probes.append(
+            SourceProbe(
+                probe_id=f"{unit.unit_id}-word-{ordinal:05d}",
+                unit_id=unit.unit_id,
+                paragraph_id=unit.paragraph_id,
+                kind=unit.kind,
+                source_file=unit.source_file,
+                source_lines=unit.source_lines,
+                markdown_fragment=unit.markdown[markdown_start:markdown_end],
+                rgb=color_pilot.deterministic_rgb(color_index_start + ordinal - 1),
+                ordinal=ordinal,
+                total=total,
+                localization_mode="plain_word",
+                token_span=(line_index + 1, start_column, end_column),
+            )
+        )
+    if "".join(probe.markdown_fragment for probe in probes) != unit.markdown:
+        return []
+    return probes
+
+
+def build_source_probes(
+    units: Sequence[SourceUnit],
+    *,
+    word_probe_kinds: set[str] | None = None,
+) -> tuple[list[SourceProbe], dict[str, str]]:
+    """Build color locators while preserving each parent unit as content truth."""
+
+    probes: list[SourceProbe] = []
+    modes: dict[str, str] = {}
+    # ``reject_line_overlaps`` can remove units from the middle of the original
+    # color sequence.  Starting word-probe colors at ``len(units)`` would then
+    # collide with a surviving later unit.  Reserve every whole-unit color and
+    # allocate each word-probe color from the remaining deterministic palette.
+    used_colors = {unit.rgb for unit in units}
+    next_color_index = 0
+
+    def allocate_probe_color() -> tuple[int, int, int]:
+        nonlocal next_color_index
+        while True:
+            rgb = color_pilot.deterministic_rgb(next_color_index)
+            next_color_index += 1
+            if rgb not in used_colors:
+                used_colors.add(rgb)
+                return rgb
+
+    for unit in units:
+        allow_word_probe = (
+            word_probe_kinds is None or unit.kind in word_probe_kinds
+        )
+        word_probes = (
+            _plain_word_probes(unit, color_index_start=0)
+            if allow_word_probe
+            else []
+        )
+        if word_probes:
+            probes.extend(
+                dataclasses.replace(probe, rgb=allocate_probe_color())
+                for probe in word_probes
+            )
+            modes[unit.unit_id] = "plain_word"
             continue
-        cursor = marker.end()
-        while cursor < len(line) and line[cursor].isspace():
-            cursor += 1
-        kind_group = page_gt.extract_balanced(line, cursor)
-        if kind_group is None:
+        probes.append(
+            SourceProbe(
+                probe_id=f"{unit.unit_id}-whole",
+                unit_id=unit.unit_id,
+                paragraph_id=unit.paragraph_id,
+                kind=unit.kind,
+                source_file=unit.source_file,
+                source_lines=unit.source_lines,
+                markdown_fragment=unit.markdown,
+                rgb=unit.rgb,
+                ordinal=1,
+                total=1,
+                localization_mode="whole",
+            )
+        )
+        modes[unit.unit_id] = "whole"
+    return probes, modes
+
+
+def _titleformat_label_template(command: str, label: str) -> str | None:
+    """Return a source-exact visible label around ``{number}``, or ``None``."""
+
+    marker = "\\the" + command
+    if label.count(marker) != 1:
+        return None
+    value = label
+    value = re.sub(
+        r"\\(?:quad|qquad|enspace|thinspace|space|nobreakspace|relax)\b",
+        "",
+        value,
+    )
+    value = value.replace("~", " ")
+    value = tex_text_punctuation_to_unicode(value)
+    value = value.replace(marker, "{number}")
+    if "\\" in value or "{" in value.replace("{number}", "") or "}" in value.replace(
+        "{number}", ""
+    ):
+        return None
+    return value.strip()
+
+
+def parse_unique_titleformat_labels(
+    source_files: Iterable[Path],
+) -> tuple[dict[str, str], dict[str, Any]]:
+    """Parse only unambiguous ``titlesec`` label arguments from executed source."""
+
+    observed: dict[str, list[str]] = collections.defaultdict(list)
+    definitions = 0
+    rejected = 0
+    for source_file in source_files:
+        source = "\n".join(
+            page_gt.strip_tex_comment(line)
+            for line in source_file.read_text(
+                encoding="utf-8", errors="replace"
+            ).splitlines()
+        )
+        cursor = 0
+        pattern = re.compile(r"\\titleformat\s*")
+        while match := pattern.search(source, cursor):
+            argument_cursor = match.end()
+            command_group = page_gt.extract_balanced(source, argument_cursor)
+            if command_group is None:
+                rejected += 1
+                cursor = match.end()
+                continue
+            command_match = re.fullmatch(
+                r"\s*\\(section|subsection|subsubsection|paragraph|subparagraph)\s*",
+                command_group[0],
+            )
+            argument_cursor = command_group[1]
+            while argument_cursor < len(source) and source[argument_cursor].isspace():
+                argument_cursor += 1
+            if argument_cursor < len(source) and source[argument_cursor] == "[":
+                argument_cursor = color_pilot.balanced_group_end(
+                    source, argument_cursor, "[", "]"
+                )
+            arguments: list[str] = []
+            for _ in range(4):
+                while argument_cursor < len(source) and source[argument_cursor].isspace():
+                    argument_cursor += 1
+                group = page_gt.extract_balanced(source, argument_cursor)
+                if group is None:
+                    break
+                arguments.append(group[0])
+                argument_cursor = group[1]
+            cursor = max(argument_cursor, match.end())
+            if command_match is None or len(arguments) != 4:
+                rejected += 1
+                continue
+            command = command_match.group(1)
+            template = _titleformat_label_template(command, arguments[1])
+            if template is None:
+                rejected += 1
+                continue
+            observed[command].append(template)
+            definitions += 1
+    accepted: dict[str, str] = {}
+    ambiguous: dict[str, list[str]] = {}
+    for command, templates in sorted(observed.items()):
+        unique = sorted(set(templates))
+        if len(unique) == 1:
+            accepted[command] = unique[0]
+        else:
+            ambiguous[command] = unique
+    return accepted, {
+        "policy_version": HEADING_LABEL_POLICY_VERSION,
+        "definitions_parsed": definitions,
+        "definitions_rejected": rejected,
+        "labels": dict(sorted(accepted.items())),
+        "ambiguous": ambiguous,
+    }
+
+
+def parse_aux_heading_numbers(
+    aux_paths: Path | Iterable[Path],
+) -> dict[tuple[str, str], list[str | None]]:
+    """Return compiler-resolved heading-number visibility from aux streams.
+
+    Some document classes render an unstarred command such as ``\\paragraph``
+    without a visible number.  Its ``\\contentsline`` is present but has no
+    ``\\numberline``.  Recording ``None`` distinguishes that compiler-resolved
+    unnumbered form from a heading that is genuinely missing from metadata.
+    """
+
+    values: dict[tuple[str, str], list[str | None]] = collections.defaultdict(list)
+    paths = [aux_paths] if isinstance(aux_paths, Path) else list(aux_paths)
+    for aux_path in paths:
+        if not aux_path.is_file():
             continue
-        kind, cursor = kind_group
-        while cursor < len(line) and line[cursor].isspace():
-            cursor += 1
-        title_group = page_gt.extract_balanced(line, cursor)
-        if title_group is None:
-            continue
-        title_raw = title_group[0]
-        number_match = re.match(r"\s*\\numberline\s*", title_raw)
-        if number_match is None:
-            continue
-        number_group = page_gt.extract_balanced(title_raw, number_match.end())
-        if number_group is None:
-            continue
-        number, title_start = number_group
-        title = page_gt.latex_to_plain(title_raw[title_start:])
-        key = (kind.strip(), page_gt.normalize_space(title).casefold())
-        values[key].append(page_gt.latex_to_plain(number))
+        for line in aux_path.read_text(encoding="utf-8", errors="replace").splitlines():
+            marker = re.search(r"\\contentsline\s*", line)
+            if marker is None:
+                continue
+            cursor = marker.end()
+            while cursor < len(line) and line[cursor].isspace():
+                cursor += 1
+            kind_group = page_gt.extract_balanced(line, cursor)
+            if kind_group is None:
+                continue
+            kind, cursor = kind_group
+            while cursor < len(line) and line[cursor].isspace():
+                cursor += 1
+            title_group = page_gt.extract_balanced(line, cursor)
+            if title_group is None:
+                continue
+            title_raw = title_group[0]
+            number: str | None = None
+            title_start = 0
+            number_match = re.match(r"\s*\\numberline\s*", title_raw)
+            if number_match is not None:
+                number_group = page_gt.extract_balanced(title_raw, number_match.end())
+                if number_group is None:
+                    continue
+                number, title_start = number_group
+                number = page_gt.latex_to_plain(number)
+            else:
+                trailing_fields: list[str] = []
+                trailing_cursor = title_group[1]
+                for _ in range(2):
+                    while (
+                        trailing_cursor < len(line)
+                        and line[trailing_cursor].isspace()
+                    ):
+                        trailing_cursor += 1
+                    trailing_group = page_gt.extract_balanced(line, trailing_cursor)
+                    if trailing_group is None:
+                        break
+                    trailing_fields.append(trailing_group[0])
+                    trailing_cursor = trailing_group[1]
+                anchor = trailing_fields[1].strip() if len(trailing_fields) == 2 else ""
+                if re.fullmatch(
+                    r"(?:section|subsection|subsubsection|paragraph|subparagraph)\*\.\d+",
+                    anchor,
+                ) is None:
+                    continue
+            title = page_gt.latex_to_plain(
+                tex_text_punctuation_to_unicode(title_raw[title_start:])
+            )
+            key = (kind.strip(), page_gt.normalize_space(title).casefold())
+            values[key].append(number)
     return values
 
 
 def build_heading_units(
     blocks: Sequence[page_gt.SourceBlock],
-    aux_path: Path,
+    aux_paths: Path | Iterable[Path],
     *,
     color_index_offset: int,
+    heading_label_templates: dict[str, str] | None = None,
 ) -> tuple[list[SourceUnit], list[dict[str, Any]]]:
-    number_queues = parse_aux_heading_numbers(aux_path)
+    number_queues = parse_aux_heading_numbers(aux_paths)
     units: list[SourceUnit] = []
     rejections: list[dict[str, Any]] = []
     for block in blocks:
         if block.kind != "heading" or not block.heading_command or not block.heading_source_title:
             continue
-        title = page_gt.latex_to_plain(block.heading_source_title)
-        if not title:
+        title_visible = page_gt.latex_to_plain(
+            tex_text_punctuation_to_unicode(block.heading_source_title)
+        )
+        if not title_visible:
             rejections.append({"source_block_id": block.block_id, "reason": "empty heading title"})
             continue
+        title = inline_markup.escape_markdown_text(title_visible)
         number: str | None = None
         if not block.heading_starred:
-            key = (block.heading_command, page_gt.normalize_space(title).casefold())
+            key = (
+                block.heading_command,
+                page_gt.normalize_space(title_visible).casefold(),
+            )
             queue = number_queues.get(key, [])
             if not queue:
                 rejections.append(
@@ -556,7 +1192,14 @@ def build_heading_units(
                 continue
             number = queue.pop(0)
         level = int(block.heading_level or 2)
-        markdown = "#" * level + " " + ((number + " ") if number else "") + title
+        if number:
+            template = (heading_label_templates or {}).get(
+                block.heading_command, "{number}"
+            )
+            visible_number = template.format(number=number)
+        else:
+            visible_number = ""
+        markdown = "#" * level + " " + ((visible_number + " ") if visible_number else "") + title
         index = color_index_offset + len(units)
         units.append(
             SourceUnit(
@@ -611,10 +1254,32 @@ def reject_line_overlaps(
     return accepted, rejections
 
 
+LIST_LEADING_VISIBLE_WRAPPER = re.compile(
+    r"\\(?:underline|textbf|textit|emph|texttt|textnormal|textrm|textsf|"
+    r"textsl|textup|textsc|mbox|hbox)\s*\{"
+)
+
+
+def list_payload_color_offset(line: str, item_end: int) -> int:
+    """Place a whole-item probe inside deterministic leading text wrappers."""
+
+    cursor = item_end
+    while cursor < len(line) and line[cursor].isspace():
+        cursor += 1
+    wrappers = 0
+    while match := LIST_LEADING_VISIBLE_WRAPPER.match(line, cursor):
+        wrappers += 1
+        cursor = match.end()
+        while cursor < len(line) and line[cursor].isspace():
+            cursor += 1
+    return cursor if wrappers else item_end
+
+
 def instrument_source_file(
     source: str,
     units: Sequence[SourceUnit],
     engine: str = "pdflatex",
+    probes: Sequence[SourceProbe] | None = None,
 ) -> str:
     """Switch colors at complete paragraph boundaries without TeX grouping.
 
@@ -625,10 +1290,18 @@ def instrument_source_file(
     """
 
     lines = source.splitlines(keepends=True)
+    word_probes = [
+        probe
+        for probe in (probes or ())
+        if probe.localization_mode == "plain_word"
+    ]
+    word_unit_ids = {probe.unit_id for probe in word_probes}
     prefixes: dict[int, str] = {}
     suffixes: dict[int, str] = {}
     occupied: set[int] = set()
     for unit in sorted(units, key=lambda value: value.start_line):
+        if unit.unit_id in word_unit_ids:
+            continue
         start = unit.start_line - 1
         end = unit.end_line - 1
         if start < 0 or end >= len(lines):
@@ -663,10 +1336,11 @@ def instrument_source_file(
             item_match = re.search(r"\\item(?:\s*\[[^\]]*\])?", lines[start])
             if item_match is None:
                 raise ValueError(f"list item command not found: {unit.unit_id}")
+            insertion = list_payload_color_offset(lines[start], item_match.end())
             lines[start] = (
-                lines[start][: item_match.end()]
+                lines[start][:insertion]
                 + color_switch
-                + lines[start][item_match.end() :]
+                + lines[start][insertion:]
             )
             suffixes[end] = suffixes.get(end, "") + black_switch
             continue
@@ -680,6 +1354,43 @@ def instrument_source_file(
             # mode can become a page-break object and move later floats.
             prefixes[start] = prefixes.get(start, "") + "\\leavevmode" + color_switch
         suffixes[end] = suffixes.get(end, "") + black_switch
+
+    token_edits: dict[int, list[tuple[int, int, str, str]]] = collections.defaultdict(list)
+    token_spans: set[tuple[int, int, int]] = set()
+    for probe in word_probes:
+        if probe.token_span is None:
+            raise ValueError(f"word probe has no token span: {probe.probe_id}")
+        line_number, start_column, end_column = probe.token_span
+        line_index = line_number - 1
+        if line_index < 0 or line_index >= len(lines):
+            raise ValueError(f"probe line outside source: {probe.probe_id}")
+        span = (line_index, start_column, end_column)
+        if span in token_spans:
+            raise ValueError(f"duplicate source token probe span: {probe.probe_id}")
+        token_spans.add(span)
+        if not 0 <= start_column < end_column <= len(lines[line_index]):
+            raise ValueError(f"probe columns outside source: {probe.probe_id}")
+        prefix = pdf_literal_color(probe.rgb, engine)
+        if probe.ordinal == 1:
+            prefix = "\\leavevmode" + prefix
+        token_edits[line_index].append(
+            (start_column, end_column, prefix, pdf_literal_restore(engine))
+        )
+    for line_index, edits in token_edits.items():
+        rendered = lines[line_index]
+        previous_start = len(rendered) + 1
+        for start_column, end_column, prefix, suffix in sorted(edits, reverse=True):
+            if end_column > previous_start:
+                raise ValueError(f"overlapping word probes on source line {line_index + 1}")
+            rendered = (
+                rendered[:start_column]
+                + prefix
+                + rendered[start_column:end_column]
+                + suffix
+                + rendered[end_column:]
+            )
+            previous_start = start_column
+        lines[line_index] = rendered
     output: list[str] = []
     for index, line in enumerate(lines):
         prefix = prefixes.get(index, "")
@@ -697,11 +1408,15 @@ def instrument_source_tree(
     clean_root: Path,
     colored_root: Path,
     units: Sequence[SourceUnit],
+    probes: Sequence[SourceProbe],
     engine: str = "pdflatex",
 ) -> None:
     by_file: dict[Path, list[SourceUnit]] = collections.defaultdict(list)
     for unit in units:
         by_file[unit.source_file.resolve()].append(unit)
+    probes_by_file: dict[Path, list[SourceProbe]] = collections.defaultdict(list)
+    for probe in probes:
+        probes_by_file[probe.source_file.resolve()].append(probe)
     for clean_path, file_units in by_file.items():
         relative = clean_path.relative_to(clean_root.resolve())
         colored_path = colored_root / relative
@@ -709,17 +1424,20 @@ def instrument_source_tree(
             colored_path.read_text(encoding="utf-8", errors="replace"),
             file_units,
             engine,
+            probes_by_file.get(clean_path, []),
         )
         atomic_write_text(colored_path, rendered)
 
 
 def extract_color_geometry(
     colored_pdf: Path,
-    units: Sequence[SourceUnit],
+    probes: Sequence[SourceProbe],
 ) -> tuple[dict[str, list[dict[str, Any]]], dict[str, Any]]:
     """Map source IDs to pages/bboxes without reading PDF character text."""
 
-    unit_by_rgb = {unit.rgb: unit for unit in units}
+    probe_by_rgb = {probe.rgb: probe for probe in probes}
+    if len(probe_by_rgb) != len(probes):
+        raise ValueError("source probe RGB values must be unique")
     observed: dict[str, dict[int, list[dict[str, Any]]]] = collections.defaultdict(
         lambda: collections.defaultdict(list)
     )
@@ -729,10 +1447,10 @@ def extract_color_geometry(
             matched = 0
             for char in page.chars:
                 rgb = color_pilot.normalize_pdf_rgb(char.get("non_stroking_color"))
-                unit = unit_by_rgb.get(rgb)
-                if unit is None:
+                probe = probe_by_rgb.get(rgb)
+                if probe is None:
                     continue
-                observed[unit.unit_id][page_number].append(char)
+                observed[probe.probe_id][page_number].append(char)
                 matched += 1
             print(
                 f"[color_page] page={page_number}/{total_pages} "
@@ -741,9 +1459,11 @@ def extract_color_geometry(
             )
     rows: dict[str, list[dict[str, Any]]] = {}
     mapped = multi_page = 0
-    for unit in units:
+    mode_counts: collections.Counter[str] = collections.Counter()
+    for probe in probes:
+        mode_counts[probe.localization_mode] += 1
         pages: list[dict[str, Any]] = []
-        for page_number, chars in sorted(observed.get(unit.unit_id, {}).items()):
+        for page_number, chars in sorted(observed.get(probe.probe_id, {}).items()):
             pages.append(
                 {
                     "page_number": page_number,
@@ -756,29 +1476,174 @@ def extract_color_geometry(
                     "characters": len(chars),
                 }
             )
-        rows[unit.unit_id] = pages
+        rows[probe.probe_id] = pages
         if pages:
             mapped += 1
         if len(pages) > 1:
             multi_page += 1
     return rows, {
-        "units_total": len(units),
-        "units_mapped": mapped,
-        "units_unmapped": len(units) - mapped,
-        "units_spanning_multiple_pages": multi_page,
-        "coverage": round(mapped / max(1, len(units)), 6),
+        "probes_total": len(probes),
+        "probes_mapped": mapped,
+        "probes_unmapped": len(probes) - mapped,
+        "probes_spanning_multiple_pages": multi_page,
+        "probe_mode_counts": dict(sorted(mode_counts.items())),
+        "coverage": round(mapped / max(1, len(probes)), 6),
     }
 
 
+def build_page_fragments(
+    units: Sequence[SourceUnit],
+    probes: Sequence[SourceProbe],
+    color_rows: dict[str, list[dict[str, Any]]],
+) -> tuple[
+    dict[int, list[tuple[PageFragment, dict[str, Any]]]],
+    dict[int, set[str]],
+    dict[str, Any],
+]:
+    """Convert color-only probe placements into source Markdown fragments."""
+
+    probes_by_unit: dict[str, list[SourceProbe]] = collections.defaultdict(list)
+    for probe in probes:
+        probes_by_unit[probe.unit_id].append(probe)
+    placements_by_page: dict[int, list[tuple[PageFragment, dict[str, Any]]]] = (
+        collections.defaultdict(list)
+    )
+    reasons_by_page: dict[int, set[str]] = collections.defaultdict(set)
+    summary: collections.Counter[str] = collections.Counter()
+    for unit in units:
+        unit_probes = sorted(probes_by_unit[unit.unit_id], key=lambda probe: probe.ordinal)
+        if not unit_probes:
+            summary["units_without_probes"] += 1
+            continue
+        mode = unit_probes[0].localization_mode
+        if any(probe.localization_mode != mode for probe in unit_probes):
+            raise ValueError(f"mixed localization modes for {unit.unit_id}")
+        if mode == "whole":
+            pages = color_rows.get(unit_probes[0].probe_id, [])
+            if len(pages) > 1:
+                for page in pages:
+                    reasons_by_page[int(page["page_number"])].add(
+                        "cross_page_source_paragraph"
+                    )
+                summary["whole_units_cross_page"] += 1
+                continue
+            if not pages:
+                summary["whole_units_unmapped"] += 1
+                continue
+            page = pages[0]
+            page_number = int(page["page_number"])
+            fragment = PageFragment(
+                fragment_id=f"{unit.unit_id}-page-{page_number:04d}",
+                unit_id=unit.unit_id,
+                paragraph_id=unit.paragraph_id,
+                kind=unit.kind,
+                markdown=unit.markdown,
+                probe_ids=(unit_probes[0].probe_id,),
+                source_file=unit.source_file,
+                source_start_line=unit.start_line,
+            )
+            placements_by_page[page_number].append((fragment, page))
+            summary["whole_units_mapped"] += 1
+            continue
+
+        if mode != "plain_word":
+            raise ValueError(f"unknown source localization mode: {mode}")
+        invalid = False
+        known_pages: set[int] = set()
+        page_sequence: list[int] = []
+        for probe in unit_probes:
+            pages = color_rows.get(probe.probe_id, [])
+            if len(pages) != 1:
+                invalid = True
+                for page in pages:
+                    known_pages.add(int(page["page_number"]))
+                continue
+            page_number = int(pages[0]["page_number"])
+            known_pages.add(page_number)
+            page_sequence.append(page_number)
+        if invalid or len(page_sequence) != len(unit_probes):
+            for page_number in known_pages:
+                reasons_by_page[page_number].add("source_word_probe_incomplete")
+            summary["plain_units_incomplete"] += 1
+            continue
+        if any(right < left for left, right in zip(page_sequence, page_sequence[1:])):
+            for page_number in known_pages:
+                reasons_by_page[page_number].add("source_word_probe_page_order_mismatch")
+            summary["plain_units_page_order_mismatch"] += 1
+            continue
+        cursor = 0
+        while cursor < len(unit_probes):
+            page_number = page_sequence[cursor]
+            end = cursor + 1
+            while end < len(unit_probes) and page_sequence[end] == page_number:
+                end += 1
+            selected = unit_probes[cursor:end]
+            selected_pages = [color_rows[probe.probe_id][0] for probe in selected]
+            bboxes = [page["bbox_points"] for page in selected_pages]
+            placement = {
+                "page_number": page_number,
+                "bbox_points": [
+                    round(min(float(bbox[0]) for bbox in bboxes), 3),
+                    round(min(float(bbox[1]) for bbox in bboxes), 3),
+                    round(max(float(bbox[2]) for bbox in bboxes), 3),
+                    round(max(float(bbox[3]) for bbox in bboxes), 3),
+                ],
+                "characters": sum(int(page["characters"]) for page in selected_pages),
+                "probe_ids": [probe.probe_id for probe in selected],
+                "probe_ordinals": [selected[0].ordinal, selected[-1].ordinal],
+            }
+            markdown = "".join(probe.markdown_fragment for probe in selected).strip()
+            if not markdown:
+                reasons_by_page[page_number].add("empty_source_word_fragment")
+            else:
+                fragment = PageFragment(
+                    fragment_id=(
+                        f"{unit.unit_id}-words-{selected[0].ordinal:05d}-"
+                        f"{selected[-1].ordinal:05d}"
+                    ),
+                    unit_id=unit.unit_id,
+                    paragraph_id=unit.paragraph_id,
+                    kind=unit.kind,
+                    markdown=markdown,
+                    probe_ids=tuple(probe.probe_id for probe in selected),
+                    source_file=unit.source_file,
+                    source_start_line=unit.start_line,
+                )
+                placements_by_page[page_number].append((fragment, placement))
+            cursor = end
+        summary["plain_units_mapped"] += 1
+        if len(known_pages) > 1:
+            summary["plain_units_split_across_pages"] += 1
+    return placements_by_page, reasons_by_page, dict(sorted(summary.items()))
+
+
+def compose_page_markdown(
+    ordered: Sequence[tuple[PageFragment, dict[str, Any]]],
+) -> str:
+    """Join page fragments while preserving source paragraph identity."""
+
+    output = ""
+    previous: PageFragment | None = None
+    for fragment, _ in ordered:
+        if previous is None:
+            output = fragment.markdown
+        elif fragment.paragraph_id == previous.paragraph_id:
+            output = output.rstrip() + " " + fragment.markdown.lstrip()
+        else:
+            output = output.rstrip() + "\n\n" + fragment.markdown.lstrip()
+        previous = fragment
+    return output.strip() + ("\n" if output.strip() else "")
+
+
 def order_page_units(
-    placements: Sequence[tuple[SourceUnit, dict[str, Any]]],
+    placements: Sequence[tuple[PageFragment, dict[str, Any]]],
     page_width: float,
-) -> tuple[list[tuple[SourceUnit, dict[str, Any]]], str | None]:
+) -> tuple[list[tuple[PageFragment, dict[str, Any]]], str | None]:
     midpoint = page_width / 2.0
     gutter = max(8.0, page_width * 0.025)
-    left: list[tuple[SourceUnit, dict[str, Any]]] = []
-    right: list[tuple[SourceUnit, dict[str, Any]]] = []
-    full: list[tuple[SourceUnit, dict[str, Any]]] = []
+    left: list[tuple[PageFragment, dict[str, Any]]] = []
+    right: list[tuple[PageFragment, dict[str, Any]]] = []
+    full: list[tuple[PageFragment, dict[str, Any]]] = []
     for placement in placements:
         bbox = placement[1]["bbox_points"]
         if bbox[2] <= midpoint + gutter:
@@ -787,18 +1652,315 @@ def order_page_units(
             right.append(placement)
         else:
             full.append(placement)
-    key = lambda item: (float(item[1]["bbox_points"][1]), float(item[1]["bbox_points"][0]))
+    def ordered(
+        values: Sequence[tuple[PageFragment, dict[str, Any]]],
+    ) -> list[tuple[PageFragment, dict[str, Any]]]:
+        geometry_order = sorted(
+            values,
+            key=lambda item: (
+                float(item[1]["bbox_points"][1]),
+                float(item[1]["bbox_points"][0]),
+            ),
+        )
+        output: list[tuple[PageFragment, dict[str, Any]]] = []
+        cursor = 0
+        while cursor < len(geometry_order):
+            anchor_top = float(geometry_order[cursor][1]["bbox_points"][1])
+            end = cursor + 1
+            while (
+                end < len(geometry_order)
+                and float(geometry_order[end][1]["bbox_points"][1]) - anchor_top
+                <= 4.0
+            ):
+                end += 1
+            cluster = geometry_order[cursor:end]
+            source_files = {
+                fragment.source_file.resolve() for fragment, _ in cluster
+            }
+            # Run-in headings often share the first visual line with the
+            # following paragraph.  Their larger font can report a slightly
+            # lower PDF top coordinate.  Only for this tight same-file visual
+            # cluster, use source line order as the deterministic tiebreaker.
+            if len(source_files) == 1 and any(
+                fragment.kind == "heading" for fragment, _ in cluster
+            ):
+                cluster = sorted(
+                    cluster,
+                    key=lambda item: (
+                        item[0].source_start_line,
+                        0 if item[0].kind == "heading" else 1,
+                        float(item[1]["bbox_points"][1]),
+                        float(item[1]["bbox_points"][0]),
+                    ),
+                )
+            output.extend(cluster)
+            cursor = end
+        return output
+
     if left and right and full:
         return [], "mixed_full_and_columns"
     if left and right:
-        return sorted(left, key=key) + sorted(right, key=key), None
-    return sorted([*left, *right, *full], key=key), None
+        return ordered(left) + ordered(right), None
+    return ordered([*left, *right, *full]), None
 
 
 def pdf_verifier_text(page: Any) -> tuple[str, str]:
     nodes = page_gt.words_to_line_nodes(page)
     ordered, layout = page_gt.order_page_nodes(nodes, float(page.width))
-    return page_gt.join_text_lines(ordered), layout
+    if not ordered:
+        return "", layout
+    value = ordered[0].text
+    for current in ordered[1:]:
+        current_text = current.text
+        if value.endswith("-") and current_text and current_text[0].islower():
+            value = value[:-1] + OPTIONAL_LINE_END_HYPHEN + current_text
+        else:
+            value += " " + current_text
+    return page_gt.normalize_space(value), layout
+
+
+MATH_VISIBLE_COMMANDS = {
+    "alpha": "α",
+    "beta": "β",
+    "gamma": "γ",
+    "delta": "δ",
+    "epsilon": "ϵ",
+    "varepsilon": "ε",
+    "theta": "θ",
+    "vartheta": "ϑ",
+    "lambda": "λ",
+    "mu": "μ",
+    "nu": "ν",
+    "xi": "ξ",
+    "pi": "π",
+    "rho": "ρ",
+    "sigma": "σ",
+    "tau": "τ",
+    "phi": "ϕ",
+    "varphi": "φ",
+    "chi": "χ",
+    "psi": "ψ",
+    "omega": "ω",
+    "Gamma": "Γ",
+    "Delta": "Δ",
+    "Theta": "Θ",
+    "Lambda": "Λ",
+    "Xi": "Ξ",
+    "Pi": "Π",
+    "Sigma": "Σ",
+    "Phi": "Φ",
+    "Psi": "Ψ",
+    "Omega": "Ω",
+    "cdot": "·",
+    "times": "×",
+    "pm": "±",
+    "mp": "∓",
+    "le": "≤",
+    "leq": "≤",
+    "ge": "≥",
+    "geq": "≥",
+    "neq": "≠",
+    "approx": "≈",
+    "infty": "∞",
+    "to": "→",
+    "rightarrow": "→",
+    "leftarrow": "←",
+    "leftrightarrow": "↔",
+    "in": "∈",
+    "notin": "∉",
+    "subset": "⊂",
+    "subseteq": "⊆",
+    "cup": "∪",
+    "cap": "∩",
+    "sum": "∑",
+    "prod": "∏",
+}
+MATH_INVISIBLE_COMMANDS = {
+    ",",
+    ";",
+    ":",
+    "!",
+    "quad",
+    "qquad",
+    "displaystyle",
+    "textstyle",
+    "scriptstyle",
+    "scriptscriptstyle",
+    "left",
+    "right",
+}
+
+
+def math_source_visible_text(value: str) -> str:
+    """Best-effort visible text for a restricted inline LaTeX math span.
+
+    Unknown commands are retained as an impossible sentinel so the strict
+    verifier fails closed instead of silently dropping a visible symbol.
+    """
+
+    for _ in range(8):
+        previous = value
+        for command in (
+            "text",
+            "textrm",
+            "textnormal",
+            "mathrm",
+            "mathbf",
+            "mathit",
+            "mathsf",
+            "mathtt",
+            "operatorname",
+            "mbox",
+            "hbox",
+        ):
+            value = replace_balanced_command(
+                value,
+                command,
+                argument_count=1,
+                visible_argument=0,
+            )
+        if value == previous:
+            break
+    replacements = {
+        r"\%": "%",
+        r"\_": "_",
+        r"\&": "&",
+        r"\#": "#",
+        r"\$": "$",
+        r"\{": "{",
+        r"\}": "}",
+    }
+    for source, replacement in replacements.items():
+        value = value.replace(source, replacement)
+
+    def command_replacement(match: re.Match[str]) -> str:
+        command = match.group(1)
+        if command in MATH_VISIBLE_COMMANDS:
+            return MATH_VISIBLE_COMMANDS[command]
+        if command in MATH_INVISIBLE_COMMANDS:
+            return ""
+        return f"⟦{command}⟧"
+
+    value = re.sub(r"\\([A-Za-z]+|[,;:!])", command_replacement, value)
+    value = value.replace("{", "").replace("}", "")
+    value = value.replace("_", "").replace("^", "")
+    value = value.replace("-", "−")
+    return value
+
+
+def markdown_visible_text(value: str) -> str:
+    """Remove Markdown syntax while preserving characters intended to print."""
+
+    value = html.unescape(value)
+    math_spans: list[str] = []
+    code_spans: list[str] = []
+    escaped_literals: list[str] = []
+
+    def stash_math(match: re.Match[str]) -> str:
+        math_spans.append(math_source_visible_text(match.group(1)))
+        return f"\uFFF0{len(math_spans) - 1}\uFFF1"
+
+    value = re.sub(r"(?<!\\)\$(?!\$)(.*?)(?<!\\)\$", stash_math, value, flags=re.DOTALL)
+    value = re.sub(r"\\\((.*?)\\\)", stash_math, value, flags=re.DOTALL)
+
+    def stash_code_span(match: re.Match[str]) -> str:
+        body = match.group("body")
+        if (
+            len(body) >= 2
+            and body.startswith(" ")
+            and body.endswith(" ")
+            and body.strip(" ")
+        ):
+            body = body[1:-1]
+        code_spans.append(body)
+        return f"\uFFD0{len(code_spans) - 1}\uFFD1"
+
+    code_span = re.compile(
+        r"(?<!`)(?P<fence>`+)(?!`)(?P<body>.*?)(?<!`)\1(?!`)",
+        flags=re.DOTALL,
+    )
+    value = code_span.sub(stash_code_span, value)
+
+    def stash_escaped_literal(match: re.Match[str]) -> str:
+        escaped_literals.append(match.group(1))
+        return f"\uFFE0{len(escaped_literals) - 1}\uFFE1"
+
+    value = re.sub(
+        r"\\([!\"#$%&'()*+,\-./:;<=>?@\[\]\\^_`{|}~])",
+        stash_escaped_literal,
+        value,
+    )
+    value = re.sub(r"<sup>(.*?)</sup>", r"\1", value, flags=re.IGNORECASE | re.DOTALL)
+    value = re.sub(r"<br\s*/?>", " ", value, flags=re.IGNORECASE)
+    value = re.sub(
+        r"</?(?:table|thead|tbody|tr|th|td)>",
+        " ",
+        value,
+        flags=re.IGNORECASE,
+    )
+    value = re.sub(r"(?m)^\s{0,3}#{1,6}\s+", "", value)
+    value = re.sub(r"(?m)^\s*[-+]\s+", "• ", value)
+    value = re.sub(r"(?m)^\s*\*\s+", "• ", value)
+
+    star_runs = list(re.finditer(r"\*+", value))
+    opening_stack: list[int] = []
+    paired_indices: set[int] = set()
+    for run in star_runs:
+        previous = value[run.start() - 1] if run.start() else ""
+        following = value[run.end()] if run.end() < len(value) else ""
+        can_close = bool(previous and not previous.isspace())
+        can_open = bool(following and not following.isspace())
+        run_indices = list(range(run.start(), run.end()))
+        if can_close:
+            while run_indices and opening_stack:
+                paired_indices.add(opening_stack.pop())
+                paired_indices.add(run_indices.pop(0))
+        if can_open:
+            opening_stack.extend(reversed(run_indices))
+    if paired_indices:
+        value = "".join(
+            character
+            for index, character in enumerate(value)
+            if index not in paired_indices
+        )
+    for index, span in enumerate(math_spans):
+        value = value.replace(f"\uFFF0{index}\uFFF1", span)
+    for index, span in enumerate(code_spans):
+        value = value.replace(f"\uFFD0{index}\uFFD1", span)
+    for index, literal in enumerate(escaped_literals):
+        value = value.replace(f"\uFFE0{index}\uFFE1", literal)
+    return value
+
+
+def exact_visible_character_stream(value: str, *, markdown: bool) -> str:
+    """Canonicalize layout artifacts, never visible punctuation or case."""
+
+    if markdown:
+        value = markdown_visible_text(value)
+    value = unicodedata.normalize("NFKC", value).replace("\u00ad", "")
+    value = re.sub(r"\s+", "", value)
+    return value
+
+
+def visible_streams_match(expected: str, observed: str) -> bool:
+    """Match with each visually printed line-end hyphen optional once."""
+
+    states = {0}
+    for character in observed:
+        next_states: set[int] = set()
+        if character == OPTIONAL_LINE_END_HYPHEN:
+            for index in states:
+                next_states.add(index)
+                if index < len(expected) and expected[index] == "-":
+                    next_states.add(index + 1)
+        else:
+            for index in states:
+                if index < len(expected) and expected[index] == character:
+                    next_states.add(index + 1)
+        if not next_states:
+            return False
+        states = next_states
+    return len(expected) in states
 
 
 def verifier_result(markdown: str, pdf_text: str) -> dict[str, Any]:
@@ -809,17 +1971,78 @@ def verifier_result(markdown: str, pdf_text: str) -> dict[str, Any]:
         if left != right:
             break
         prefix += 1
-    exact = expected == observed
+    token_exact = expected == observed
+    expected_characters = exact_visible_character_stream(markdown, markdown=True)
+    observed_characters = exact_visible_character_stream(pdf_text, markdown=False)
+    character_stream_exact = visible_streams_match(
+        expected_characters, observed_characters
+    )
+    observed_hash_characters = (
+        expected_characters
+        if character_stream_exact
+        else observed_characters.replace(OPTIONAL_LINE_END_HYPHEN, "")
+    )
+    if character_stream_exact:
+        # Poppler occasionally merges two adjacent visual words.  Whitespace
+        # is layout-only, but punctuation and case remain exact in this stream.
+        match_mode = "exact_visible_character_stream"
+    elif token_exact:
+        match_mode = "punctuation_or_case_mismatch"
+    elif not expected and observed:
+        match_mode = "missing_source_content"
+    elif expected and not observed:
+        match_mode = "missing_pdf_content"
+    elif len(observed) < len(expected) and expected[: len(observed)] == observed:
+        match_mode = "source_fragment_overflows_page"
+    elif len(expected) < len(observed) and observed[: len(expected)] == expected:
+        match_mode = "unclaimed_pdf_suffix"
+    elif len(expected) < len(observed) and observed[-len(expected) :] == expected:
+        match_mode = "unclaimed_pdf_prefix"
+    else:
+        match_mode = "content_or_order_mismatch"
+    passed = character_stream_exact
     return {
-        "status": "passed" if exact else "failed",
+        "contract_version": VERIFIER_CONTRACT_VERSION,
+        "status": "passed" if passed else "failed",
+        "match_mode": match_mode,
         "expected_tokens": len(expected),
         "observed_tokens": len(observed),
-        "exact_ordered_token_match": exact,
+        "exact_ordered_token_match": token_exact,
+        "exact_ordered_character_stream_match": character_stream_exact,
         "matching_prefix_tokens": prefix,
         "expected_sha256": hashlib.sha256("\n".join(expected).encode("utf-8")).hexdigest(),
         "observed_sha256": hashlib.sha256("\n".join(observed).encode("utf-8")).hexdigest(),
+        "expected_character_stream_sha256": hashlib.sha256(
+            expected_characters.encode("utf-8")
+        ).hexdigest(),
+        "observed_character_stream_sha256": hashlib.sha256(
+            observed_hash_characters.encode("utf-8")
+        ).hexdigest(),
+        "optional_line_end_hyphens": observed_characters.count(
+            OPTIONAL_LINE_END_HYPHEN
+        ),
         "first_expected_mismatch": expected[prefix] if prefix < len(expected) else None,
         "first_observed_mismatch": observed[prefix] if prefix < len(observed) else None,
+        "first_expected_character_mismatch": next(
+            (
+                expected_characters[index]
+                for index in range(
+                    min(len(expected_characters), len(observed_hash_characters))
+                )
+                if expected_characters[index] != observed_hash_characters[index]
+            ),
+            None,
+        ),
+        "first_observed_character_mismatch": next(
+            (
+                observed_hash_characters[index]
+                for index in range(
+                    min(len(expected_characters), len(observed_hash_characters))
+                )
+                if expected_characters[index] != observed_hash_characters[index]
+            ),
+            None,
+        ),
     }
 
 
@@ -853,6 +2076,12 @@ def main() -> int:
         reference_report = color_pilot.strip_references_tree(clean_root)
     else:
         reference_report = {"status": "disabled", "residuals": []}
+    if args.drop_figures:
+        figure_report = strip_ignored_figures_tree(clean_root)
+        figure_policy = "drop_figures"
+    else:
+        figure_report = {"status": "disabled"}
+        figure_policy = "keep_figures"
     main_path = clean_root / args.main_tex
     atomic_write_text(
         main_path,
@@ -868,7 +2097,12 @@ def main() -> int:
         timeout_seconds=args.compile_timeout,
         engine=args.engine,
     )
-    executed = compiled_tex_sources(clean_root, clean_build)
+    executed_project_sources = compiled_project_sources(clean_root, clean_build)
+    executed = [
+        path
+        for path in executed_project_sources
+        if path.suffix.casefold() in {".tex", ".ltx"}
+    ]
     if not executed:
         raise RuntimeError("clean compile exposed no executed TeX sources")
     math_macros = page_gt.collect_simple_math_macros(clean_root)
@@ -876,11 +2110,15 @@ def main() -> int:
     paragraphs = page_gt.parse_source_paragraphs(clean_root, structural_blocks, executed)
     aux_paths = sorted(clean_build.glob("*.aux"))
     references = parse_aux_references(aux_paths)
+    heading_label_templates, heading_label_report = parse_unique_titleformat_labels(
+        executed_project_sources
+    )
     units, source_rejections = build_source_units(paragraphs, references=references)
     heading_units, heading_rejections = build_heading_units(
         structural_blocks,
-        clean_build / args.main_tex.with_suffix(".aux").name,
+        aux_paths,
         color_index_offset=len(units),
+        heading_label_templates=heading_label_templates,
     )
     units.extend(heading_units)
     source_rejections.extend(heading_rejections)
@@ -888,52 +2126,128 @@ def main() -> int:
     source_rejections.extend(overlap_rejections)
     if not units:
         raise RuntimeError("no source-renderable ordinary paragraphs")
-    print(
-        f"[source_units] paragraphs={len(paragraphs)} accepted={len(units)} "
-        f"headings={len(heading_units)} overlaps_rejected={len(overlap_rejections)} "
-        f"rejected={len(source_rejections)} files={len(executed)}",
-        flush=True,
-    )
-    shutil.copytree(clean_root, colored_root)
-    instrument_source_tree(clean_root, colored_root, units, args.engine)
-    colored_build = output_dir / "build_colored"
-    colored_pdf = color_pilot.run_compile(
-        source_root=colored_root,
-        main_tex=args.main_tex,
-        build_dir=colored_build,
-        log_path=output_dir / "logs" / "colored.log",
-        label="source-first-colored",
-        timeout_seconds=args.compile_timeout,
-        engine=args.engine,
-    )
-    geometry = color_pilot.compare_pdf_geometry(clean_pdf, colored_pdf)
-    print(
-        f"[geometry] status={geometry['status']} pages={geometry['pages_compared']} "
-        f"max_shift_points={geometry['max_geometry_shift_points']}",
-        flush=True,
-    )
-    if not geometry["page_count_equal"]:
-        raise RuntimeError("color instrumentation changed PDF page count")
-    geometry_rejected_pages = {
-        int(page["page_number"])
-        for page in geometry["pages"]
-        if not page["character_text_equal"] or not page["geometry_equal"]
-    }
-    if geometry_rejected_pages:
+    probe_tiers: list[tuple[str, set[str]]] = [
+        ("paragraph_and_list_tokens", {"paragraph", "itemize_item", "enumerate_item"}),
+        ("paragraph_tokens", {"paragraph"}),
+        ("whole_units", set()),
+    ]
+    probe_attempts: list[dict[str, Any]] = []
+    probes: list[SourceProbe] = []
+    localization_modes: dict[str, str] = {}
+    mode_counts: collections.Counter[str] = collections.Counter()
+    geometry: dict[str, Any] | None = None
+    colored_pdf: Path | None = None
+    probe_tier = ""
+    for attempt, (tier_name, word_probe_kinds) in enumerate(probe_tiers, start=1):
+        tier_probes, tier_modes = build_source_probes(
+            units,
+            word_probe_kinds=word_probe_kinds,
+        )
+        tier_counts = collections.Counter(tier_modes.values())
         print(
-            f"[geometry_filter] rejected_pages={len(geometry_rejected_pages)} "
-            f"pages={sorted(geometry_rejected_pages)}",
+            f"[source_units] tier={tier_name} attempt={attempt}/{len(probe_tiers)} "
+            f"paragraphs={len(paragraphs)} accepted={len(units)} "
+            f"headings={len(heading_units)} overlaps_rejected={len(overlap_rejections)} "
+            f"rejected={len(source_rejections)} probes={len(tier_probes)} "
+            f"plain_word_units={tier_counts.get('plain_word', 0)} "
+            f"whole_units={tier_counts.get('whole', 0)} files={len(executed)}",
             flush=True,
         )
-    color_rows, color_summary = extract_color_geometry(colored_pdf, units)
-    unit_by_id = {unit.unit_id: unit for unit in units}
-    placements_by_page: dict[int, list[tuple[SourceUnit, dict[str, Any]]]] = collections.defaultdict(list)
-    multi_page_pages: set[int] = set()
-    for unit_id, pages in color_rows.items():
-        if len(pages) > 1:
-            multi_page_pages.update(int(page["page_number"]) for page in pages)
-        for page in pages:
-            placements_by_page[int(page["page_number"])].append((unit_by_id[unit_id], page))
+        if colored_root.exists():
+            shutil.rmtree(colored_root)
+        shutil.copytree(clean_root, colored_root)
+        instrument_source_tree(clean_root, colored_root, units, tier_probes, args.engine)
+        suffix = "" if attempt == 1 else f"_{tier_name}"
+        colored_build = output_dir / f"build_colored{suffix}"
+        try:
+            candidate_pdf = color_pilot.run_compile(
+                source_root=colored_root,
+                main_tex=args.main_tex,
+                build_dir=colored_build,
+                log_path=output_dir / "logs" / f"colored{suffix}.log",
+                label=f"source-first-colored-{tier_name}",
+                timeout_seconds=args.compile_timeout,
+                engine=args.engine,
+            )
+            candidate_geometry = color_pilot.compare_pdf_geometry(
+                clean_pdf, candidate_pdf
+            )
+            probe_attempts.append(
+                {
+                    "tier": tier_name,
+                    "status": "compiled",
+                    "page_count_equal": candidate_geometry["page_count_equal"],
+                    "geometry_status": candidate_geometry["status"],
+                    "probes": len(tier_probes),
+                    "unit_modes": dict(sorted(tier_counts.items())),
+                }
+            )
+            print(
+                f"[geometry] tier={tier_name} status={candidate_geometry['status']} "
+                f"page_count_equal={candidate_geometry['page_count_equal']} "
+                f"pages={candidate_geometry['pages_compared']} "
+                f"max_shift_points={candidate_geometry['max_geometry_shift_points']}",
+                flush=True,
+            )
+            if not candidate_geometry["page_count_equal"]:
+                continue
+        except (RuntimeError, TimeoutError, FileNotFoundError) as error:
+            probe_attempts.append(
+                {
+                    "tier": tier_name,
+                    "status": "compile_failed",
+                    "error": f"{type(error).__name__}: {error}",
+                    "probes": len(tier_probes),
+                    "unit_modes": dict(sorted(tier_counts.items())),
+                }
+            )
+            print(
+                f"[probe_fallback] tier={tier_name} reason=compile_failed "
+                f"error={type(error).__name__}:{error}",
+                flush=True,
+            )
+            continue
+        probes = tier_probes
+        localization_modes = tier_modes
+        mode_counts = tier_counts
+        geometry = candidate_geometry
+        colored_pdf = candidate_pdf
+        probe_tier = tier_name
+        break
+    if geometry is None or colored_pdf is None:
+        raise RuntimeError(
+            "all source probe tiers changed page count or failed compilation: "
+            + json.dumps(probe_attempts, ensure_ascii=False)
+        )
+    geometry_by_page = {
+        int(page["page_number"]): page for page in geometry["pages"]
+    }
+    shadow_text_rejected_pages = {
+        page_number
+        for page_number, page in geometry_by_page.items()
+        if not page["character_count_equal"] or not page["character_text_equal"]
+    }
+    geometry_diagnostic_pages = {
+        page_number
+        for page_number, page in geometry_by_page.items()
+        if not page["geometry_equal"]
+    }
+    if shadow_text_rejected_pages:
+        print(
+            f"[shadow_text_filter] rejected_pages={len(shadow_text_rejected_pages)} "
+            f"pages={sorted(shadow_text_rejected_pages)}",
+            flush=True,
+        )
+    if geometry_diagnostic_pages:
+        print(
+            f"[geometry_diagnostic] drift_pages={len(geometry_diagnostic_pages)} "
+            f"pages={sorted(geometry_diagnostic_pages)}",
+            flush=True,
+        )
+    color_rows, color_summary = extract_color_geometry(colored_pdf, probes)
+    placements_by_page, localization_reasons, localization_summary = build_page_fragments(
+        units, probes, color_rows
+    )
     page_rows: list[dict[str, Any]] = []
     rejected_rows: list[dict[str, Any]] = []
     pages_dir = output_dir / "pages"
@@ -943,16 +2257,16 @@ def main() -> int:
             page = document.pages[page_number - 1]
             reasons: list[str] = []
             placements = placements_by_page.get(page_number, [])
-            if page_number in geometry_rejected_pages:
-                reasons.append("color_geometry_mismatch")
+            shadow_geometry = geometry_by_page.get(page_number)
+            if shadow_geometry is None or page_number in shadow_text_rejected_pages:
+                reasons.append("color_shadow_page_text_mismatch")
             if not placements:
                 reasons.append("no_colored_source_paragraphs")
-            if page_number in multi_page_pages:
-                reasons.append("cross_page_source_paragraph")
+            reasons.extend(sorted(localization_reasons.get(page_number, set())))
             ordered, order_error = order_page_units(placements, float(page.width))
             if order_error:
                 reasons.append(order_error)
-            markdown = "\n\n".join(unit.markdown for unit, _ in ordered).strip() + "\n"
+            markdown = compose_page_markdown(ordered)
             pdf_text, pdf_layout = pdf_verifier_text(page)
             verifier = verifier_result(markdown, pdf_text)
             if verifier["status"] != "passed":
@@ -961,6 +2275,10 @@ def main() -> int:
             row = {
                 "schema_version": SCHEMA_VERSION,
                 "contract": CONTRACT,
+                "probe_policy_version": PROBE_POLICY_VERSION,
+                "shadow_invariant_policy_version": SHADOW_INVARIANT_POLICY_VERSION,
+                "heading_label_policy_version": HEADING_LABEL_POLICY_VERSION,
+                "figure_policy": figure_policy,
                 "data_id": f"{args.paper_id}_page_{page_number:04d}",
                 "paper_id": args.paper_id,
                 "page_number": page_number,
@@ -970,12 +2288,50 @@ def main() -> int:
                 "page_provenance": "compiled_vector_color",
                 "pdf_role": "independent_verifier_only",
                 "layout": pdf_layout,
-                "source_unit_ids": [unit.unit_id for unit, _ in ordered],
-                "source_paragraph_ids": [unit.paragraph_id for unit, _ in ordered],
+                "source_unit_ids": list(
+                    dict.fromkeys(fragment.unit_id for fragment, _ in ordered)
+                ),
+                "source_paragraph_ids": list(
+                    dict.fromkeys(fragment.paragraph_id for fragment, _ in ordered)
+                ),
+                "source_probe_ids": [
+                    probe_id
+                    for fragment, _ in ordered
+                    for probe_id in fragment.probe_ids
+                ],
                 "color_placements": [
-                    {"unit_id": unit.unit_id, **placement} for unit, placement in ordered
+                    {
+                        "fragment_id": fragment.fragment_id,
+                        "unit_id": fragment.unit_id,
+                        "probe_ids": list(fragment.probe_ids),
+                        **placement,
+                    }
+                    for fragment, placement in ordered
                 ],
                 "verifier": verifier,
+                "shadow_invariant": {
+                    "character_count_equal": (
+                        shadow_geometry.get("character_count_equal")
+                        if shadow_geometry is not None
+                        else False
+                    ),
+                    "character_text_equal": (
+                        shadow_geometry.get("character_text_equal")
+                        if shadow_geometry is not None
+                        else False
+                    ),
+                    "geometry_equal": (
+                        shadow_geometry.get("geometry_equal")
+                        if shadow_geometry is not None
+                        else False
+                    ),
+                    "max_geometry_shift_points": (
+                        shadow_geometry.get("max_geometry_shift_points")
+                        if shadow_geometry is not None
+                        else None
+                    ),
+                    "geometry_role": "diagnostic_only",
+                },
             }
             if status == "passed":
                 stem = f"page_{page_number:04d}"
@@ -1007,15 +2363,20 @@ def main() -> int:
                 flush=True,
             )
     write_jsonl(output_dir / "source_units.jsonl", (unit.as_json(clean_root) for unit in units))
+    write_jsonl(output_dir / "source_probes.jsonl", (probe.as_json(clean_root) for probe in probes))
     write_jsonl(output_dir / "source_rejections.jsonl", source_rejections)
     write_jsonl(output_dir / "color_page_alignment.jsonl", (
-        {"unit_id": unit_id, "pages": pages} for unit_id, pages in color_rows.items()
+        {"probe_id": probe_id, "pages": pages} for probe_id, pages in color_rows.items()
     ))
     write_jsonl(output_dir / "pages_passed.jsonl", page_rows)
     write_jsonl(output_dir / "pages_rejected.jsonl", rejected_rows)
     report = {
         "schema_version": SCHEMA_VERSION,
         "contract": CONTRACT,
+        "probe_policy_version": PROBE_POLICY_VERSION,
+        "shadow_invariant_policy_version": SHADOW_INVARIANT_POLICY_VERSION,
+        "heading_label_policy_version": HEADING_LABEL_POLICY_VERSION,
+        "figure_policy": figure_policy,
         "status": "passed" if page_rows else "failed",
         "paper_id": args.paper_id,
         "source_dir": str(source_dir),
@@ -1024,8 +2385,22 @@ def main() -> int:
         "clean_pdf": str(clean_pdf),
         "colored_pdf": str(colored_pdf),
         "reference_removal": reference_report,
+        "figure_removal": figure_report,
         "geometry_validation": geometry,
+        "shadow_page_invariant": {
+            "policy_version": SHADOW_INVARIANT_POLICY_VERSION,
+            "text_mismatch_pages": sorted(shadow_text_rejected_pages),
+            "geometry_diagnostic_pages": sorted(geometry_diagnostic_pages),
+        },
+        "heading_label_resolution": heading_label_report,
         "color_alignment": color_summary,
+        "localization": {
+            "selected_probe_tier": probe_tier,
+            "probe_attempts": probe_attempts,
+            "unit_modes": dict(sorted(mode_counts.items())),
+            **localization_summary,
+        },
+        "verifier_contract_version": VERIFIER_CONTRACT_VERSION,
         "source_paragraphs_total": len(paragraphs),
         "source_units_renderable": len(units),
         "source_units_rejected": len(source_rejections),

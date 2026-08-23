@@ -39,13 +39,21 @@ CONFUSABLE_PAIRS = {
 }
 MUTATION_POLICY_VERSION = "chaos_visual_v2"
 SELECTION_POLICY_VERSION = (
-    "page_exact_source_paragraph_v5_fail_closed_current_gt_no_bibliography"
+    "page_exact_source_paragraph_v6_rendered_line_spread_current_gt_no_bibliography"
 )
 BIBLIOGRAPHY_POLICY_VERSION = "exclude_bibliography_tail_v1"
 STRICT_INPUT_FILTER_POLICY_VERSION = "strict_gt_current_contract_v1"
 STRICT_INPUT_STRICT_TEXT_CONTRACT_VERSION = 2
 STRICT_INPUT_AUTHOR_SUPERSCRIPT_CONTRACT_VERSION = 5
-SOURCE_FIRST_INPUT_POLICY_VERSION = "source_first_color_v2_verified_pages_v1"
+SOURCE_FIRST_INPUT_POLICY_VERSION = "source_first_color_v6_literal_markdown_v5"
+SOURCE_FIRST_SCHEMA_VERSION = 6
+SOURCE_FIRST_CONTRACT = "source_first_color_v6"
+SOURCE_FIRST_VERIFIER_CONTRACT_VERSION = 4
+SOURCE_FIRST_PROBE_POLICY_VERSION = (
+    "paragraph_list_payload_then_paragraph_then_whole_v2"
+)
+SOURCE_FIRST_SHADOW_INVARIANT_POLICY_VERSION = "exact_page_character_sequence_v1"
+SOURCE_FIRST_HEADING_LABEL_POLICY_VERSION = "aux_number_unique_titleformat_label_v1"
 BIBLIOGRAPHY_HEADING_RE = re.compile(
     r"^\s*(?:#{1,6}\s*)?"
     r"(?:(?:appendix\s+)?[A-Z0-9]+(?:\.[A-Z0-9]+)*[.)]?\s+)?"
@@ -195,20 +203,76 @@ def load_source_first_clean_page_index(manifest_path: Path) -> dict[str, dict[st
         sidecar = read_json(markdown_path.with_suffix(".json"))
         result_root = markdown_path.parent.parent
         report = read_json(result_root / "validation_report.json")
-        verifier = sidecar.get("verifier", {})
+        verifier_value = sidecar.get("verifier", {})
+        verifier = verifier_value if isinstance(verifier_value, dict) else {}
+        source_probes_path = result_root / "source_probes.jsonl"
+        source_probes = read_jsonl(source_probes_path) if source_probes_path.is_file() else []
+        known_probe_ids = [str(row.get("probe_id") or "") for row in source_probes]
+        page_probe_ids = sidecar.get("source_probe_ids")
+        shadow_invariant = sidecar.get("shadow_invariant")
+        figure_policy = report.get("figure_policy")
+        figure_status = (report.get("figure_removal") or {}).get("status")
+        valid_figure_policy = (
+            (figure_policy == "drop_figures" and figure_status == "passed")
+            or (figure_policy == "keep_figures" and figure_status == "disabled")
+        )
+        ordered_content_match = (
+            verifier.get("exact_ordered_character_stream_match") is True
+        )
         required = {
+            "page_schema": sidecar.get("schema_version") == SOURCE_FIRST_SCHEMA_VERSION,
+            "page_contract": sidecar.get("contract") == SOURCE_FIRST_CONTRACT,
+            "page_probe_policy": sidecar.get("probe_policy_version")
+            == SOURCE_FIRST_PROBE_POLICY_VERSION,
+            "page_shadow_invariant_policy": sidecar.get(
+                "shadow_invariant_policy_version"
+            )
+            == SOURCE_FIRST_SHADOW_INVARIANT_POLICY_VERSION,
+            "page_heading_label_policy": sidecar.get(
+                "heading_label_policy_version"
+            )
+            == SOURCE_FIRST_HEADING_LABEL_POLICY_VERSION,
+            "page_shadow_text_identity": isinstance(shadow_invariant, dict)
+            and shadow_invariant.get("character_count_equal") is True
+            and shadow_invariant.get("character_text_equal") is True,
+            "page_shadow_geometry_role": isinstance(shadow_invariant, dict)
+            and shadow_invariant.get("geometry_role") == "diagnostic_only",
+            "page_figure_policy": sidecar.get("figure_policy") == figure_policy,
             "page_status": sidecar.get("status") == "passed",
             "generation_source": sidecar.get("generation_source") == "latex_source",
             "page_provenance": sidecar.get("page_provenance") == "compiled_vector_color",
             "pdf_role": sidecar.get("pdf_role") == "independent_verifier_only",
             "verifier_status": verifier.get("status") == "passed",
-            "ordered_token_match": verifier.get("exact_ordered_token_match") is True,
-            "report_contract": report.get("contract") == "source_first_color_v2",
+            "verifier_contract_version": verifier.get("contract_version")
+            == SOURCE_FIRST_VERIFIER_CONTRACT_VERSION,
+            "ordered_content_match": ordered_content_match,
+            "report_schema": report.get("schema_version") == SOURCE_FIRST_SCHEMA_VERSION,
+            "report_contract": report.get("contract") == SOURCE_FIRST_CONTRACT,
+            "report_probe_policy": report.get("probe_policy_version")
+            == SOURCE_FIRST_PROBE_POLICY_VERSION,
+            "report_shadow_invariant_policy": report.get(
+                "shadow_invariant_policy_version"
+            )
+            == SOURCE_FIRST_SHADOW_INVARIANT_POLICY_VERSION,
+            "report_heading_label_policy": report.get(
+                "heading_label_policy_version"
+            )
+            == SOURCE_FIRST_HEADING_LABEL_POLICY_VERSION,
+            "report_figure_policy": valid_figure_policy,
+            "report_reference_removal": (report.get("reference_removal") or {}).get("status")
+            == "passed",
             "report_status": report.get("status") == "passed",
             "pdf_not_generator": report.get("pdf_used_for_generation") is False,
             "pdf_is_verifier": report.get("pdf_used_for_verification") is True,
             "markdown_exists": markdown_path.is_file(),
             "image_exists": image_path.is_file(),
+            "source_probes_exists": source_probes_path.is_file(),
+            "source_probe_inventory": bool(known_probe_ids)
+            and all(known_probe_ids)
+            and len(known_probe_ids) == len(set(known_probe_ids)),
+            "source_probe_ids": isinstance(page_probe_ids, list)
+            and bool(page_probe_ids)
+            and set(map(str, page_probe_ids)) <= set(known_probe_ids),
             "manifest_id": str(case.get("pair_id")) == str(sidecar.get("data_id")),
         }
         failures = sorted(key for key, passed in required.items() if not passed)
@@ -366,9 +430,17 @@ def verify_pair(
         if (
             not isinstance(verifier, dict)
             or verifier.get("status") != "passed"
-            or verifier.get("exact_ordered_token_match") is not True
+            or verifier.get("contract_version")
+            != SOURCE_FIRST_VERIFIER_CONTRACT_VERSION
+            or verifier.get("exact_ordered_character_stream_match") is not True
         ):
             errors.append("source_first_clean_verifier_not_exact")
+        source_probe_ids = clean_row.get("source_probe_ids")
+        if not isinstance(source_probe_ids, list) or not source_probe_ids:
+            errors.append("source_first_clean_source_probe_ids_missing")
+        markdown_path = Path(str(clean_row.get("markdown", "")))
+        if not (markdown_path.parent.parent / "source_probes.jsonl").is_file():
+            errors.append("source_first_clean_source_probes_missing")
     else:
         if clean_row.get("validation_status") != "passed":
             errors.append("clean_validation_status_not_passed")
