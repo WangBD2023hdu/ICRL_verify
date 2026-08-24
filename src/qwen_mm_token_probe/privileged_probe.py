@@ -38,7 +38,16 @@ from .prompts import DEFAULT_PDF_OCR_PROMPT
 SCHEMA_VERSION = 2
 DEFAULT_MODEL_ID = "Qwen/Qwen3.5-4B"
 DEFAULT_PROMPT = DEFAULT_PDF_OCR_PROMPT
-DEFAULT_PRIVILEGED_INSTRUCTION = "请转写上述文本"
+DEFAULT_PRIVILEGED_INSTRUCTION = (
+    "请逐字逐符号转写下面边界标记之间的文档。"
+    "转写不是翻译；不要改变任何字符。边界标记本身不要输出。"
+)
+PRIVILEGED_PROMPT_TEMPLATE = (
+    "{instruction}\n\n"
+    "<<<DOCUMENT_START>>>\n"
+    "{ground_truth}\n"
+    "<<<DOCUMENT_END>>>"
+)
 
 
 @dataclass(frozen=True)
@@ -166,7 +175,7 @@ def run_privileged_probe(
         "dataset_root": str(dataset_path),
         "output_dir": str(output_root),
         "prompt": prompt,
-        "privileged_prompt_template": "{ground_truth}\\n\\n{instruction}",
+        "privileged_prompt_template": PRIVILEGED_PROMPT_TEMPLATE,
         "privileged_instruction": privileged_instruction,
         "generation_count_per_sample": 1,
         "teacher_forced_forward_count_per_sample": 2,
@@ -353,7 +362,10 @@ def _run_sample(
     if sample.image_path.resolve() != image_copy.resolve():
         shutil.copy2(sample.image_path, image_copy)
     ground_truth = sample.ground_truth_path.read_text(encoding="utf-8")
-    privileged_prompt = f"{ground_truth}\n\n{privileged_instruction}"
+    privileged_prompt = _build_privileged_prompt(
+        ground_truth=ground_truth,
+        instruction=privileged_instruction,
+    )
     _write_text_atomic(sample_dir / "ground_truth.md", ground_truth)
     _write_text_atomic(sample_dir / "privileged_prompt.txt", privileged_prompt)
 
@@ -486,6 +498,7 @@ def _run_sample(
             "privileged_prompt_sha256": _sha256_text(privileged_prompt),
             "ground_truth_sha256": _sha256_text(ground_truth),
             "privileged_instruction": privileged_instruction,
+            "privileged_prompt_template": PRIVILEGED_PROMPT_TEMPLATE,
             "top_k": top_k,
             "forward_chunk_size": forward_chunk_size,
         },
@@ -503,6 +516,16 @@ def _run_sample(
     }
     partial_path.unlink(missing_ok=True)
     return result
+
+
+def _build_privileged_prompt(*, ground_truth: str, instruction: str) -> str:
+    document_end = "" if ground_truth.endswith("\n") else "\n"
+    return (
+        f"{instruction}\n\n"
+        "<<<DOCUMENT_START>>>\n"
+        f"{ground_truth}{document_end}"
+        "<<<DOCUMENT_END>>>"
+    )
 
 
 def _prepare_text_prompt_inputs(
@@ -1983,6 +2006,7 @@ def _sample_fingerprint(
         "model_id": config["model_id"],
         "prompt": config["prompt"],
         "privileged_instruction": config["privileged_instruction"],
+        "privileged_prompt_template": config["privileged_prompt_template"],
         "max_new_tokens": config["max_new_tokens"],
         "top_k": config["top_k"],
         "forward_chunk_size": config["forward_chunk_size"],

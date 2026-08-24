@@ -14,6 +14,21 @@ from PIL import Image
 from qwen_mm_token_probe import privileged_probe as probe
 from qwen_mm_token_probe.hf_qwen import ModelBundle
 
+_PRIVILEGED_PROMPT_INSTRUCTION = (
+    "请逐字逐符号转写下面边界标记之间的文档。转写不是翻译；不要改变任何字符。"
+    "边界标记本身不要输出。"
+)
+
+
+def _expected_privileged_prompt(ground_truth: str) -> str:
+    document_end = "" if ground_truth.endswith("\n") else "\n"
+    return (
+        f"{_PRIVILEGED_PROMPT_INSTRUCTION}\n\n"
+        "<<<DOCUMENT_START>>>\n"
+        f"{ground_truth}{document_end}"
+        "<<<DOCUMENT_END>>>"
+    )
+
 
 class FakeTokenizer:
     all_special_ids: ClassVar[list[int]] = []
@@ -221,17 +236,33 @@ def test_load_release_samples_resolves_release_paths(tmp_path: Path) -> None:
 
 def test_text_teacher_prompt_is_text_only_and_verbatim() -> None:
     bundle = _bundle()
+    ground_truth = "\n# 标题\n\n- 保留 Markdown 的尾部空格  \n"
+    prompt = _expected_privileged_prompt(ground_truth)
 
     inputs = probe._prepare_text_prompt_inputs(
         model_bundle=bundle,
-        prompt="完整 GT\n\n请转写上述文本",
+        prompt=prompt,
     )
 
     assert bundle.tokenizer.messages == [
-        {"role": "user", "content": "完整 GT\n\n请转写上述文本"}
+        {"role": "user", "content": prompt}
     ]
     assert inputs["input_ids"].tolist() == [[4, 5, 6]]
     assert "pixel_values" not in inputs
+
+
+def test_privileged_prompt_builder_preserves_gt_without_trailing_newline() -> None:
+    ground_truth = "# 标题\n\nAB  "
+
+    prompt = probe._build_privileged_prompt(
+        ground_truth=ground_truth,
+        instruction=_PRIVILEGED_PROMPT_INSTRUCTION,
+    )
+
+    assert prompt == _expected_privileged_prompt(ground_truth)
+    assert prompt.endswith(f"{ground_truth}\n<<<DOCUMENT_END>>>")
+    assert ground_truth in prompt
+    assert prompt.count(ground_truth) == 1
 
 
 def test_exact_response_ids_are_directly_appended_before_forward() -> None:
@@ -265,7 +296,8 @@ def test_sample_generates_once_then_forwards_same_ids_twice(
     image_path = tmp_path / "page.png"
     Image.new("RGB", (32, 32), "white").save(image_path)
     gt_path = tmp_path / "page.md"
-    gt_path.write_text("AB", encoding="utf-8")
+    ground_truth = "\n# 标题\n\nAB  \n"
+    gt_path.write_text(ground_truth, encoding="utf-8")
     sample = probe.PrivilegedProbeSample(
         ordinal=1,
         pair_id="p1",
@@ -283,18 +315,11 @@ def test_sample_generates_once_then_forwards_same_ids_twice(
             "attention_mask": torch.ones((1, 3), dtype=torch.long),
         }
 
-    def fake_teacher_inputs(**_: object) -> dict[str, torch.Tensor]:
-        return {
-            "input_ids": torch.tensor([[4, 5, 6]], dtype=torch.long),
-            "attention_mask": torch.ones((1, 3), dtype=torch.long),
-        }
-
     def fake_generate(**kwargs: object) -> tuple[list[int], str]:
         generation_calls.append(kwargs["prompt_inputs"]["input_ids"].tolist()[0])
         return [7, 8], "ignored"
 
     monkeypatch.setattr(probe, "prepare_prompt_inputs", fake_prepare_prompt_inputs)
-    monkeypatch.setattr(probe, "_prepare_text_prompt_inputs", fake_teacher_inputs)
     monkeypatch.setattr(probe, "generate_from_prompt", fake_generate)
 
     result = probe._run_sample(
@@ -303,7 +328,7 @@ def test_sample_generates_once_then_forwards_same_ids_twice(
         fingerprint="fingerprint",
         model_bundle=bundle,
         prompt="OCR",
-        privileged_instruction="请转写上述文本",
+        privileged_instruction=_PRIVILEGED_PROMPT_INSTRUCTION,
         max_new_tokens=16,
         top_k=3,
         forward_chunk_size=2,
@@ -323,10 +348,27 @@ def test_sample_generates_once_then_forwards_same_ids_twice(
     assert result["protocol"]["teacher_forced_forward_count"] == 2
     assert result["protocol"]["response_ids_directly_concatenated"] is True
     assert result["protocol"]["response_text_retokenized"] is False
-    assert result["ground_truth"] == "AB"
-    assert (tmp_path / "sample" / "privileged_prompt.txt").read_text(
+    assert result["ground_truth"] == ground_truth
+    expected_prompt = _expected_privileged_prompt(ground_truth)
+    messages = bundle.tokenizer.messages
+    assert messages == [{"role": "user", "content": expected_prompt}]
+    assert messages is not None
+    teacher_prompt = messages[0]["content"]
+    assert isinstance(teacher_prompt, str)
+    written_prompt = (tmp_path / "sample" / "privileged_prompt.txt").read_text(
         encoding="utf-8"
-    ) == "AB\n\n请转写上述文本"
+    )
+    assert written_prompt == expected_prompt
+    assert written_prompt == teacher_prompt
+    assert (tmp_path / "sample" / "ground_truth.md").read_text(
+        encoding="utf-8"
+    ) == ground_truth
+    assert "<<<DOCUMENT_START>>>" in teacher_prompt
+    assert "<<<DOCUMENT_END>>>" in teacher_prompt
+    assert result["response"]["token_ids"] == [7, 8]
+    assert result["response"]["text"] == "AB"
+    assert "<<<DOCUMENT_START>>>" not in result["response"]["text"]
+    assert "<<<DOCUMENT_END>>>" not in result["response"]["text"]
 
 
 def test_combine_scores_reports_teacher_alternative() -> None:

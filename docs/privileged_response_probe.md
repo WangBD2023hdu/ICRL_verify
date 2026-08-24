@@ -10,7 +10,18 @@ For every page it performs exactly:
 2. one teacher-forced forward after directly concatenating that ID tensor to
    the same multimodal prompt;
 3. one teacher-forced forward after directly concatenating the identical ID
-   tensor to the text-only prompt `GT + "\n\n" + "请转写上述文本"`.
+   tensor to this text-only prompt:
+
+```text
+请逐字逐符号转写下面边界标记之间的文档。转写不是翻译；不要改变任何字符。边界标记本身不要输出。
+
+<<<DOCUMENT_START>>>
+{完整 Markdown GT}
+<<<DOCUMENT_END>>>
+```
+
+The complete Markdown GT is inserted verbatim. If it has no trailing newline,
+one newline is added only to place `<<<DOCUMENT_END>>>` on its own line.
 
 The response is never decoded and re-tokenized for either forward. Every
 `result.json` records `response_ids_directly_concatenated=true` and
