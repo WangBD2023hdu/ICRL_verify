@@ -39,19 +39,18 @@ qwen-mm-privileged-probe \
   --heartbeat-seconds 30
 ```
 
-The aggregate `report.html` compares original and privileged target-token
-probabilities, signed `delta_logp = teacher - original`, entropy, rank, Top-1
-transitions, GT alignment, and mutation sites. Each sample directory contains
-the copied page image, GT, exact privileged prompt, response text, response IDs,
-resumable partial checkpoint, token CSV, mutation CSV, JSON result, and HTML
-report.
+The root `report.html` is a sample browser and opens the first completed sample
+directly. It contains no aggregate statistics or filtered token analysis. Each
+sample report keeps the complete Ground Truth and model Response visible side by
+side, followed by every generated response token in its original ID order.
 
-Each sample report keeps Ground Truth and model Response visible side by side.
-Synthetic mutation words are highlighted and listed before the complete token
-table. For every linked mutation token and every regular response token, the
-report shows target probability/rank plus Original and GT-Teacher Top-1/Top-2
-token IDs, decoded text, and candidate probabilities. Existing results can be
-rendered with the new layout without another model forward:
+For each response token, the table shows its probability and rank under the
+original image+prompt context, the probability and rank of that exact same token
+under GT teacher forcing, both conditions' Top-1/Top-2 decoded candidates, and
+signed `delta_p`/`delta_logp = teacher - original`. Report rebuilding validates
+that every row index and token ID still matches the generated `response_ids`;
+it never sorts or filters the sequence. Existing results can be rendered with
+this layout without another model forward:
 
 ```bash
 qwen-mm-privileged-probe \

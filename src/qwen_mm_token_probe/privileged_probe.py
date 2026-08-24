@@ -1013,7 +1013,7 @@ def rebuild_privileged_report(output_dir: str | Path) -> dict[str, Any]:
     _write_json_atomic(output_root / "summary.json", global_summary)
     _write_text_atomic(
         output_root / "report.html",
-        _render_aggregate_html(global_summary, sample_rows, all_tokens, all_mutations),
+        _render_aggregate_html(sample_rows),
     )
     return global_summary
 
@@ -1076,171 +1076,83 @@ def _write_sample_outputs(sample_dir: Path, result: dict[str, Any]) -> None:
     _write_text_atomic(sample_dir / "report.html", _render_sample_html(result))
 
 
+def _response_rows_in_generation_order(
+    result: dict[str, Any],
+) -> list[dict[str, Any]]:
+    rows = list(result["tokens"])
+    response_ids = [int(token_id) for token_id in result["response"]["token_ids"]]
+    if len(rows) != len(response_ids):
+        raise RuntimeError(
+            "report token count does not match generated response IDs: "
+            f"rows={len(rows)} ids={len(response_ids)}"
+        )
+    for position, (row, response_id) in enumerate(zip(rows, response_ids)):
+        row_index = int(row["index"])
+        row_token_id = int(row["token_id"])
+        if row_index != position or row_token_id != response_id:
+            raise RuntimeError(
+                "report tokens are not in generated response order at position "
+                f"{position}: index={row_index} token_id={row_token_id} "
+                f"response_id={response_id}"
+            )
+    return rows
+
+
 def _render_sample_html(result: dict[str, Any]) -> str:
-    rows = result["tokens"]
-    mutations = result["mutation_observations"]
-    chart_data = [
-        {
-            "i": row["index"],
-            "token": row["token"],
-            "po": row["p_original"],
-            "pt": row["p_teacher"],
-            "d": row["delta_logp_teacher_minus_original"],
-        }
-        for row in rows
-    ]
+    rows = _response_rows_in_generation_order(result)
     token_rows = "".join(_token_table_row(row) for row in rows)
-    original_strip = "".join(_probability_span(row, "p_original") for row in rows)
-    teacher_strip = "".join(_probability_span(row, "p_teacher") for row in rows)
-    delta_strip = "".join(_delta_span(row) for row in rows)
-    mutation_focus = "".join(
-        _mutation_focus_card(mutation, rows) for mutation in mutations
-    )
-    if not mutation_focus:
-        mutation_focus = "<p class='empty-state'>该样本没有人工变异词。</p>"
     image_name = Path(result["sample"]["image_copy"]).name
-    summary = result["summary"]
-    highlighted_gt = _highlight_ground_truth(
-        str(result["ground_truth"]),
-        result.get("sample", {}).get("changes", []),
-    )
-    highlighted_response = _highlight_response(
-        str(result["response"]["text"]),
-        rows,
-    )
-    mutation_token_count = sum(bool(row.get("mutation_ids")) for row in rows)
-    top1_changed_count = sum(bool(row.get("top1_changed")) for row in rows)
+    ground_truth = html.escape(str(result["ground_truth"]))
+    response_text = html.escape(str(result["response"]["text"]))
     return f"""<!doctype html>
 <html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
 <title>{html.escape(result["pair_id"])} privileged probe</title>{_report_css()}</head>
 <body><main>
-<nav><a href="../../report.html">汇总报告</a><a href="token_probabilities.csv">Token CSV</a><a href="mutation_probabilities.csv">变异 CSV</a></nav>
+<nav><a href="../../report.html" target="_top">全部样本</a><a href="token_probabilities.csv">完整 Token CSV</a></nav>
 <h1>{html.escape(result["pair_id"])}</h1>
-<div class="stats">{_stat("Tokens", summary["token_count"])}{_stat("变异词 Token", mutation_token_count)}{_stat("Top-1 改变", top1_changed_count)}{_stat("Mean p original", summary["mean_p_original"])}{_stat("Mean p teacher", summary["mean_p_teacher"])}{_stat("Mean Δlogp", summary["mean_delta_logp_teacher_minus_original"], signed=True)}</div>
-<section><h2>GT 与模型 Response</h2>
+<section><h2>原始文本</h2>
 <div class="source-review">
 <figure><img src="{html.escape(image_name)}" alt="document page"><figcaption>输入图片</figcaption></figure>
 <div class="transcript-grid">
-<div class="transcript-panel"><div class="panel-heading"><h3>Ground Truth</h3><span>{len(str(result["ground_truth"]))} chars</span></div><pre class="transcript">{highlighted_gt}</pre></div>
-<div class="transcript-panel"><div class="panel-heading"><h3>模型 Response</h3><span>{len(rows)} tokens</span></div><pre class="transcript">{highlighted_response}</pre></div>
+<div class="transcript-panel"><div class="panel-heading"><h3>Ground Truth</h3><span>{len(str(result["ground_truth"]))} chars</span></div><pre class="transcript">{ground_truth}</pre></div>
+<div class="transcript-panel"><div class="panel-heading"><h3>模型 Response</h3><span>{len(rows)} tokens</span></div><pre class="transcript">{response_text}</pre></div>
 </div></div>
-<div class="legend"><span><i class="legend-swatch mutation"></i>变异词</span><span><i class="legend-swatch mismatch"></i>GT 不一致</span></div>
 </section>
-<section id="mutation-focus"><h2>变异词重点</h2><div class="mutation-list">{mutation_focus}</div></section>
-<section><h2>逐 Token 概率变化</h2><canvas id="prob-chart" width="1600" height="360"></canvas>
-<div class="strip-grid">
-<div><h3>原图条件 p(response token)</h3><div class="token-strip">{original_strip}</div></div>
-<div><h3>GT Teacher 条件 p(response token)</h3><div class="token-strip">{teacher_strip}</div></div>
-<div><h3>Δlogp = teacher - original</h3><div class="token-strip">{delta_strip}</div></div>
-</div></section>
-<section id="token-details"><div class="section-heading"><h2>Token 概率与 Top-1 / Top-2</h2><output id="visible-token-count">{len(rows)} / {len(rows)}</output></div>
-<div class="token-toolbar">
-<div class="segmented" role="group" aria-label="Token filter">
-<button type="button" class="filter-button active" data-token-filter="all" aria-pressed="true">全部</button>
-<button type="button" class="filter-button" data-token-filter="mutation" aria-pressed="false">变异词</button>
-<button type="button" class="filter-button" data-token-filter="changed" aria-pressed="false">Top-1 改变</button>
-<button type="button" class="filter-button" data-token-filter="gain" aria-pressed="false">概率上升</button>
-<button type="button" class="filter-button" data-token-filter="drop" aria-pressed="false">概率下降</button>
-<button type="button" class="filter-button" data-token-filter="mismatch" aria-pressed="false">GT 不一致</button>
-</div>
-<label class="token-search"><span>搜索</span><input id="token-search" type="search" placeholder="index / token / ID" autocomplete="off"></label>
-</div>
+<section id="token-details"><div class="section-heading"><h2>全部 Response Token（严格按生成顺序）</h2><output>{len(rows)} tokens</output></div>
 <div class="table-scroll token-table-scroll"><table class="token-detail-table">
-<thead><tr><th rowspan="2">#</th><th rowspan="2">Response token</th><th rowspan="2">GT 标签</th><th colspan="4" class="condition original-condition">原图条件</th><th colspan="4" class="condition teacher-condition">GT Teacher 条件</th><th rowspan="2">Δp</th><th rowspan="2">Δlogp</th></tr>
-<tr><th>p(target)</th><th>target rank</th><th>Top-1</th><th>Top-2</th><th>p(target)</th><th>target rank</th><th>Top-1</th><th>Top-2</th></tr></thead>
+<thead><tr><th rowspan="2">生成索引</th><th rowspan="2">Response token</th><th colspan="4" class="condition original-condition">原图条件（image + prompt）</th><th colspan="4" class="condition teacher-condition">GT Teacher-Forcing 条件</th><th colspan="2" class="condition delta-condition">概率变化（Teacher - Original）</th></tr>
+<tr><th>p(response token)</th><th>response rank</th><th>Top-1</th><th>Top-2</th><th>p(same response token)</th><th>response rank</th><th>Top-1</th><th>Top-2</th><th>Δp</th><th>Δlogp</th></tr></thead>
 <tbody>{token_rows}</tbody></table></div></section>
-</main><script>const DATA={json.dumps(chart_data, ensure_ascii=False)};{_chart_javascript()}</script></body></html>"""
+</main></body></html>"""
 
 
-def _render_aggregate_html(
-    summary: dict[str, Any],
-    sample_rows: Sequence[dict[str, Any]],
-    tokens: Sequence[dict[str, Any]],
-    mutations: Sequence[dict[str, Any]],
-) -> str:
-    sample_table = "".join(
-        "<tr>"
-        f"<td><a href='{html.escape(str(row['report']))}'>{html.escape(str(row['pair_id']))}</a></td>"
-        f"<td>{int(row['token_count'])}</td>"
-        f"<td>{float(row['mean_p_original']):.6f}</td>"
-        f"<td>{float(row['mean_p_teacher']):.6f}</td>"
-        f"<td class='{_delta_class(float(row['mean_delta_logp_teacher_minus_original']))}'>{float(row['mean_delta_logp_teacher_minus_original']):+.4f}</td>"
-        f"<td>{100 * float(row['top1_changed_rate']):.2f}%</td>"
-        f"<td>{html.escape(str(row.get('finish_reason', '')))}</td>"
-        "</tr>"
-        for row in sample_rows
+def _render_aggregate_html(sample_rows: Sequence[dict[str, Any]]) -> str:
+    first_report = str(sample_rows[0]["report"]) if sample_rows else ""
+    sample_links = "".join(
+        f"<a class='sample-link{' active' if index == 0 else ''}' "
+        f"href='{html.escape(str(row['report']), quote=True)}' "
+        f"target='sample-report' data-sample-link>"
+        f"<strong>{html.escape(str(row['pair_id']))}</strong>"
+        f"<span>{int(row['token_count'])} tokens</span></a>"
+        for index, row in enumerate(sample_rows)
     )
-    mutation_table = "".join(
-        "<tr>"
-        f"<td>{html.escape(str(row['pair_id']))}</td>"
-        f"<td>{html.escape(str(row['ocr_ans']))}</td>"
-        f"<td>{html.escape(str(row['origin_ans']))}</td>"
-        f"<td>{html.escape(str(row['predicted']))}</td>"
-        f"<td>{html.escape(str(row['relation']))}</td>"
-        f"<td>{_optional_float(row.get('decision_p_original'))}</td>"
-        f"<td>{_optional_float(row.get('decision_p_teacher'))}</td>"
-        f"<td class='{_delta_class(row.get('decision_delta_logp'))}'>{_optional_float(row.get('decision_delta_logp'), signed=True)}</td>"
-        "</tr>"
-        for row in mutations
-    )
-    strongest = sorted(
-        tokens,
-        key=lambda row: abs(float(row["delta_logp_teacher_minus_original"])),
-        reverse=True,
-    )[:100]
-    strongest_table = "".join(
-        "<tr>"
-        f"<td>{html.escape(str(row['pair_id']))}</td><td>{int(row['index'])}</td>"
-        f"<td>{html.escape(str(row['token']))}</td><td>{html.escape(str(row.get('token_label', '')))}</td>"
-        f"<td>{float(row['p_original']):.6f}</td><td>{float(row['p_teacher']):.6f}</td>"
-        f"<td class='{_delta_class(float(row['delta_logp_teacher_minus_original']))}'>{float(row['delta_logp_teacher_minus_original']):+.4f}</td>"
-        f"<td>{html.escape(str(row['top_token_teacher']))}</td>"
-        f"<td>{int(row['top_token_id_teacher'])}</td><td>{float(row['top_p_teacher']):.6f}</td>"
-        f"<td>{html.escape(str(row['teacher_preference']))}</td>"
-        f"<td>{html.escape(str(row['top1_transition']))}</td></tr>"
-        for row in strongest
-    )
-    alternative_rows = [
-        row for row in tokens if str(row["teacher_preference"]) != "response_token_top1"
-    ]
-    alternative_rows.sort(
-        key=lambda row: (
-            str(row["teacher_preference"]) != "different_surface_top1",
-            float(row["p_teacher"]),
-        )
-    )
-    alternatives_table = "".join(
-        "<tr>"
-        f"<td>{html.escape(str(row['pair_id']))}</td><td>{int(row['index'])}</td>"
-        f"<td>{html.escape(str(row['token']))}</td><td>{int(row['token_id'])}</td>"
-        f"<td>{float(row['p_original']):.6f}</td><td>{float(row['p_teacher']):.6f}</td>"
-        f"<td>{html.escape(str(row['top_token_teacher']))}</td>"
-        f"<td>{int(row['top_token_id_teacher'])}</td><td>{float(row['top_p_teacher']):.6f}</td>"
-        f"<td>{html.escape(str(row['teacher_preference']))}</td>"
-        f"<td>{html.escape(str(row['top1_transition']))}</td></tr>"
-        for row in alternative_rows[:500]
-    )
-    scatter = [
-        {
-            "x": float(row["p_original"]),
-            "y": float(row["p_teacher"]),
-            "label": str(row.get("token_label", "")),
-        }
-        for row in _even_sample(tokens, 12000)
-    ]
-    deltas = [float(row["delta_logp_teacher_minus_original"]) for row in tokens]
     return f"""<!doctype html>
 <html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
 <title>Privileged Response Token Probe</title>{_report_css()}</head><body><main>
-<nav><a href="summary.json">Summary JSON</a><a href="sample_summary.csv">Sample CSV</a><a href="token_probabilities.csv">Token CSV</a><a href="mutation_probabilities.csv">Mutation CSV</a></nav>
-<h1>特权信息固定 Response 概率分析</h1>
-<div class="stats">{_stat("Samples", summary["completed_samples"])}{_stat("Tokens", summary["total_tokens"])}{_stat("Mutations", summary["total_mutations"])}{_stat("Mean p original", summary["mean_p_original"])}{_stat("Mean p teacher", summary["mean_p_teacher"])}{_stat("Mean Δlogp", summary["mean_delta_logp_teacher_minus_original"], signed=True)}{_stat("Top-1 changed", summary["top1_changed_rate"], percent=True)}{_stat("Same text / different ID", summary["teacher_preference_counts"].get("same_surface_different_token_id", 0))}{_stat("Teacher different text", summary["teacher_preference_counts"].get("different_surface_top1", 0))}{_stat("Teacher recovers response", summary["top1_transition_counts"].get("teacher_recovers_response", 0))}{_stat("Teacher rejects response", summary["top1_transition_counts"].get("teacher_rejects_response", 0))}</div>
-<section class="chart-grid"><div><h2>p original vs p teacher</h2><canvas id="scatter" width="720" height="520"></canvas></div><div><h2>Δlogp 分布</h2><canvas id="histogram" width="720" height="520"></canvas></div></section>
-<section><h2>逐样本</h2><div class="table-scroll"><table><thead><tr><th>Sample</th><th>Tokens</th><th>Mean p original</th><th>Mean p teacher</th><th>Mean Δlogp</th><th>Top-1 changed</th><th>Finish</th></tr></thead><tbody>{sample_table}</tbody></table></div></section>
-<section><h2>{summary["total_mutations"]} 个定向变异位置</h2><div class="table-scroll"><table><thead><tr><th>Sample</th><th>图片文字</th><th>原词</th><th>模型读回</th><th>关系</th><th>p original</th><th>p teacher</th><th>Δlogp</th></tr></thead><tbody>{mutation_table}</tbody></table></div></section>
-<section><h2>教师 Top-1 不再是 Response token</h2><div class="table-scroll"><table><thead><tr><th>Sample</th><th>#</th><th>Response token</th><th>Response ID</th><th>p original</th><th>p teacher</th><th>Teacher top-1</th><th>Top-1 ID</th><th>Top-1 p</th><th>解释</th><th>Top-1 transition</th></tr></thead><tbody>{alternatives_table}</tbody></table></div></section>
-<section><h2>|Δlogp| 最大的 Token</h2><div class="table-scroll"><table><thead><tr><th>Sample</th><th>#</th><th>Token</th><th>GT 标签</th><th>p original</th><th>p teacher</th><th>Δlogp</th><th>Teacher top-1</th><th>Top-1 ID</th><th>Top-1 p</th><th>解释</th><th>Top-1 transition</th></tr></thead><tbody>{strongest_table}</tbody></table></div></section>
-</main><script>const SCATTER={json.dumps(scatter, ensure_ascii=False)};const DELTAS={json.dumps(deltas)};{_aggregate_chart_javascript()}</script></body></html>"""
+<nav><a href="token_probabilities.csv">完整 Token CSV</a></nav>
+<h1>Response Token 概率对照</h1>
+<div class="sample-browser">
+<aside class="sample-list">{sample_links}</aside>
+<iframe class="sample-frame" name="sample-report" src="{html.escape(first_report, quote=True)}" title="样本逐 Token 概率对照"></iframe>
+</div>
+</main><script>
+document.querySelectorAll('[data-sample-link]').forEach(link => {{
+  link.addEventListener('click', () => {{
+    document.querySelectorAll('[data-sample-link]').forEach(item => item.classList.remove('active'));
+    link.classList.add('active');
+  }});
+}});
+</script></body></html>"""
 
 
 def _candidate_at(
@@ -1319,45 +1231,12 @@ def _probability_cell(value: Any, condition: str) -> str:
 def _token_table_row(row: dict[str, Any]) -> str:
     delta = float(row["delta_logp_teacher_minus_original"])
     delta_p = float(row["delta_p_teacher_minus_original"])
-    is_mutation = bool(str(row.get("mutation_ids", "")).strip())
-    is_mismatch = bool(row.get("is_hallucination"))
-    top1_changed = bool(row.get("top1_changed"))
-    classes = ["token-row"]
-    if is_mutation:
-        classes.append("mutation-token-row")
-    if is_mismatch:
-        classes.append("mismatch-token-row")
-    if top1_changed:
-        classes.append("top1-changed-row")
-    search_parts = [
-        str(row.get("index", "")),
-        str(row.get("token_id", "")),
-        str(row.get("token", "")),
-        str(row.get("raw_token", "")),
-        str(row.get("token_label", "")),
-    ]
-    for condition in ("original", "teacher"):
-        for rank in (1, 2):
-            candidate = _candidate_at(row, condition, rank)
-            if candidate is not None:
-                search_parts.extend(
-                    [
-                        str(candidate.get("token_id", "")),
-                        str(candidate.get("token", "")),
-                        str(candidate.get("raw_token", "")),
-                    ]
-                )
-    search_value = html.escape(" ".join(search_parts).lower(), quote=True)
     return (
-        f"<tr id='token-{int(row['index'])}' class='{' '.join(classes)}' "
-        f"data-mutation='{int(is_mutation)}' data-mismatch='{int(is_mismatch)}' "
-        f"data-top1-changed='{int(top1_changed)}' "
-        f"data-delta='{'gain' if delta >= 0 else 'drop'}' data-search='{search_value}'>"
+        f"<tr id='token-{int(row['index'])}' class='token-row'>"
         f"<td>{int(row['index'])}</td>"
         "<td><div class='response-token'>"
         f"<code>{html.escape(str(row['token'])) or '&lt;empty&gt;'}</code>"
         f"<span>ID {int(row['token_id'])}</span></div></td>"
-        f"<td class='label-cell'>{html.escape(str(row.get('token_label', '')))}</td>"
         f"<td>{_probability_cell(row['p_original'], 'original')}</td>"
         f"<td>{int(row['rank_original'])}</td>"
         f"<td>{_candidate_block(row, 'original', 1)}</td>"
@@ -1615,6 +1494,38 @@ figcaption { margin-top: 5px; color: #65767b; font-size: 12px; }
   border-bottom: 1px solid #dfe5e3;
 }
 .panel-heading span, .section-heading output { color: #65767b; font-size: 12px; }
+.sample-browser {
+  display: grid;
+  grid-template-columns: minmax(210px, 280px) minmax(0, 1fr);
+  gap: 12px;
+  height: calc(100vh - 120px);
+  min-height: 680px;
+}
+.sample-list {
+  overflow: auto;
+  padding: 6px;
+  background: #fff;
+  border: 1px solid #d5dcda;
+}
+.sample-link {
+  display: grid;
+  gap: 2px;
+  margin-bottom: 4px;
+  padding: 9px 10px;
+  border-left: 3px solid transparent;
+  color: #26383e;
+  text-decoration: none;
+}
+.sample-link:hover { background: #f1f6f5; }
+.sample-link.active { border-left-color: #08748d; background: #e5f1f2; }
+.sample-link strong { overflow-wrap: anywhere; font-size: 12px; }
+.sample-link span { color: #708086; font-size: 11px; }
+.sample-frame {
+  width: 100%;
+  height: 100%;
+  border: 1px solid #d5dcda;
+  background: #fff;
+}
 pre.transcript {
   min-height: 520px;
   max-height: 840px;
@@ -1816,6 +1727,9 @@ td:first-child, th:first-child { text-align: left; }
 @media (max-width: 820px) {
   main { padding: 14px; }
   .transcript-grid, .chart-grid { grid-template-columns: 1fr; }
+  .sample-browser { grid-template-columns: 1fr; height: auto; }
+  .sample-list { max-height: 220px; }
+  .sample-frame { min-height: 900px; }
   .mutation-terms { grid-template-columns: repeat(2, minmax(0, 1fr)); }
   .token-toolbar { align-items: stretch; flex-direction: column; }
   .token-search input { width: 100%; }

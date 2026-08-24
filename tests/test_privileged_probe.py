@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import math
+from html.parser import HTMLParser
 from pathlib import Path
 from types import SimpleNamespace
 from typing import ClassVar
@@ -65,6 +66,48 @@ class RecordingModel(torch.nn.Module):
 class TrackerStub:
     def set_current(self, **_: object) -> None:
         return None
+
+
+class SampleReportParser(HTMLParser):
+    def __init__(self) -> None:
+        super().__init__()
+        self.transcripts: list[str] = []
+        self.token_rows: list[tuple[str, list[str]]] = []
+        self._transcript_parts: list[str] | None = None
+        self._token_row: tuple[str, list[str]] | None = None
+        self._cell_parts: list[str] | None = None
+
+    def handle_starttag(
+        self,
+        tag: str,
+        attrs: list[tuple[str, str | None]],
+    ) -> None:
+        attributes = dict(attrs)
+        if tag == "pre" and attributes.get("class") == "transcript":
+            self._transcript_parts = []
+        if tag == "tr":
+            row_id = attributes.get("id")
+            if row_id is not None and row_id.startswith("token-"):
+                self._token_row = (row_id, [])
+        if tag == "td" and self._token_row is not None:
+            self._cell_parts = []
+
+    def handle_data(self, data: str) -> None:
+        if self._transcript_parts is not None:
+            self._transcript_parts.append(data)
+        if self._cell_parts is not None:
+            self._cell_parts.append(data)
+
+    def handle_endtag(self, tag: str) -> None:
+        if tag == "pre" and self._transcript_parts is not None:
+            self.transcripts.append("".join(self._transcript_parts))
+            self._transcript_parts = None
+        elif tag == "td" and self._token_row is not None:
+            self._token_row[1].append("".join(self._cell_parts or []))
+            self._cell_parts = None
+        elif tag == "tr" and self._token_row is not None:
+            self.token_rows.append(self._token_row)
+            self._token_row = None
 
 
 def _bundle(model: torch.nn.Module | None = None) -> ModelBundle:
@@ -272,10 +315,20 @@ def test_combine_scores_reports_teacher_alternative() -> None:
     assert rows[0]["delta_logp_teacher_minus_original"] < 0
 
 
-def test_sample_report_exposes_gt_response_mutation_and_top2() -> None:
+def test_sample_report_keeps_complete_response_token_table_in_order() -> None:
+    response_ids = [8, 7, 9]
     rows = probe._combine_scores(
-        [7],
+        response_ids,
         [
+            _score_record(
+                8,
+                "B",
+                0.2,
+                top_token_id=7,
+                top_raw_token="A",
+                top_probability=0.6,
+                target_rank=2,
+            ),
             _score_record(
                 7,
                 "A",
@@ -284,106 +337,223 @@ def test_sample_report_exposes_gt_response_mutation_and_top2() -> None:
                 top_raw_token="A",
                 top_probability=0.9,
                 target_rank=1,
-            )
+            ),
+            _score_record(
+                9,
+                "X",
+                0.1,
+                top_token_id=8,
+                top_raw_token="B",
+                top_probability=0.7,
+                target_rank=3,
+            ),
         ],
         [
             _score_record(
+                8,
+                "B",
+                0.4,
+                top_token_id=8,
+                top_raw_token="B",
+                top_probability=0.4,
+                target_rank=1,
+            ),
+            _score_record(
                 7,
                 "A",
-                0.1,
+                0.3,
+                top_token_id=9,
+                top_raw_token="X",
+                top_probability=0.5,
+                target_rank=2,
+            ),
+            _score_record(
+                9,
+                "X",
+                0.8,
                 top_token_id=9,
                 top_raw_token="X",
                 top_probability=0.8,
-                target_rank=2,
-            )
+                target_rank=1,
+            ),
         ],
     )
-    rows[0].update(
+    for row, original_candidates, teacher_candidates in zip(
+        rows,
+        [
+            [
+                {"rank": 1, "token_id": 7, "token": "A", "raw_token": "A", "probability": 0.6},
+                {"rank": 2, "token_id": 8, "token": "B", "raw_token": "B", "probability": 0.2},
+            ],
+            [
+                {"rank": 1, "token_id": 7, "token": "A", "raw_token": "A", "probability": 0.9},
+                {"rank": 2, "token_id": 8, "token": "B", "raw_token": "B", "probability": 0.05},
+            ],
+            [
+                {"rank": 1, "token_id": 8, "token": "B", "raw_token": "B", "probability": 0.7},
+                {"rank": 2, "token_id": 9, "token": "X", "raw_token": "X", "probability": 0.1},
+            ],
+        ],
+        [
+            [
+                {"rank": 1, "token_id": 8, "token": "B", "raw_token": "B", "probability": 0.4},
+                {"rank": 2, "token_id": 7, "token": "A", "raw_token": "A", "probability": 0.2},
+            ],
+            [
+                {"rank": 1, "token_id": 9, "token": "X", "raw_token": "X", "probability": 0.5},
+                {"rank": 2, "token_id": 7, "token": "A", "raw_token": "A", "probability": 0.3},
+            ],
+            [
+                {"rank": 1, "token_id": 9, "token": "X", "raw_token": "X", "probability": 0.8},
+                {"rank": 2, "token_id": 7, "token": "A", "raw_token": "A", "probability": 0.1},
+            ],
+        ],
+    ):
+        row["top_candidates_original"] = original_candidates
+        row["top_candidates_teacher"] = teacher_candidates
+    rows[1].update(
         {
             "token_label": "mutation_opposite_variant",
             "is_hallucination": True,
             "mutation_ids": "m001",
             "raw_source_start": 0,
             "raw_source_end": 1,
-            "top_candidates_original": [
-                {
-                    "rank": 1,
-                    "token_id": 7,
-                    "token": "A",
-                    "raw_token": "A",
-                    "probability": 0.9,
-                },
-                {
-                    "rank": 2,
-                    "token_id": 9,
-                    "token": "X",
-                    "raw_token": "X",
-                    "probability": 0.08,
-                },
-            ],
-            "top_candidates_teacher": [
-                {
-                    "rank": 1,
-                    "token_id": 9,
-                    "token": "X",
-                    "raw_token": "X",
-                    "probability": 0.8,
-                },
-                {
-                    "rank": 2,
-                    "token_id": 7,
-                    "token": "A",
-                    "raw_token": "A",
-                    "probability": 0.1,
-                },
-            ],
         }
     )
     mutation = {
         "mutation_id": "m001",
-        "ocr_ans": "A",
-        "origin_ans": "X",
+        "ocr_ans": "B",
+        "origin_ans": "A",
         "bbox": [1, 2, 3, 4],
-        "predicted": "A",
+        "predicted": "B",
         "relation": "opposite_variant",
-        "response_token_indices": [0],
+        "response_token_indices": [1],
     }
+    ground_truth = "A\nGround truth tail"
+    response_text = "BAX"
     result = {
         "pair_id": "pair-1",
         "sample": {
             "image_copy": "/tmp/input.png",
             "changes": [
                 {
-                    "ocr_ans": "A",
-                    "origin_ans": "X",
+                    "ocr_ans": "B",
+                    "origin_ans": "A",
                     "markdown_span": [0, 1],
                 }
             ],
         },
-        "response": {"text": "A"},
-        "ground_truth": "A",
+        "response": {"text": response_text, "token_ids": response_ids},
+        "ground_truth": ground_truth,
         "summary": {
-            "token_count": 1,
-            "mean_p_original": 0.9,
-            "mean_p_teacher": 0.1,
-            "mean_delta_logp_teacher_minus_original": math.log(0.1) - math.log(0.9),
+            "token_count": len(rows),
+            "mean_p_original": 0.4,
+            "mean_p_teacher": 0.5,
+            "mean_delta_logp_teacher_minus_original": math.fsum(
+                float(row["delta_logp_teacher_minus_original"]) for row in rows
+            )
+            / len(rows),
         },
         "mutation_observations": [mutation],
         "tokens": rows,
     }
 
     report = probe._render_sample_html(result)
+    parser = SampleReportParser()
+    parser.feed(report)
 
+    assert parser.transcripts == [ground_truth, response_text]
     assert "Ground Truth" in report
     assert "模型 Response" in report
-    assert "变异词重点" in report
-    assert "图片中的变异词" in report
-    assert "Original Top-2" in report
-    assert "Teacher Top-2" in report
-    assert "ID 9" in report
-    assert "p 0.080000" in report
-    assert "data-mutation='1'" in report
-    assert "class='mutation-mark'" in report
+    assert "image + prompt" in report
+    assert "GT Teacher-Forcing 条件" in report
+    assert "p(response token)" in report
+    assert "p(same response token)" in report
+    assert "Top-1" in report
+    assert "Top-2" in report
+    assert '<div class="stats">' not in report
+    assert "data-token-filter=" not in report
+    assert '<article class="mutation-focus">' not in report
+
+    assert [row_id for row_id, _ in parser.token_rows] == [
+        "token-0",
+        "token-1",
+        "token-2",
+    ]
+    assert len(parser.token_rows) == len(response_ids)
+    assert report.count("class='token-row") == len(response_ids)
+    expected = [
+        (0, 8, "B", 0.2, 0.4),
+        (1, 7, "A", 0.9, 0.3),
+        (2, 9, "X", 0.1, 0.8),
+    ]
+    for (row_id, cells), (index, token_id, token_text, p_original, p_teacher) in zip(
+        parser.token_rows, expected
+    ):
+        assert row_id == f"token-{index}"
+        assert len(cells) == 12
+        assert cells[0] == str(index)
+        assert token_text in cells[1]
+        assert f"ID {token_id}" in cells[1]
+        assert f"{p_original:.6f}" in cells[2]
+        assert f"{p_teacher:.6f}" in cells[6]
+        assert f"{p_teacher - p_original:+.6f}" in cells[10]
+        assert (
+            f"{math.log(p_teacher) - math.log(p_original):+.4f}"
+            in cells[11]
+        )
+
+    assert "0.200000" in parser.token_rows[0][1][2]
+    assert "p 0.600000" in parser.token_rows[0][1][4]
+    assert "0.400000" in parser.token_rows[0][1][6]
+    assert "p 0.400000" in parser.token_rows[0][1][8]
+
+
+@pytest.mark.parametrize(
+    ("tokens", "response_ids"),
+    [
+        ([{"index": 1, "token_id": 7}], [7]),
+        ([{"index": 0, "token_id": 8}], [7]),
+    ],
+)
+def test_response_rows_reject_order_or_id_mismatch(
+    tokens: list[dict[str, int]],
+    response_ids: list[int],
+) -> None:
+    with pytest.raises(
+        RuntimeError,
+        match="report tokens are not in generated response order",
+    ):
+        probe._response_rows_in_generation_order(
+            {"tokens": tokens, "response": {"token_ids": response_ids}}
+        )
+
+
+def test_aggregate_report_has_no_statistics_and_starts_with_first_sample() -> None:
+    report = probe._render_aggregate_html(
+        [
+            {
+                "pair_id": "pair-1",
+                "report": "samples/001_pair-1/report.html",
+                "token_count": 3,
+            },
+            {
+                "pair_id": "pair-2",
+                "report": "samples/002_pair-2/report.html",
+                "token_count": 5,
+            },
+        ]
+    )
+
+    iframe_start = report.index("<iframe ")
+    iframe_end = report.index(">", iframe_start)
+    iframe_tag = report[iframe_start:iframe_end]
+    assert 'src="samples/001_pair-1/report.html"' in iframe_tag
+    assert "samples/002_pair-2/report.html" in report
+    assert '<div class="stats">' not in report
+    assert "<canvas" not in report
+    assert "summary.json" not in report
+    assert "<table" not in report
 
 
 def test_cli_contains_no_api_transport_arguments() -> None:
