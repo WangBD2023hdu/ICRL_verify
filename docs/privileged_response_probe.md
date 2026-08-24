@@ -45,3 +45,16 @@ transitions, GT alignment, and mutation sites. Each sample directory contains
 the copied page image, GT, exact privileged prompt, response text, response IDs,
 resumable partial checkpoint, token CSV, mutation CSV, JSON result, and HTML
 report.
+
+Each sample report keeps Ground Truth and model Response visible side by side.
+Synthetic mutation words are highlighted and listed before the complete token
+table. For every linked mutation token and every regular response token, the
+report shows target probability/rank plus Original and GT-Teacher Top-1/Top-2
+token IDs, decoded text, and candidate probabilities. Existing results can be
+rendered with the new layout without another model forward:
+
+```bash
+qwen-mm-privileged-probe \
+  --output-dir outputs/arxiv_confusable_privileged_probe_v1 \
+  --rebuild-report-only
+```

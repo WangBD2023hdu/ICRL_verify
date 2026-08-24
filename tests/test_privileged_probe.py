@@ -272,6 +272,120 @@ def test_combine_scores_reports_teacher_alternative() -> None:
     assert rows[0]["delta_logp_teacher_minus_original"] < 0
 
 
+def test_sample_report_exposes_gt_response_mutation_and_top2() -> None:
+    rows = probe._combine_scores(
+        [7],
+        [
+            _score_record(
+                7,
+                "A",
+                0.9,
+                top_token_id=7,
+                top_raw_token="A",
+                top_probability=0.9,
+                target_rank=1,
+            )
+        ],
+        [
+            _score_record(
+                7,
+                "A",
+                0.1,
+                top_token_id=9,
+                top_raw_token="X",
+                top_probability=0.8,
+                target_rank=2,
+            )
+        ],
+    )
+    rows[0].update(
+        {
+            "token_label": "mutation_opposite_variant",
+            "is_hallucination": True,
+            "mutation_ids": "m001",
+            "raw_source_start": 0,
+            "raw_source_end": 1,
+            "top_candidates_original": [
+                {
+                    "rank": 1,
+                    "token_id": 7,
+                    "token": "A",
+                    "raw_token": "A",
+                    "probability": 0.9,
+                },
+                {
+                    "rank": 2,
+                    "token_id": 9,
+                    "token": "X",
+                    "raw_token": "X",
+                    "probability": 0.08,
+                },
+            ],
+            "top_candidates_teacher": [
+                {
+                    "rank": 1,
+                    "token_id": 9,
+                    "token": "X",
+                    "raw_token": "X",
+                    "probability": 0.8,
+                },
+                {
+                    "rank": 2,
+                    "token_id": 7,
+                    "token": "A",
+                    "raw_token": "A",
+                    "probability": 0.1,
+                },
+            ],
+        }
+    )
+    mutation = {
+        "mutation_id": "m001",
+        "ocr_ans": "A",
+        "origin_ans": "X",
+        "bbox": [1, 2, 3, 4],
+        "predicted": "A",
+        "relation": "opposite_variant",
+        "response_token_indices": [0],
+    }
+    result = {
+        "pair_id": "pair-1",
+        "sample": {
+            "image_copy": "/tmp/input.png",
+            "changes": [
+                {
+                    "ocr_ans": "A",
+                    "origin_ans": "X",
+                    "markdown_span": [0, 1],
+                }
+            ],
+        },
+        "response": {"text": "A"},
+        "ground_truth": "A",
+        "summary": {
+            "token_count": 1,
+            "mean_p_original": 0.9,
+            "mean_p_teacher": 0.1,
+            "mean_delta_logp_teacher_minus_original": math.log(0.1) - math.log(0.9),
+        },
+        "mutation_observations": [mutation],
+        "tokens": rows,
+    }
+
+    report = probe._render_sample_html(result)
+
+    assert "Ground Truth" in report
+    assert "模型 Response" in report
+    assert "变异词重点" in report
+    assert "图片中的变异词" in report
+    assert "Original Top-2" in report
+    assert "Teacher Top-2" in report
+    assert "ID 9" in report
+    assert "p 0.080000" in report
+    assert "data-mutation='1'" in report
+    assert "class='mutation-mark'" in report
+
+
 def test_cli_contains_no_api_transport_arguments() -> None:
     parser = probe._build_parser()
     option_strings = {

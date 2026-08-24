@@ -144,8 +144,8 @@ def run_privileged_probe(
         raise ValueError("privileged_instruction must not be empty")
     if max_new_tokens <= 0:
         raise ValueError("max_new_tokens must be positive")
-    if not 1 <= top_k <= 50:
-        raise ValueError("top_k must be between 1 and 50")
+    if not 2 <= top_k <= 50:
+        raise ValueError("top_k must be between 2 and 50 so Top-1/Top-2 are available")
     if forward_chunk_size <= 0:
         raise ValueError("forward_chunk_size must be positive")
     if min_pixels <= 0 or max_pixels < min_pixels:
@@ -870,6 +870,34 @@ def _build_mutation_rows(
         ]
         token_rows = [rows[token_index] for token_index in token_indices]
         decision = token_rows[0] if token_rows else None
+        response_tokens = [
+            {
+                "index": int(row["index"]),
+                "token_id": int(row["token_id"]),
+                "token": str(row["token"]),
+                "raw_token": str(row["raw_token"]),
+                "p_original": float(row["p_original"]),
+                "p_teacher": float(row["p_teacher"]),
+                "rank_original": int(row["rank_original"]),
+                "rank_teacher": int(row["rank_teacher"]),
+                "delta_p_teacher_minus_original": float(
+                    row["delta_p_teacher_minus_original"]
+                ),
+                "delta_logp_teacher_minus_original": float(
+                    row["delta_logp_teacher_minus_original"]
+                ),
+                "top_candidates_original": list(row.get("top_candidates_original", [])),
+                "top_candidates_teacher": list(row.get("top_candidates_teacher", [])),
+                "top_token_id_original": int(row["top_token_id_original"]),
+                "top_token_original": str(row["top_token_original"]),
+                "top_p_original": float(row["top_p_original"]),
+                "top_token_id_teacher": int(row["top_token_id_teacher"]),
+                "top_token_teacher": str(row["top_token_teacher"]),
+                "top_p_teacher": float(row["top_p_teacher"]),
+                "top1_changed": bool(row["top1_changed"]),
+            }
+            for row in token_rows
+        ]
         mutation_rows.append(
             {
                 "mutation_id": mutation_id,
@@ -880,6 +908,7 @@ def _build_mutation_rows(
                 "predicted": observation.predicted,
                 "relation": observation.relation,
                 "response_token_indices": token_indices,
+                "response_tokens": response_tokens,
                 "decision_token_index": int(decision["index"]) if decision else None,
                 "decision_token": str(decision["token"]) if decision else "",
                 "decision_p_original": float(decision["p_original"])
@@ -962,6 +991,7 @@ def rebuild_privileged_report(output_dir: str | Path) -> dict[str, Any]:
     all_mutations: list[dict[str, Any]] = []
     sample_rows: list[dict[str, Any]] = []
     for result_path, result in zip(result_paths, results):
+        _write_sample_outputs(result_path.parent, result)
         relative_report = result_path.parent.relative_to(output_root) / "report.html"
         sample_rows.append(
             {
@@ -1048,6 +1078,7 @@ def _write_sample_outputs(sample_dir: Path, result: dict[str, Any]) -> None:
 
 def _render_sample_html(result: dict[str, Any]) -> str:
     rows = result["tokens"]
+    mutations = result["mutation_observations"]
     chart_data = [
         {
             "i": row["index"],
@@ -1062,22 +1093,62 @@ def _render_sample_html(result: dict[str, Any]) -> str:
     original_strip = "".join(_probability_span(row, "p_original") for row in rows)
     teacher_strip = "".join(_probability_span(row, "p_teacher") for row in rows)
     delta_strip = "".join(_delta_span(row) for row in rows)
-    mutation_rows = "".join(
-        _mutation_table_row(row) for row in result["mutation_observations"]
+    mutation_focus = "".join(
+        _mutation_focus_card(mutation, rows) for mutation in mutations
     )
+    if not mutation_focus:
+        mutation_focus = "<p class='empty-state'>该样本没有人工变异词。</p>"
     image_name = Path(result["sample"]["image_copy"]).name
     summary = result["summary"]
+    highlighted_gt = _highlight_ground_truth(
+        str(result["ground_truth"]),
+        result.get("sample", {}).get("changes", []),
+    )
+    highlighted_response = _highlight_response(
+        str(result["response"]["text"]),
+        rows,
+    )
+    mutation_token_count = sum(bool(row.get("mutation_ids")) for row in rows)
+    top1_changed_count = sum(bool(row.get("top1_changed")) for row in rows)
     return f"""<!doctype html>
 <html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
 <title>{html.escape(result["pair_id"])} privileged probe</title>{_report_css()}</head>
 <body><main>
 <nav><a href="../../report.html">汇总报告</a><a href="token_probabilities.csv">Token CSV</a><a href="mutation_probabilities.csv">变异 CSV</a></nav>
 <h1>{html.escape(result["pair_id"])}</h1>
-<div class="stats">{_stat("Tokens", summary["token_count"])}{_stat("Mean p original", summary["mean_p_original"])}{_stat("Mean p teacher", summary["mean_p_teacher"])}{_stat("Mean Δlogp", summary["mean_delta_logp_teacher_minus_original"], signed=True)}{_stat("Top-1 changed", summary["top1_changed_rate"], percent=True)}</div>
-<section class="source-grid"><figure><img src="{html.escape(image_name)}" alt="document page"><figcaption>输入图片</figcaption></figure><div><h2>模型 Response</h2><pre>{html.escape(result["response"]["text"])}</pre><details><summary>Ground Truth</summary><pre>{html.escape(result["ground_truth"])}</pre></details></div></section>
-<section><h2>逐 Token 概率</h2><canvas id="prob-chart" width="1600" height="360"></canvas><h3>原图条件</h3><div class="token-strip">{original_strip}</div><h3>特权信息条件</h3><div class="token-strip">{teacher_strip}</div><h3>Δlogp = teacher - original</h3><div class="token-strip">{delta_strip}</div></section>
-<section><h2>人工变异位置</h2><div class="table-scroll"><table><thead><tr><th>ID</th><th>图片文字</th><th>原词</th><th>模型读回</th><th>关系</th><th>Decision token</th><th>p original</th><th>p teacher</th><th>Δlogp</th></tr></thead><tbody>{mutation_rows}</tbody></table></div></section>
-<section><h2>Token 明细</h2><div class="table-scroll"><table><thead><tr><th>#</th><th>ID</th><th>Token</th><th>GT 标签</th><th>p original</th><th>p teacher</th><th>Δp</th><th>Δlogp</th><th>Original top-1</th><th>Original top-1 ID</th><th>Teacher top-1</th><th>Teacher top-1 ID</th><th>Teacher top-1 p</th><th>Top-1 changed</th><th>解释</th><th>Top-1 transition</th></tr></thead><tbody>{token_rows}</tbody></table></div></section>
+<div class="stats">{_stat("Tokens", summary["token_count"])}{_stat("变异词 Token", mutation_token_count)}{_stat("Top-1 改变", top1_changed_count)}{_stat("Mean p original", summary["mean_p_original"])}{_stat("Mean p teacher", summary["mean_p_teacher"])}{_stat("Mean Δlogp", summary["mean_delta_logp_teacher_minus_original"], signed=True)}</div>
+<section><h2>GT 与模型 Response</h2>
+<div class="source-review">
+<figure><img src="{html.escape(image_name)}" alt="document page"><figcaption>输入图片</figcaption></figure>
+<div class="transcript-grid">
+<div class="transcript-panel"><div class="panel-heading"><h3>Ground Truth</h3><span>{len(str(result["ground_truth"]))} chars</span></div><pre class="transcript">{highlighted_gt}</pre></div>
+<div class="transcript-panel"><div class="panel-heading"><h3>模型 Response</h3><span>{len(rows)} tokens</span></div><pre class="transcript">{highlighted_response}</pre></div>
+</div></div>
+<div class="legend"><span><i class="legend-swatch mutation"></i>变异词</span><span><i class="legend-swatch mismatch"></i>GT 不一致</span></div>
+</section>
+<section id="mutation-focus"><h2>变异词重点</h2><div class="mutation-list">{mutation_focus}</div></section>
+<section><h2>逐 Token 概率变化</h2><canvas id="prob-chart" width="1600" height="360"></canvas>
+<div class="strip-grid">
+<div><h3>原图条件 p(response token)</h3><div class="token-strip">{original_strip}</div></div>
+<div><h3>GT Teacher 条件 p(response token)</h3><div class="token-strip">{teacher_strip}</div></div>
+<div><h3>Δlogp = teacher - original</h3><div class="token-strip">{delta_strip}</div></div>
+</div></section>
+<section id="token-details"><div class="section-heading"><h2>Token 概率与 Top-1 / Top-2</h2><output id="visible-token-count">{len(rows)} / {len(rows)}</output></div>
+<div class="token-toolbar">
+<div class="segmented" role="group" aria-label="Token filter">
+<button type="button" class="filter-button active" data-token-filter="all" aria-pressed="true">全部</button>
+<button type="button" class="filter-button" data-token-filter="mutation" aria-pressed="false">变异词</button>
+<button type="button" class="filter-button" data-token-filter="changed" aria-pressed="false">Top-1 改变</button>
+<button type="button" class="filter-button" data-token-filter="gain" aria-pressed="false">概率上升</button>
+<button type="button" class="filter-button" data-token-filter="drop" aria-pressed="false">概率下降</button>
+<button type="button" class="filter-button" data-token-filter="mismatch" aria-pressed="false">GT 不一致</button>
+</div>
+<label class="token-search"><span>搜索</span><input id="token-search" type="search" placeholder="index / token / ID" autocomplete="off"></label>
+</div>
+<div class="table-scroll token-table-scroll"><table class="token-detail-table">
+<thead><tr><th rowspan="2">#</th><th rowspan="2">Response token</th><th rowspan="2">GT 标签</th><th colspan="4" class="condition original-condition">原图条件</th><th colspan="4" class="condition teacher-condition">GT Teacher 条件</th><th rowspan="2">Δp</th><th rowspan="2">Δlogp</th></tr>
+<tr><th>p(target)</th><th>target rank</th><th>Top-1</th><th>Top-2</th><th>p(target)</th><th>target rank</th><th>Top-1</th><th>Top-2</th></tr></thead>
+<tbody>{token_rows}</tbody></table></div></section>
 </main><script>const DATA={json.dumps(chart_data, ensure_ascii=False)};{_chart_javascript()}</script></body></html>"""
 
 
@@ -1172,25 +1243,251 @@ def _render_aggregate_html(
 </main><script>const SCATTER={json.dumps(scatter, ensure_ascii=False)};const DELTAS={json.dumps(deltas)};{_aggregate_chart_javascript()}</script></body></html>"""
 
 
+def _candidate_at(
+    row: dict[str, Any],
+    condition: str,
+    rank: int,
+) -> dict[str, Any] | None:
+    candidates = row.get(f"top_candidates_{condition}", [])
+    if isinstance(candidates, list) and len(candidates) >= rank:
+        candidate = dict(candidates[rank - 1])
+        candidate.setdefault("rank", rank)
+        return candidate
+    if rank != 1:
+        return None
+    suffix = "original" if condition == "original" else "teacher"
+    token_id = row.get(f"top_token_id_{suffix}")
+    if token_id is None:
+        return None
+    return {
+        "rank": 1,
+        "token_id": int(token_id),
+        "token": str(row.get(f"top_token_{suffix}", "")),
+        "raw_token": str(
+            row.get(
+                f"top_raw_token_{suffix}",
+                row.get(f"top_token_{suffix}", ""),
+            )
+        ),
+        "probability": float(row.get(f"top_p_{suffix}", 0.0)),
+    }
+
+
+def _candidate_block(
+    row: dict[str, Any],
+    condition: str,
+    rank: int,
+) -> str:
+    candidate = _candidate_at(row, condition, rank)
+    rank_label = f"Top-{rank}"
+    if candidate is None:
+        return (
+            "<div class='candidate missing'>"
+            f"<span class='candidate-rank'>{rank_label}</span><span>-</span></div>"
+        )
+    token_id = int(candidate["token_id"])
+    raw_token = str(candidate.get("raw_token", candidate.get("token", "")))
+    decoded = _display_token(raw_token) or "<empty>"
+    target_id = int(row.get("token_id", -1))
+    target_raw = str(row.get("raw_token", row.get("token", "")))
+    if token_id == target_id:
+        relation = "target"
+    elif raw_token == target_raw:
+        relation = "same-surface"
+    else:
+        relation = "alternative"
+    probability = float(candidate.get("probability", 0.0))
+    return (
+        f"<div class='candidate {relation}'>"
+        f"<span class='candidate-rank'>{rank_label}</span>"
+        f"<code>{html.escape(decoded)}</code>"
+        f"<span class='candidate-id'>ID {token_id}</span>"
+        f"<strong>p {probability:.6f}</strong></div>"
+    )
+
+
+def _probability_cell(value: Any, condition: str) -> str:
+    probability = min(1.0, max(0.0, float(value)))
+    return (
+        f"<div class='probability-cell {condition}'>"
+        f"<strong>{probability:.6f}</strong>"
+        f"<span class='probability-track'><i style='width:{100 * probability:.4f}%'></i></span>"
+        "</div>"
+    )
+
+
 def _token_table_row(row: dict[str, Any]) -> str:
+    delta = float(row["delta_logp_teacher_minus_original"])
+    delta_p = float(row["delta_p_teacher_minus_original"])
+    is_mutation = bool(str(row.get("mutation_ids", "")).strip())
+    is_mismatch = bool(row.get("is_hallucination"))
+    top1_changed = bool(row.get("top1_changed"))
+    classes = ["token-row"]
+    if is_mutation:
+        classes.append("mutation-token-row")
+    if is_mismatch:
+        classes.append("mismatch-token-row")
+    if top1_changed:
+        classes.append("top1-changed-row")
+    search_parts = [
+        str(row.get("index", "")),
+        str(row.get("token_id", "")),
+        str(row.get("token", "")),
+        str(row.get("raw_token", "")),
+        str(row.get("token_label", "")),
+    ]
+    for condition in ("original", "teacher"):
+        for rank in (1, 2):
+            candidate = _candidate_at(row, condition, rank)
+            if candidate is not None:
+                search_parts.extend(
+                    [
+                        str(candidate.get("token_id", "")),
+                        str(candidate.get("token", "")),
+                        str(candidate.get("raw_token", "")),
+                    ]
+                )
+    search_value = html.escape(" ".join(search_parts).lower(), quote=True)
+    return (
+        f"<tr id='token-{int(row['index'])}' class='{' '.join(classes)}' "
+        f"data-mutation='{int(is_mutation)}' data-mismatch='{int(is_mismatch)}' "
+        f"data-top1-changed='{int(top1_changed)}' "
+        f"data-delta='{'gain' if delta >= 0 else 'drop'}' data-search='{search_value}'>"
+        f"<td>{int(row['index'])}</td>"
+        "<td><div class='response-token'>"
+        f"<code>{html.escape(str(row['token'])) or '&lt;empty&gt;'}</code>"
+        f"<span>ID {int(row['token_id'])}</span></div></td>"
+        f"<td class='label-cell'>{html.escape(str(row.get('token_label', '')))}</td>"
+        f"<td>{_probability_cell(row['p_original'], 'original')}</td>"
+        f"<td>{int(row['rank_original'])}</td>"
+        f"<td>{_candidate_block(row, 'original', 1)}</td>"
+        f"<td>{_candidate_block(row, 'original', 2)}</td>"
+        f"<td>{_probability_cell(row['p_teacher'], 'teacher')}</td>"
+        f"<td>{int(row['rank_teacher'])}</td>"
+        f"<td>{_candidate_block(row, 'teacher', 1)}</td>"
+        f"<td>{_candidate_block(row, 'teacher', 2)}</td>"
+        f"<td class='{_delta_class(delta_p)}'>{delta_p:+.6f}</td>"
+        f"<td class='{_delta_class(delta)}'>{delta:+.4f}</td></tr>"
+    )
+
+
+def _mutation_focus_card(
+    mutation: dict[str, Any],
+    rows: Sequence[dict[str, Any]],
+) -> str:
+    mutation_id = str(mutation.get("mutation_id", ""))
+    indices = {
+        int(index)
+        for index in mutation.get("response_token_indices", [])
+        if isinstance(index, int) or str(index).isdigit()
+    }
+    token_rows = [
+        row
+        for row in rows
+        if int(row.get("index", -1)) in indices
+        or mutation_id in str(row.get("mutation_ids", "")).split(",")
+    ]
+    detail_rows = "".join(_mutation_token_detail_row(row) for row in token_rows)
+    if not detail_rows:
+        detail_rows = (
+            "<tr><td colspan='8' class='empty-state'>"
+            "未对齐到模型 Response token</td></tr>"
+        )
+    relation = str(mutation.get("relation", "unknown"))
+    relation_class = "gain" if relation == "expected" else "drop"
+    bbox = mutation.get("bbox", [])
+    bbox_text = json.dumps(bbox, ensure_ascii=False) if bbox else "-"
+    return f"""<article class="mutation-focus">
+<div class="mutation-heading"><div><span class="mutation-id">{html.escape(mutation_id)}</span><strong>变异词对比</strong></div><span class="{relation_class}">{html.escape(relation)}</span></div>
+<div class="mutation-terms">
+<div><span>图片中的变异词</span><code>{html.escape(str(mutation.get("ocr_ans", "")))}</code></div>
+<div><span>原词</span><code>{html.escape(str(mutation.get("origin_ans", "")))}</code></div>
+<div><span>模型读回</span><code>{html.escape(str(mutation.get("predicted", "")))}</code></div>
+<div><span>BBox</span><code>{html.escape(bbox_text)}</code></div>
+</div>
+<div class="table-scroll mutation-token-table"><table><thead><tr><th>Response token</th><th>p original</th><th>p teacher</th><th>Δlogp</th><th>Original Top-1</th><th>Original Top-2</th><th>Teacher Top-1</th><th>Teacher Top-2</th></tr></thead><tbody>{detail_rows}</tbody></table></div>
+</article>"""
+
+
+def _mutation_token_detail_row(row: dict[str, Any]) -> str:
     delta = float(row["delta_logp_teacher_minus_original"])
     return (
         "<tr>"
-        f"<td>{int(row['index'])}</td><td>{int(row['token_id'])}</td>"
-        f"<td class='token'>{html.escape(str(row['token']))}</td>"
-        f"<td>{html.escape(str(row.get('token_label', '')))}</td>"
-        f"<td>{float(row['p_original']):.6f}</td><td>{float(row['p_teacher']):.6f}</td>"
-        f"<td>{float(row['delta_p_teacher_minus_original']):+.6f}</td>"
+        "<td><div class='response-token'>"
+        f"<code>{html.escape(str(row['token'])) or '&lt;empty&gt;'}</code>"
+        f"<span>#{int(row['index'])} · ID {int(row['token_id'])}</span></div></td>"
+        f"<td>{_probability_cell(row['p_original'], 'original')}</td>"
+        f"<td>{_probability_cell(row['p_teacher'], 'teacher')}</td>"
         f"<td class='{_delta_class(delta)}'>{delta:+.4f}</td>"
-        f"<td class='token'>{html.escape(str(row['top_token_original']))}</td>"
-        f"<td>{int(row['top_token_id_original'])}</td>"
-        f"<td class='token'>{html.escape(str(row['top_token_teacher']))}</td>"
-        f"<td>{int(row['top_token_id_teacher'])}</td>"
-        f"<td>{float(row['top_p_teacher']):.6f}</td>"
-        f"<td>{'yes' if row['top1_changed'] else 'no'}</td>"
-        f"<td>{html.escape(str(row['teacher_preference']))}</td>"
-        f"<td>{html.escape(str(row['top1_transition']))}</td></tr>"
+        f"<td>{_candidate_block(row, 'original', 1)}</td>"
+        f"<td>{_candidate_block(row, 'original', 2)}</td>"
+        f"<td>{_candidate_block(row, 'teacher', 1)}</td>"
+        f"<td>{_candidate_block(row, 'teacher', 2)}</td>"
+        "</tr>"
     )
+
+
+def _highlight_ground_truth(
+    ground_truth: str,
+    changes: Sequence[dict[str, Any]],
+) -> str:
+    spans: list[tuple[int, int, str]] = []
+    for index, change in enumerate(changes, start=1):
+        span = change.get("markdown_span", [])
+        if not isinstance(span, (list, tuple)) or len(span) != 2:
+            continue
+        start, end = int(span[0]), int(span[1])
+        if start < 0 or end <= start or end > len(ground_truth):
+            continue
+        label = (
+            f"m{index:03d}: {change.get('origin_ans', '')} -> "
+            f"{change.get('ocr_ans', '')}"
+        )
+        spans.append((start, end, label))
+    spans.sort()
+    parts: list[str] = []
+    cursor = 0
+    for start, end, label in spans:
+        if start < cursor:
+            continue
+        parts.append(html.escape(ground_truth[cursor:start]))
+        parts.append(
+            f"<mark class='mutation-mark' title='{html.escape(label, quote=True)}'>"
+            f"{html.escape(ground_truth[start:end])}</mark>"
+        )
+        cursor = end
+    parts.append(html.escape(ground_truth[cursor:]))
+    return "".join(parts)
+
+
+def _highlight_response(
+    response_text: str,
+    rows: Sequence[dict[str, Any]],
+) -> str:
+    reconstructed = "".join(str(row.get("raw_token", "")) for row in rows)
+    if reconstructed != response_text:
+        return html.escape(response_text)
+    parts: list[str] = []
+    for row in rows:
+        raw_token = str(row.get("raw_token", ""))
+        escaped = html.escape(raw_token)
+        mutation_ids = str(row.get("mutation_ids", "")).strip()
+        is_mismatch = bool(row.get("is_hallucination"))
+        if mutation_ids:
+            title = f"#{row.get('index')} · ID {row.get('token_id')} · {mutation_ids}"
+            parts.append(
+                f"<mark class='mutation-mark' title='{html.escape(title, quote=True)}'>"
+                f"{escaped}</mark>"
+            )
+        elif is_mismatch:
+            title = f"#{row.get('index')} · ID {row.get('token_id')} · GT 不一致"
+            parts.append(
+                f"<mark class='mismatch-mark' title='{html.escape(title, quote=True)}'>"
+                f"{escaped}</mark>"
+            )
+        else:
+            parts.append(escaped)
+    return "".join(parts)
 
 
 def _mutation_table_row(row: dict[str, Any]) -> str:
@@ -1212,11 +1509,15 @@ def _mutation_table_row(row: dict[str, Any]) -> str:
 def _probability_span(row: dict[str, Any], key: str) -> str:
     value = min(1.0, max(0.0, float(row[key])))
     hue = 5.0 + 120.0 * value
+    condition = "original" if key == "p_original" else "teacher"
+    top1 = _candidate_at(row, condition, 1)
+    top2 = _candidate_at(row, condition, 2)
     title = (
         f"#{row['index']} {row['token']} | {key}={value:.6f} | "
-        f"delta_logp={float(row['delta_logp_teacher_minus_original']):+.4f}"
+        f"delta_logp={float(row['delta_logp_teacher_minus_original']):+.4f} | "
+        f"{_candidate_title(top1, 1)} | {_candidate_title(top2, 2)}"
     )
-    return f"<span class='heat-token' style='background:hsl({hue:.1f} 68% 78%)' title='{html.escape(title)}'>{html.escape(str(row['token']))}</span>"
+    return f"<button type='button' class='heat-token' data-token-index='{int(row['index'])}' style='background:hsl({hue:.1f} 68% 78%)' title='{html.escape(title, quote=True)}'>{html.escape(str(row['token']))}</button>"
 
 
 def _delta_span(row: dict[str, Any]) -> str:
@@ -1224,20 +1525,410 @@ def _delta_span(row: dict[str, Any]) -> str:
     magnitude = min(1.0, abs(value) / 3.0)
     hue = 145 if value >= 0 else 2
     lightness = 94 - 35 * magnitude
-    title = f"#{row['index']} {row['token']} | delta_logp={value:+.6f}"
-    return f"<span class='heat-token' style='background:hsl({hue} 62% {lightness:.1f}%)' title='{html.escape(title)}'>{html.escape(str(row['token']))}</span>"
+    title = (
+        f"#{row['index']} {row['token']} | delta_logp={value:+.6f} | "
+        f"original {_candidate_title(_candidate_at(row, 'original', 1), 1)} | "
+        f"teacher {_candidate_title(_candidate_at(row, 'teacher', 1), 1)}"
+    )
+    return f"<button type='button' class='heat-token' data-token-index='{int(row['index'])}' style='background:hsl({hue} 62% {lightness:.1f}%)' title='{html.escape(title, quote=True)}'>{html.escape(str(row['token']))}</button>"
+
+
+def _candidate_title(candidate: dict[str, Any] | None, rank: int) -> str:
+    if candidate is None:
+        return f"Top-{rank}=unavailable"
+    raw_token = str(candidate.get("raw_token", candidate.get("token", "")))
+    decoded = _display_token(raw_token) or "<empty>"
+    return (
+        f"Top-{rank}=ID {int(candidate['token_id'])} {decoded!r} "
+        f"p={float(candidate.get('probability', 0.0)):.6f}"
+    )
 
 
 def _report_css() -> str:
     return """<style>
-:root{font-family:Inter,system-ui,-apple-system,"Segoe UI",sans-serif;color:#1d2528;background:#f5f6f4;line-height:1.45}*{box-sizing:border-box}body{margin:0}main{max-width:1540px;margin:auto;padding:24px}nav{display:flex;gap:16px;flex-wrap:wrap;margin-bottom:20px}a{color:#075b70}h1{font-size:28px;margin:0 0 18px;letter-spacing:0}h2{font-size:19px;margin:28px 0 12px;letter-spacing:0}h3{font-size:14px;margin:16px 0 6px;letter-spacing:0;color:#4c5b60}.stats{display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:8px}.stat{background:#fff;border:1px solid #d9dedc;border-radius:6px;padding:12px}.stat span{display:block;color:#617075;font-size:12px}.stat strong{font-size:21px}.source-grid,.chart-grid{display:grid;grid-template-columns:minmax(300px,0.8fr) minmax(420px,1.2fr);gap:24px;align-items:start}figure{margin:0}figure img{width:100%;max-height:900px;object-fit:contain;background:#fff;border:1px solid #d9dedc}figcaption{font-size:12px;color:#617075}pre{white-space:pre-wrap;word-break:break-word;background:#fff;border:1px solid #d9dedc;padding:14px;max-height:520px;overflow:auto}canvas{width:100%;height:auto;background:#fff;border:1px solid #d9dedc}.token-strip{display:flex;flex-wrap:wrap;gap:2px;background:#fff;border:1px solid #d9dedc;padding:8px}.heat-token{font:12px ui-monospace,SFMono-Regular,Menlo,monospace;padding:2px 3px;border-radius:3px;white-space:pre}.table-scroll{overflow:auto;background:#fff;border:1px solid #d9dedc}table{border-collapse:collapse;width:100%;font-size:12px}th,td{padding:7px 9px;border-bottom:1px solid #e7eae8;text-align:right;white-space:nowrap}th{position:sticky;top:0;background:#eaf0ed;z-index:1}td:first-child,th:first-child{text-align:left}.token{font-family:ui-monospace,SFMono-Regular,Menlo,monospace;text-align:left}.gain{color:#08764a;font-weight:650}.drop{color:#b02b2b;font-weight:650}details{margin-top:12px}summary{cursor:pointer;color:#075b70}@media(max-width:850px){main{padding:14px}.source-grid,.chart-grid{grid-template-columns:1fr}}
+:root {
+  font-family: Inter, system-ui, -apple-system, "Segoe UI", sans-serif;
+  color: #1d292d;
+  background: #f3f5f5;
+  line-height: 1.45;
+  font-synthesis: none;
+}
+* { box-sizing: border-box; }
+body { margin: 0; }
+main { max-width: 1880px; margin: auto; padding: 24px; }
+nav { display: flex; gap: 16px; flex-wrap: wrap; margin-bottom: 20px; }
+a { color: #075d73; }
+h1 { margin: 0 0 18px; font-size: 28px; letter-spacing: 0; }
+h2 { margin: 30px 0 12px; font-size: 20px; letter-spacing: 0; }
+h3 { margin: 0; font-size: 14px; letter-spacing: 0; color: #43565d; }
+section { width: 100%; }
+.stats {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(150px, 1fr));
+  gap: 8px;
+}
+.stat {
+  min-width: 0;
+  padding: 12px;
+  background: #fff;
+  border: 1px solid #d5dcda;
+  border-radius: 6px;
+}
+.stat span { display: block; color: #65767b; font-size: 12px; }
+.stat strong { display: block; overflow-wrap: anywhere; font-size: 20px; }
+.source-review {
+  display: grid;
+  grid-template-columns: minmax(300px, .72fr) minmax(680px, 1.28fr);
+  gap: 20px;
+  align-items: start;
+}
+figure { margin: 0; }
+figure img {
+  display: block;
+  width: 100%;
+  max-height: 980px;
+  object-fit: contain;
+  background: #fff;
+  border: 1px solid #d5dcda;
+}
+figcaption { margin-top: 5px; color: #65767b; font-size: 12px; }
+.transcript-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 10px;
+}
+.transcript-panel {
+  min-width: 0;
+  background: #fff;
+  border: 1px solid #d5dcda;
+  border-radius: 6px;
+}
+.panel-heading, .section-heading, .mutation-heading {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+}
+.panel-heading {
+  min-height: 44px;
+  padding: 10px 12px;
+  border-bottom: 1px solid #dfe5e3;
+}
+.panel-heading span, .section-heading output { color: #65767b; font-size: 12px; }
+pre.transcript {
+  min-height: 520px;
+  max-height: 840px;
+  margin: 0;
+  padding: 14px;
+  overflow: auto;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  font: 13px/1.58 ui-monospace, SFMono-Regular, Menlo, monospace;
+}
+mark.mutation-mark {
+  padding: 1px 2px;
+  color: inherit;
+  background: #ffe083;
+  box-shadow: inset 0 -2px 0 #c48b00;
+}
+mark.mismatch-mark {
+  padding: 1px 2px;
+  color: inherit;
+  background: #ffd3d0;
+  box-shadow: inset 0 -2px 0 #ba3e39;
+}
+.legend { display: flex; gap: 18px; margin-top: 9px; color: #596b71; font-size: 12px; }
+.legend span { display: inline-flex; align-items: center; gap: 6px; }
+.legend-swatch { width: 12px; height: 12px; border: 1px solid #aab6b2; }
+.legend-swatch.mutation { background: #ffe083; }
+.legend-swatch.mismatch { background: #ffd3d0; }
+.mutation-list { display: grid; gap: 12px; }
+.mutation-focus {
+  overflow: hidden;
+  background: #fff;
+  border: 1px solid #cfd8d5;
+  border-left: 4px solid #d09a12;
+  border-radius: 6px;
+}
+.mutation-heading { min-height: 46px; padding: 10px 12px; border-bottom: 1px solid #dfe5e3; }
+.mutation-heading > div { display: flex; align-items: center; gap: 9px; }
+.mutation-id {
+  padding: 2px 6px;
+  background: #e8eeee;
+  border-radius: 4px;
+  color: #405258;
+  font: 12px ui-monospace, SFMono-Regular, Menlo, monospace;
+}
+.mutation-terms {
+  display: grid;
+  grid-template-columns: repeat(4, minmax(150px, 1fr));
+  gap: 1px;
+  background: #dfe5e3;
+  border-bottom: 1px solid #dfe5e3;
+}
+.mutation-terms > div { min-width: 0; padding: 10px 12px; background: #f9fbfa; }
+.mutation-terms span { display: block; margin-bottom: 4px; color: #65767b; font-size: 11px; }
+.mutation-terms code { display: block; overflow-wrap: anywhere; font-size: 13px; }
+.mutation-token-table { border: 0; }
+.chart-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(360px, 1fr));
+  gap: 20px;
+}
+canvas { width: 100%; height: auto; background: #fff; border: 1px solid #d5dcda; }
+.strip-grid { display: grid; gap: 10px; margin-top: 12px; }
+.strip-grid h3 { margin-bottom: 6px; }
+.token-strip {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 2px;
+  min-height: 38px;
+  padding: 8px;
+  background: #fff;
+  border: 1px solid #d5dcda;
+}
+.heat-token {
+  min-width: 18px;
+  min-height: 24px;
+  padding: 2px 4px;
+  border: 1px solid rgba(37, 56, 61, .18);
+  border-radius: 3px;
+  color: #172327;
+  font: 12px ui-monospace, SFMono-Regular, Menlo, monospace;
+  letter-spacing: 0;
+  white-space: pre;
+  cursor: pointer;
+}
+.heat-token:focus-visible { outline: 2px solid #08748d; outline-offset: 1px; }
+.token-toolbar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 14px;
+  margin-bottom: 10px;
+}
+.segmented {
+  display: inline-flex;
+  flex-wrap: wrap;
+  overflow: hidden;
+  border: 1px solid #bcc8c4;
+  border-radius: 6px;
+}
+.filter-button {
+  min-height: 34px;
+  padding: 6px 11px;
+  border: 0;
+  border-right: 1px solid #ccd5d2;
+  background: #fff;
+  color: #30444a;
+  cursor: pointer;
+}
+.filter-button:last-child { border-right: 0; }
+.filter-button.active { background: #176b78; color: #fff; }
+.token-search { display: flex; align-items: center; gap: 7px; color: #596b71; font-size: 12px; }
+.token-search input {
+  width: min(300px, 34vw);
+  min-height: 34px;
+  padding: 6px 9px;
+  border: 1px solid #bcc8c4;
+  border-radius: 5px;
+  background: #fff;
+  font: inherit;
+}
+.table-scroll { overflow: auto; background: #fff; border: 1px solid #d5dcda; }
+.token-table-scroll { max-height: 860px; }
+table { width: 100%; border-collapse: collapse; font-size: 12px; }
+th, td {
+  padding: 7px 9px;
+  border-right: 1px solid #edf0ef;
+  border-bottom: 1px solid #e2e7e5;
+  text-align: right;
+  vertical-align: top;
+  white-space: nowrap;
+}
+th {
+  position: sticky;
+  top: 0;
+  z-index: 2;
+  background: #e8eeee;
+  color: #33464c;
+}
+.token-detail-table thead tr:first-child th { top: 0; }
+.token-detail-table thead tr:nth-child(2) th { top: 33px; }
+th.condition { text-align: center; }
+th.original-condition { background: #dceff1; }
+th.teacher-condition { background: #f5e5e8; }
+td:first-child, th:first-child { text-align: left; }
+.token-row.mutation-token-row { background: #fff9e8; }
+.token-row.mismatch-token-row td:first-child { box-shadow: inset 4px 0 0 #c64d47; }
+.token-row.top1-changed-row { outline: 1px solid rgba(164, 55, 76, .22); outline-offset: -1px; }
+.response-token {
+  display: grid;
+  min-width: 100px;
+  gap: 2px;
+  text-align: left;
+}
+.response-token code {
+  max-width: 220px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  color: #152a31;
+  font-size: 13px;
+}
+.response-token span { color: #708086; font: 10px ui-monospace, SFMono-Regular, Menlo, monospace; }
+.label-cell { max-width: 180px; overflow: hidden; text-overflow: ellipsis; text-align: left; }
+.probability-cell { display: grid; min-width: 92px; gap: 4px; }
+.probability-cell strong { font: 11px ui-monospace, SFMono-Regular, Menlo, monospace; }
+.probability-track { width: 100%; height: 4px; overflow: hidden; background: #e6ebe9; }
+.probability-track i { display: block; height: 100%; }
+.probability-cell.original .probability-track i { background: #168299; }
+.probability-cell.teacher .probability-track i { background: #b34b63; }
+.candidate {
+  display: grid;
+  grid-template-columns: auto minmax(48px, 1fr);
+  min-width: 174px;
+  gap: 2px 7px;
+  padding: 5px 7px;
+  border: 1px solid #d6ddda;
+  border-radius: 5px;
+  background: #fff;
+  text-align: left;
+}
+.candidate.target { border-color: #4d9a78; background: #f0faf5; }
+.candidate.same-surface { border-color: #4f8fa1; background: #eff8fa; }
+.candidate.alternative { border-color: #d39a54; background: #fff8ed; }
+.candidate.missing { color: #8a989c; background: #f7f8f8; }
+.candidate-rank { color: #68797e; font-size: 10px; }
+.candidate code {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  font-size: 12px;
+}
+.candidate-id { color: #68797e; font: 10px ui-monospace, SFMono-Regular, Menlo, monospace; }
+.candidate strong { font: 10px ui-monospace, SFMono-Regular, Menlo, monospace; text-align: right; }
+.gain { color: #08764a; font-weight: 650; }
+.drop { color: #b02b2b; font-weight: 650; }
+.empty-state { margin: 0; padding: 14px; color: #718086; text-align: left; }
+@media (max-width: 1180px) {
+  .source-review { grid-template-columns: 1fr; }
+  figure img { max-height: 720px; }
+}
+@media (max-width: 820px) {
+  main { padding: 14px; }
+  .transcript-grid, .chart-grid { grid-template-columns: 1fr; }
+  .mutation-terms { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+  .token-toolbar { align-items: stretch; flex-direction: column; }
+  .token-search input { width: 100%; }
+  pre.transcript { min-height: 300px; }
+}
+@media (max-width: 520px) {
+  .mutation-terms { grid-template-columns: 1fr; }
+}
 </style>"""
 
 
 def _chart_javascript() -> str:
     return """
-function setup(canvas){const dpr=window.devicePixelRatio||1;const w=canvas.clientWidth||800;canvas.width=w*dpr;canvas.height=360*dpr;const c=canvas.getContext('2d');c.scale(dpr,dpr);return {c,w,h:360}}
-function draw(){const {c,w,h}=setup(document.getElementById('prob-chart'));c.clearRect(0,0,w,h);const pad={l:48,r:16,t:18,b:34};const pw=w-pad.l-pad.r,ph=210;const x=i=>pad.l+(DATA.length<=1?0:i/(DATA.length-1))*pw;const y=p=>pad.t+(1-p)*ph;c.strokeStyle='#cad1ce';for(let q=0;q<=4;q++){const yy=y(q/4);c.beginPath();c.moveTo(pad.l,yy);c.lineTo(w-pad.r,yy);c.stroke();c.fillStyle='#59686d';c.fillText((q/4).toFixed(2),6,yy+4)}function line(key,color){c.strokeStyle=color;c.lineWidth=1.5;c.beginPath();DATA.forEach((d,i)=>{const xx=x(i),yy=y(d[key]);i?c.lineTo(xx,yy):c.moveTo(xx,yy)});c.stroke()}line('po','#166b8f');line('pt','#a33a55');c.fillStyle='#166b8f';c.fillText('original',pad.l,12);c.fillStyle='#a33a55';c.fillText('teacher',pad.l+62,12);const base=330,scale=Math.max(1,...DATA.map(d=>Math.abs(d.d)));DATA.forEach((d,i)=>{const xx=x(i),bh=Math.min(74,Math.abs(d.d)/scale*74);c.fillStyle=d.d>=0?'#238a63':'#c94b4b';c.fillRect(xx, d.d>=0?base-bh:base, Math.max(1,pw/Math.max(DATA.length,1)), bh)});c.strokeStyle='#59686d';c.beginPath();c.moveTo(pad.l,base);c.lineTo(w-pad.r,base);c.stroke();c.fillStyle='#59686d';c.fillText('Δlogp',6,base+4)}window.addEventListener('resize',draw);draw();
+function setup(canvas) {
+  const dpr = window.devicePixelRatio || 1;
+  const w = canvas.clientWidth || 800;
+  canvas.width = w * dpr;
+  canvas.height = 360 * dpr;
+  const c = canvas.getContext('2d');
+  c.scale(dpr, dpr);
+  return {c, w, h: 360};
+}
+function draw() {
+  const canvas = document.getElementById('prob-chart');
+  if (!canvas) return;
+  const {c, w} = setup(canvas);
+  c.clearRect(0, 0, w, 360);
+  const pad = {l: 48, r: 16, t: 18, b: 34};
+  const pw = w - pad.l - pad.r;
+  const ph = 210;
+  const x = i => pad.l + (DATA.length <= 1 ? 0 : i / (DATA.length - 1)) * pw;
+  const y = p => pad.t + (1 - p) * ph;
+  c.strokeStyle = '#cad1ce';
+  for (let q = 0; q <= 4; q++) {
+    const yy = y(q / 4);
+    c.beginPath(); c.moveTo(pad.l, yy); c.lineTo(w - pad.r, yy); c.stroke();
+    c.fillStyle = '#59686d'; c.fillText((q / 4).toFixed(2), 6, yy + 4);
+  }
+  function line(key, color) {
+    c.strokeStyle = color; c.lineWidth = 1.5; c.beginPath();
+    DATA.forEach((d, i) => {
+      const xx = x(i), yy = y(d[key]);
+      i ? c.lineTo(xx, yy) : c.moveTo(xx, yy);
+    });
+    c.stroke();
+  }
+  line('po', '#168299');
+  line('pt', '#b34b63');
+  c.fillStyle = '#168299'; c.fillText('original', pad.l, 12);
+  c.fillStyle = '#b34b63'; c.fillText('GT teacher', pad.l + 64, 12);
+  const base = 330;
+  const scale = Math.max(1, DATA.reduce((m, d) => Math.max(m, Math.abs(d.d)), 0));
+  DATA.forEach((d, i) => {
+    const xx = x(i), bh = Math.min(74, Math.abs(d.d) / scale * 74);
+    c.fillStyle = d.d >= 0 ? '#238a63' : '#c94b4b';
+    c.fillRect(xx, d.d >= 0 ? base - bh : base, Math.max(1, pw / Math.max(DATA.length, 1)), bh);
+  });
+  c.strokeStyle = '#59686d';
+  c.beginPath(); c.moveTo(pad.l, base); c.lineTo(w - pad.r, base); c.stroke();
+  c.fillStyle = '#59686d'; c.fillText('Δlogp', 6, base + 4);
+}
+let activeTokenFilter = 'all';
+function applyTokenFilter() {
+  const query = (document.getElementById('token-search')?.value || '').trim().toLowerCase();
+  const rows = [...document.querySelectorAll('.token-row')];
+  let visible = 0;
+  rows.forEach(row => {
+    const modeMatch =
+      activeTokenFilter === 'all' ||
+      (activeTokenFilter === 'mutation' && row.dataset.mutation === '1') ||
+      (activeTokenFilter === 'changed' && row.dataset.top1Changed === '1') ||
+      (activeTokenFilter === 'gain' && row.dataset.delta === 'gain') ||
+      (activeTokenFilter === 'drop' && row.dataset.delta === 'drop') ||
+      (activeTokenFilter === 'mismatch' && row.dataset.mismatch === '1');
+    const queryMatch = !query || (row.dataset.search || '').includes(query);
+    const show = modeMatch && queryMatch;
+    row.hidden = !show;
+    if (show) visible++;
+  });
+  const counter = document.getElementById('visible-token-count');
+  if (counter) counter.textContent = visible + ' / ' + rows.length;
+}
+function activateFilter(mode) {
+  activeTokenFilter = mode;
+  document.querySelectorAll('[data-token-filter]').forEach(button => {
+    const active = button.dataset.tokenFilter === mode;
+    button.classList.toggle('active', active);
+    button.setAttribute('aria-pressed', active ? 'true' : 'false');
+  });
+  applyTokenFilter();
+}
+document.querySelectorAll('[data-token-filter]').forEach(button => {
+  button.addEventListener('click', () => activateFilter(button.dataset.tokenFilter || 'all'));
+});
+document.getElementById('token-search')?.addEventListener('input', applyTokenFilter);
+document.querySelectorAll('[data-token-index]').forEach(button => {
+  button.addEventListener('click', () => {
+    activateFilter('all');
+    const search = document.getElementById('token-search');
+    if (search) search.value = '';
+    applyTokenFilter();
+    const row = document.getElementById('token-' + button.dataset.tokenIndex);
+    if (!row) return;
+    row.scrollIntoView({behavior: 'smooth', block: 'center'});
+    row.animate(
+      [{backgroundColor: '#ffe083'}, {backgroundColor: ''}],
+      {duration: 1200, easing: 'ease-out'}
+    );
+  });
+});
+window.addEventListener('resize', draw);
+draw();
+applyTokenFilter();
 """
 
 
