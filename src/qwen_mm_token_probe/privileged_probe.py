@@ -4,13 +4,16 @@ import argparse
 import csv
 import hashlib
 import html
+import inspect
 import json
-import os
+import math
 import shutil
 import statistics
+from collections.abc import Iterable, Sequence
 from dataclasses import asdict, dataclass
+from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Iterable, Sequence
+from typing import Any
 
 from .hallu_alignment import (
     align_normalized_text,
@@ -19,20 +22,21 @@ from .hallu_alignment import (
     recover_relocated_matches,
     token_alignment_rows,
 )
+from .hf_qwen import (
+    ModelBundle,
+    append_generated_tokens,
+    decode_generated_tokens,
+    decode_token_piece,
+    generate_from_prompt,
+    load_model_bundle,
+    move_inputs_to_device,
+    prepare_prompt_inputs,
+)
 from .progress import ProgressTracker
 from .prompts import DEFAULT_PDF_OCR_PROMPT
-from .vllm_api import (
-    RequestLimiter,
-    ThreadLocalClients,
-    canonical_prompt_scores,
-    generate_response,
-    safe_error,
-    utc_now,
-)
 
-
-SCHEMA_VERSION = 1
-DEFAULT_MODEL = "qwen-4b"
+SCHEMA_VERSION = 2
+DEFAULT_MODEL_ID = "Qwen/Qwen3.5-4B"
 DEFAULT_PROMPT = DEFAULT_PDF_OCR_PROMPT
 DEFAULT_PRIVILEGED_INSTRUCTION = "请转写上述文本"
 
@@ -77,12 +81,20 @@ def load_release_samples(
             pair_id = str(record.get("pair_id", "")).strip()
             if not pair_id:
                 raise ValueError(f"missing pair_id at {pairs_path}:{line_number}")
-            image_path = _resolve_release_path(root, str(record.get("edited_image", "")))
-            gt_path = _resolve_release_path(root, str(record.get("edited_markdown", "")))
+            image_path = _resolve_release_path(
+                root, str(record.get("edited_image", ""))
+            )
+            gt_path = _resolve_release_path(
+                root, str(record.get("edited_markdown", ""))
+            )
             if not image_path.is_file():
-                raise FileNotFoundError(f"edited image is missing for {pair_id}: {image_path}")
+                raise FileNotFoundError(
+                    f"edited image is missing for {pair_id}: {image_path}"
+                )
             if not gt_path.is_file():
-                raise FileNotFoundError(f"edited Markdown GT is missing for {pair_id}: {gt_path}")
+                raise FileNotFoundError(
+                    f"edited Markdown GT is missing for {pair_id}: {gt_path}"
+                )
             changes = tuple(dict(item) for item in record.get("changes", []))
             samples.append(
                 PrivilegedProbeSample(
@@ -100,49 +112,46 @@ def load_release_samples(
     return samples
 
 
-def run_api_privileged_probe(
+def run_privileged_probe(
     *,
-    base_url: str,
-    model: str,
+    model_id: str | Path,
     dataset_root: str | Path,
     output_dir: str | Path,
-    api_key: str | None = None,
-    api_key_env: str = "INF_API_KEY",
     prompt: str = DEFAULT_PROMPT,
     privileged_instruction: str = DEFAULT_PRIVILEGED_INSTRUCTION,
-    max_tokens: int = 4096,
-    top_logprobs: int = 5,
+    max_new_tokens: int = 4096,
+    top_k: int = 5,
+    forward_chunk_size: int = 16,
+    device_map: str | None = "auto",
+    dtype: str = "bfloat16",
+    trust_remote_code: bool = False,
+    min_pixels: int = 2048,
+    max_pixels: int = 16777216,
+    image_patch_size: int = 16,
     seed: int = 7,
-    verify_tls: bool = True,
-    timeout_seconds: float = 900.0,
-    max_retries: int = 5,
-    retry_base_seconds: float = 3.0,
-    request_interval_seconds: float = 0.0,
     resume: bool = True,
     fail_fast: bool = False,
     limit: int | None = None,
     heartbeat_seconds: float = 30.0,
 ) -> PrivilegedProbeSummary:
-    normalized_base_url = base_url.rstrip("/")
-    resolved_key = api_key or os.environ.get(api_key_env)
-    if not normalized_base_url:
-        raise ValueError("base_url must not be empty")
-    if not model.strip():
-        raise ValueError("model must not be empty")
-    if not resolved_key:
-        raise RuntimeError(f"API key is missing; set environment variable {api_key_env}")
+    """Generate once and score the exact generated IDs in two offline contexts."""
+
+    if not str(model_id).strip():
+        raise ValueError("model_id must not be empty")
     if not prompt.strip():
         raise ValueError("prompt must not be empty")
     if not privileged_instruction.strip():
         raise ValueError("privileged_instruction must not be empty")
-    if max_tokens <= 0:
-        raise ValueError("max_tokens must be positive")
-    if not 1 <= top_logprobs <= 20:
-        raise ValueError("top_logprobs must be between 1 and 20")
-    if timeout_seconds <= 0 or retry_base_seconds <= 0:
-        raise ValueError("timeout and retry delay must be positive")
-    if max_retries < 0 or request_interval_seconds < 0:
-        raise ValueError("retry count and request interval must be non-negative")
+    if max_new_tokens <= 0:
+        raise ValueError("max_new_tokens must be positive")
+    if not 1 <= top_k <= 50:
+        raise ValueError("top_k must be between 1 and 50")
+    if forward_chunk_size <= 0:
+        raise ValueError("forward_chunk_size must be positive")
+    if min_pixels <= 0 or max_pixels < min_pixels:
+        raise ValueError("pixel limits must be positive and max_pixels >= min_pixels")
+    if image_patch_size <= 0:
+        raise ValueError("image_patch_size must be positive")
 
     dataset_path = Path(dataset_root).expanduser().resolve()
     output_root = Path(output_dir).expanduser().resolve()
@@ -151,54 +160,65 @@ def run_api_privileged_probe(
     samples = load_release_samples(dataset_path, limit=limit)
     config = {
         "schema_version": SCHEMA_VERSION,
-        "created_at": utc_now(),
-        "backend": "vllm-openai-chat-completions",
-        "base_url": normalized_base_url,
-        "model": model,
+        "created_at": _utc_now(),
+        "backend": "huggingface-transformers-offline",
+        "model_id": str(model_id),
         "dataset_root": str(dataset_path),
         "output_dir": str(output_root),
         "prompt": prompt,
         "privileged_prompt_template": "{ground_truth}\\n\\n{instruction}",
         "privileged_instruction": privileged_instruction,
         "generation_count_per_sample": 1,
+        "teacher_forced_forward_count_per_sample": 2,
         "fixed_response_scoring_conditions": ["original_image", "privileged_text"],
-        "strict_response_id_equality": True,
-        "max_tokens": max_tokens,
-        "top_logprobs": top_logprobs,
+        "response_ids_directly_concatenated": True,
+        "response_text_retokenized": False,
+        "max_new_tokens": max_new_tokens,
+        "top_k": top_k,
+        "forward_chunk_size": forward_chunk_size,
+        "device_map": device_map,
+        "dtype": dtype,
+        "trust_remote_code": trust_remote_code,
+        "min_pixels": min_pixels,
+        "max_pixels": max_pixels,
+        "image_patch_size": image_patch_size,
+        "enable_thinking": False,
         "seed": seed,
-        "verify_tls": verify_tls,
-        "timeout_seconds": timeout_seconds,
-        "max_retries": max_retries,
-        "retry_base_seconds": retry_base_seconds,
-        "request_interval_seconds": request_interval_seconds,
         "resume": resume,
         "limit": limit,
     }
     _write_json_atomic(output_root / "config.json", config)
 
     tracker = ProgressTracker(
-        task="qwen-mm-api-privileged-probe",
+        task="qwen-mm-privileged-probe",
         total_items=len(samples),
         total_bytes=sum(sample.image_path.stat().st_size for sample in samples),
-        shard="single-process/vllm-api",
+        shard="single-process/huggingface-transformers",
         heartbeat_seconds=heartbeat_seconds,
     )
     tracker.start()
-    clients = ThreadLocalClients(
-        base_url=normalized_base_url,
-        api_key=resolved_key,
-        verify_tls=verify_tls,
-        timeout_seconds=timeout_seconds,
-    )
-    limiter = RequestLimiter(request_interval_seconds)
+    tracker.set_current(index=0, name=str(model_id), phase="loading-local-model")
+    try:
+        model_bundle = load_model_bundle(
+            str(model_id),
+            device_map=device_map,
+            dtype=dtype,
+            trust_remote_code=trust_remote_code,
+        )
+    except Exception as exc:
+        tracker.note_error(
+            phase="model-load-error",
+            name=f"{type(exc).__name__}: {_safe_error(exc)}",
+        )
+        tracker.finish(interrupted=False)
+        raise
+
     completed_now = 0
     skipped = 0
     failed = 0
     interrupted = False
     fatal_error: BaseException | None = None
-
     try:
-        client = clients.get()
         for sample in samples:
             sample_dir = samples_root / f"{sample.ordinal:03d}_{sample.pair_id}"
             result_path = sample_dir / "result.json"
@@ -219,16 +239,16 @@ def run_api_privileged_probe(
                     sample=sample,
                     sample_dir=sample_dir,
                     fingerprint=fingerprint,
-                    client=client,
-                    model=model,
+                    model_bundle=model_bundle,
                     prompt=prompt,
                     privileged_instruction=privileged_instruction,
-                    max_tokens=max_tokens,
-                    top_logprobs=top_logprobs,
+                    max_new_tokens=max_new_tokens,
+                    top_k=top_k,
+                    forward_chunk_size=forward_chunk_size,
+                    min_pixels=min_pixels,
+                    max_pixels=max_pixels,
+                    image_patch_size=image_patch_size,
                     seed=seed + sample.ordinal - 1,
-                    max_retries=max_retries,
-                    retry_base_seconds=retry_base_seconds,
-                    request_limiter=limiter,
                     tracker=tracker,
                 )
                 _write_json_atomic(result_path, result)
@@ -248,10 +268,10 @@ def run_api_privileged_probe(
                 _append_jsonl(
                     output_root / "failures.jsonl",
                     {
-                        "timestamp": utc_now(),
+                        "timestamp": _utc_now(),
                         "pair_id": sample.pair_id,
                         "exception_type": type(exc).__name__,
-                        "message": safe_error(exc),
+                        "message": _safe_error(exc),
                     },
                 )
                 tracker.complete_unit(
@@ -259,26 +279,29 @@ def run_api_privileged_probe(
                     records=0,
                     bytes_count=sample.image_path.stat().st_size,
                     index=sample.ordinal,
-                    name=f"{sample.pair_id}: {type(exc).__name__}: {safe_error(exc)}",
+                    name=f"{sample.pair_id}: {type(exc).__name__}: {_safe_error(exc)}",
                 )
                 if fail_fast:
                     fatal_error = exc
                     break
     except KeyboardInterrupt:
         interrupted = True
-    except Exception as exc:  # noqa: BLE001 - finalize logs before surfacing setup failures
+    except Exception as exc:  # noqa: BLE001 - finalize progress before surfacing
         fatal_error = exc
-        tracker.note_error(phase="api-setup-error", name=f"{type(exc).__name__}: {safe_error(exc)}")
-    finally:
-        clients.close()
+        tracker.note_error(
+            phase="offline-probe-error",
+            name=f"{type(exc).__name__}: {_safe_error(exc)}",
+        )
 
-    tracker.set_current(index=len(samples), name="aggregate-report", phase="building-report")
+    tracker.set_current(
+        index=len(samples), name="aggregate-report", phase="building-report"
+    )
     completed_total = 0
     report_error: Exception | None = None
     try:
-        report_summary = rebuild_api_privileged_report(output_root)
+        report_summary = rebuild_privileged_report(output_root)
         completed_total = int(report_summary["completed_samples"])
-    except Exception as exc:  # noqa: BLE001 - finish progress before surfacing report errors
+    except Exception as exc:  # noqa: BLE001 - report errors must not hide run status
         report_error = exc
     tracker.finish(interrupted=interrupted)
 
@@ -290,7 +313,14 @@ def run_api_privileged_probe(
         failed_items=failed,
         interrupted=interrupted,
     )
-    _write_json_atomic(output_root / "run_summary.json", asdict(summary) | {"output_dir": str(output_root)})
+    _write_json_atomic(
+        output_root / "run_summary.json",
+        asdict(summary)
+        | {
+            "output_dir": str(output_root),
+            "completed_now": completed_now,
+        },
+    )
     if fatal_error is not None:
         raise fatal_error
     if interrupted:
@@ -305,78 +335,118 @@ def _run_sample(
     sample: PrivilegedProbeSample,
     sample_dir: Path,
     fingerprint: str,
-    client: Any,
-    model: str,
+    model_bundle: ModelBundle,
     prompt: str,
     privileged_instruction: str,
-    max_tokens: int,
-    top_logprobs: int,
+    max_new_tokens: int,
+    top_k: int,
+    forward_chunk_size: int,
+    min_pixels: int,
+    max_pixels: int,
+    image_patch_size: int,
     seed: int,
-    max_retries: int,
-    retry_base_seconds: float,
-    request_limiter: RequestLimiter,
     tracker: ProgressTracker,
 ) -> dict[str, Any]:
+    sample_dir.mkdir(parents=True, exist_ok=True)
     image_copy = sample_dir / f"input{sample.image_path.suffix.lower()}"
+    partial_path = sample_dir / "partial.json"
     if sample.image_path.resolve() != image_copy.resolve():
         shutil.copy2(sample.image_path, image_copy)
     ground_truth = sample.ground_truth_path.read_text(encoding="utf-8")
-    privileged_prompt = f"{ground_truth.rstrip()}\n\n{privileged_instruction.strip()}"
+    privileged_prompt = f"{ground_truth}\n\n{privileged_instruction}"
     _write_text_atomic(sample_dir / "ground_truth.md", ground_truth)
     _write_text_atomic(sample_dir / "privileged_prompt.txt", privileged_prompt)
 
-    tracker.set_current(index=sample.ordinal, name=sample.pair_id, phase="generating-response-once")
-    generated = generate_response(
-        client=client,
-        model=model,
+    tracker.set_current(
+        index=sample.ordinal,
+        name=sample.pair_id,
+        phase="preparing-original-multimodal-prompt",
+    )
+    original_inputs = prepare_prompt_inputs(
+        processor=model_bundle.processor,
         image_path=image_copy,
         prompt=prompt,
-        max_tokens=max_tokens,
-        top_logprobs=top_logprobs,
-        seed=seed,
-        max_retries=max_retries,
-        retry_base_seconds=retry_base_seconds,
-        request_limiter=request_limiter,
-        request_label=f"{sample.pair_id}/generate-once",
+        device=model_bundle.device,
+        min_pixels=min_pixels,
+        max_pixels=max_pixels,
+        image_patch_size=image_patch_size,
+        enable_thinking=False,
     )
-    response_text = str(generated["text"])
-    response_ids = [int(row["token_id"]) for row in generated["tokens"]]
-    if not response_ids:
-        raise RuntimeError("model generated no scoreable response token IDs")
+    tracker.set_current(
+        index=sample.ordinal,
+        name=sample.pair_id,
+        phase="preparing-privileged-text-prompt",
+    )
+    teacher_inputs = _prepare_text_prompt_inputs(
+        model_bundle=model_bundle,
+        prompt=privileged_prompt,
+    )
+
+    partial = _load_partial(partial_path, fingerprint)
+    generation_performed = False
+    if partial is None:
+        tracker.set_current(
+            index=sample.ordinal,
+            name=sample.pair_id,
+            phase="generating-response-once",
+        )
+        _seed_everything(seed)
+        response_ids, _ = generate_from_prompt(
+            model=model_bundle.model,
+            tokenizer=model_bundle.tokenizer,
+            prompt_inputs=original_inputs,
+            max_new_tokens=max_new_tokens,
+            do_sample=False,
+            temperature=None,
+            top_p=None,
+        )
+        if not response_ids:
+            raise RuntimeError("model generated no scoreable response token IDs")
+        response_text = decode_generated_tokens(model_bundle.tokenizer, response_ids)
+        finish_reason = "length" if len(response_ids) >= max_new_tokens else "stop"
+        generation_performed = True
+        partial = {
+            "schema_version": SCHEMA_VERSION,
+            "partial": True,
+            "fingerprint": fingerprint,
+            "pair_id": sample.pair_id,
+            "generation_count": 1,
+            "response_ids": response_ids,
+            "response_text": response_text,
+            "finish_reason": finish_reason,
+            "forwards": {},
+        }
+        _write_json_atomic(partial_path, partial)
+    else:
+        response_ids = [int(value) for value in partial["response_ids"]]
+        response_text = str(partial["response_text"])
+        finish_reason = str(partial.get("finish_reason", "unknown"))
+
     _write_text_atomic(sample_dir / "response.md", response_text)
     _write_json_atomic(sample_dir / "response_ids.json", response_ids)
 
-    tracker.set_current(index=sample.ordinal, name=sample.pair_id, phase="scoring-original-fixed-response")
-    original_scores = canonical_prompt_scores(
-        client=client,
-        model=model,
-        image_path=image_copy,
-        prompt=prompt,
-        response_text=response_text,
-        prompt_logprobs=top_logprobs,
-        seed=seed,
-        max_retries=max_retries,
-        retry_base_seconds=retry_base_seconds,
-        request_limiter=request_limiter,
-        request_label=f"{sample.pair_id}/original-fixed-response",
-        expected_token_ids=response_ids,
+    forwards = dict(partial.get("forwards", {}))
+    scoring_contexts = (
+        ("original", original_inputs, "scoring-original-exact-response-ids"),
+        ("teacher", teacher_inputs, "scoring-privileged-exact-response-ids"),
     )
+    for context_name, context_inputs, phase in scoring_contexts:
+        if context_name in forwards:
+            continue
+        tracker.set_current(index=sample.ordinal, name=sample.pair_id, phase=phase)
+        forwards[context_name] = _score_fixed_response_ids(
+            model_bundle=model_bundle,
+            prompt_inputs=context_inputs,
+            response_ids=response_ids,
+            top_k=top_k,
+            chunk_size=forward_chunk_size,
+        )
+        partial["forwards"] = forwards
+        _write_json_atomic(partial_path, partial)
+        _empty_device_cache(model_bundle.device)
 
-    tracker.set_current(index=sample.ordinal, name=sample.pair_id, phase="scoring-privileged-fixed-response")
-    teacher_scores = canonical_prompt_scores(
-        client=client,
-        model=model,
-        image_path=None,
-        prompt=privileged_prompt,
-        response_text=response_text,
-        prompt_logprobs=top_logprobs,
-        seed=seed,
-        max_retries=max_retries,
-        retry_base_seconds=retry_base_seconds,
-        request_limiter=request_limiter,
-        request_label=f"{sample.pair_id}/privileged-fixed-response",
-        expected_token_ids=response_ids,
-    )
+    original_scores = list(forwards["original"])
+    teacher_scores = list(forwards["teacher"])
     rows = _combine_scores(response_ids, original_scores, teacher_scores)
     mutation_observations = _attach_gt_and_mutation_alignment(
         rows=rows,
@@ -386,10 +456,11 @@ def _run_sample(
     )
     mutation_rows = _build_mutation_rows(rows, mutation_observations, sample.changes)
     summary = _summarize_rows(rows, mutation_rows)
+    reconstructed = "".join(str(row["raw_token"]) for row in rows)
 
-    return {
+    result = {
         "schema_version": SCHEMA_VERSION,
-        "completed_at": utc_now(),
+        "completed_at": _utc_now(),
         "fingerprint": fingerprint,
         "pair_id": sample.pair_id,
         "sample": {
@@ -400,28 +471,244 @@ def _run_sample(
             "changes": list(sample.changes),
         },
         "protocol": {
+            "backend": "huggingface-transformers-offline",
             "generation_count": 1,
-            "api_call_count": 3,
-            "response_ids_reused_for_all_scoring": True,
-            "strict_response_id_equality": True,
+            "generation_performed_this_run": generation_performed,
+            "teacher_forced_forward_count": 2,
+            "response_ids_reused_for_all_forwards": True,
+            "response_ids_directly_concatenated": True,
+            "response_text_retokenized": False,
             "scoring_conditions": ["original_image", "privileged_text"],
+            "original_prompt_token_count": int(original_inputs["input_ids"].shape[-1]),
+            "privileged_prompt_token_count": int(teacher_inputs["input_ids"].shape[-1]),
+            "response_ids_sha256": _sha256_token_ids(response_ids),
             "original_prompt_sha256": _sha256_text(prompt),
             "privileged_prompt_sha256": _sha256_text(privileged_prompt),
             "ground_truth_sha256": _sha256_text(ground_truth),
             "privileged_instruction": privileged_instruction,
-            "top_logprobs": top_logprobs,
+            "top_k": top_k,
+            "forward_chunk_size": forward_chunk_size,
         },
         "response": {
             "text": response_text,
             "token_ids": response_ids,
             "token_count": len(response_ids),
-            "finish_reason": generated["finish_reason"],
+            "finish_reason": finish_reason,
+            "piece_reconstruction_matches_response": reconstructed == response_text,
         },
         "ground_truth": ground_truth,
         "summary": summary,
         "mutation_observations": mutation_rows,
         "tokens": rows,
     }
+    partial_path.unlink(missing_ok=True)
+    return result
+
+
+def _prepare_text_prompt_inputs(
+    *,
+    model_bundle: ModelBundle,
+    prompt: str,
+) -> dict[str, Any]:
+    """Build a text-only chat prefix ending at the assistant generation marker."""
+
+    messages = [{"role": "user", "content": prompt}]
+    template_kwargs: dict[str, Any] = {
+        "add_generation_prompt": True,
+        "tokenize": True,
+        "return_dict": True,
+        "return_tensors": "pt",
+        "enable_thinking": False,
+    }
+    try:
+        encoded = model_bundle.tokenizer.apply_chat_template(
+            messages, **template_kwargs
+        )
+    except TypeError:
+        template_kwargs.pop("enable_thinking")
+        try:
+            encoded = model_bundle.tokenizer.apply_chat_template(
+                messages, **template_kwargs
+            )
+        except TypeError:
+            rendered = model_bundle.tokenizer.apply_chat_template(
+                messages,
+                add_generation_prompt=True,
+                tokenize=False,
+            )
+            encoded = model_bundle.tokenizer(
+                rendered,
+                add_special_tokens=False,
+                return_tensors="pt",
+            )
+    if not hasattr(encoded, "items"):
+        encoded = {
+            "input_ids": encoded,
+            "attention_mask": _ones_like(encoded),
+        }
+    return move_inputs_to_device(dict(encoded), model_bundle.device)
+
+
+def _score_fixed_response_ids(
+    *,
+    model_bundle: ModelBundle,
+    prompt_inputs: dict[str, Any],
+    response_ids: Sequence[int],
+    top_k: int,
+    chunk_size: int,
+) -> list[dict[str, Any]]:
+    """Append response IDs directly and score them without decoding/re-tokenizing."""
+
+    import torch
+
+    if not response_ids:
+        raise ValueError("response_ids must not be empty")
+    prompt_length = int(prompt_inputs["input_ids"].shape[-1])
+    scoring_inputs = append_generated_tokens(prompt_inputs, list(response_ids))
+    scoring_inputs.pop("position_ids", None)
+    forward_kwargs = dict(scoring_inputs)
+    forward_kwargs["use_cache"] = False
+    try:
+        supports_keep = (
+            "logits_to_keep" in inspect.signature(model_bundle.model.forward).parameters
+        )
+    except (TypeError, ValueError):
+        supports_keep = False
+    if supports_keep:
+        forward_kwargs["logits_to_keep"] = len(response_ids) + 1
+
+    with torch.inference_mode():
+        outputs = model_bundle.model(**forward_kwargs)
+    logits = outputs.logits[0]
+    if supports_keep and logits.shape[0] <= len(response_ids) + 1:
+        required = len(response_ids) + 1
+        if logits.shape[0] < required:
+            raise RuntimeError(
+                "model returned too few logits for exact-ID scoring: "
+                f"got={logits.shape[0]} required={required}"
+            )
+        target_logits = logits[-required:-1]
+    else:
+        target_logits = logits[
+            prompt_length - 1 : prompt_length - 1 + len(response_ids)
+        ]
+    if target_logits.shape[0] != len(response_ids):
+        raise RuntimeError(
+            "fixed-response logits are not aligned with response IDs: "
+            f"logits={target_logits.shape[0]} ids={len(response_ids)}"
+        )
+
+    rows: list[dict[str, Any]] = []
+    for start in range(0, len(response_ids), chunk_size):
+        end = min(len(response_ids), start + chunk_size)
+        chunk = target_logits[start:end].float()
+        target_tensor = torch.tensor(
+            [int(value) for value in response_ids[start:end]],
+            dtype=torch.long,
+            device=chunk.device,
+        )
+        log_normalizer = torch.logsumexp(chunk, dim=-1)
+        selected_logits = chunk.gather(1, target_tensor[:, None]).squeeze(1)
+        selected_logp = selected_logits - log_normalizer
+        target_ranks = 1 + (chunk > selected_logits[:, None]).sum(dim=-1)
+        top_values, top_ids = torch.topk(
+            chunk,
+            k=min(top_k, int(chunk.shape[-1])),
+            dim=-1,
+        )
+        top_logp = top_values - log_normalizer[:, None]
+        probabilities = torch.softmax(chunk, dim=-1)
+        entropies = -(probabilities * torch.log_softmax(chunk, dim=-1)).sum(dim=-1)
+
+        selected_logp_cpu = selected_logp.detach().cpu().tolist()
+        ranks_cpu = target_ranks.detach().cpu().tolist()
+        entropy_cpu = entropies.detach().cpu().tolist()
+        top_ids_cpu = top_ids.detach().cpu().tolist()
+        top_logp_cpu = top_logp.detach().cpu().tolist()
+        for offset, token_id in enumerate(response_ids[start:end]):
+            raw_token = decode_token_piece(model_bundle.tokenizer, int(token_id))
+            candidates: list[dict[str, Any]] = []
+            for rank, (candidate_id, candidate_logp) in enumerate(
+                zip(top_ids_cpu[offset], top_logp_cpu[offset]),
+                start=1,
+            ):
+                candidate_raw = decode_token_piece(
+                    model_bundle.tokenizer,
+                    int(candidate_id),
+                )
+                candidates.append(
+                    {
+                        "rank": rank,
+                        "token_id": int(candidate_id),
+                        "token": _display_token(candidate_raw),
+                        "raw_token": candidate_raw,
+                        "probability": math.exp(float(candidate_logp)),
+                        "log_probability": float(candidate_logp),
+                    }
+                )
+            target_logp = float(selected_logp_cpu[offset])
+            top = candidates[0]
+            rows.append(
+                {
+                    "token_id": int(token_id),
+                    "token": _display_token(raw_token),
+                    "raw_token": raw_token,
+                    "probability": math.exp(target_logp),
+                    "log_probability": target_logp,
+                    "target_rank": int(ranks_cpu[offset]),
+                    "entropy": float(entropy_cpu[offset]),
+                    "top_token_id": int(top["token_id"]),
+                    "top_token": str(top["token"]),
+                    "top_raw_token": str(top["raw_token"]),
+                    "top_probability": float(top["probability"]),
+                    "top_log_probability": float(top["log_probability"]),
+                    "top_candidates": candidates,
+                }
+            )
+        del chunk, probabilities
+    del outputs, logits, target_logits
+    return rows
+
+
+def _load_partial(path: Path, fingerprint: str) -> dict[str, Any] | None:
+    if not path.is_file():
+        return None
+    try:
+        value = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return None
+    if value.get("fingerprint") != fingerprint:
+        return None
+    if not value.get("response_ids"):
+        return None
+    return value
+
+
+def _seed_everything(seed: int) -> None:
+    import torch
+
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
+
+
+def _empty_device_cache(device: Any) -> None:
+    import torch
+
+    if str(device).startswith("cuda") and torch.cuda.is_available():
+        torch.cuda.empty_cache()
+    elif str(device).startswith("mps") and hasattr(torch, "mps"):
+        torch.mps.empty_cache()
+
+
+def _ones_like(value: Any) -> Any:
+    import torch
+
+    return torch.ones_like(value)
+
+
+def _display_token(raw_token: str) -> str:
+    return raw_token.replace("\n", "\\n").replace("\t", "\\t")
 
 
 def _combine_scores(
@@ -430,7 +717,10 @@ def _combine_scores(
     teacher_scores: Sequence[dict[str, object]],
 ) -> list[dict[str, Any]]:
     expected_length = len(response_ids)
-    if len(original_scores) != expected_length or len(teacher_scores) != expected_length:
+    if (
+        len(original_scores) != expected_length
+        or len(teacher_scores) != expected_length
+    ):
         raise RuntimeError(
             "fixed-response score length mismatch: "
             f"ids={expected_length}, original={len(original_scores)}, teacher={len(teacher_scores)}"
@@ -439,7 +729,10 @@ def _combine_scores(
     for index, (token_id, original, teacher) in enumerate(
         zip(response_ids, original_scores, teacher_scores)
     ):
-        if int(original["token_id"]) != token_id or int(teacher["token_id"]) != token_id:
+        if (
+            int(original["token_id"]) != token_id
+            or int(teacher["token_id"]) != token_id
+        ):
             raise RuntimeError(f"fixed-response token ID mismatch at index {index}")
         raw_token = str(original["raw_token"])
         teacher_raw = str(teacher["raw_token"])
@@ -478,6 +771,7 @@ def _combine_scores(
                 "p_original": float(original["probability"]),
                 "logp_original": logp_original,
                 "rank_original": int(original["target_rank"]),
+                "entropy_original": float(original.get("entropy", 0.0)),
                 "top_token_id_original": top_original_id,
                 "top_token_original": str(original["top_token"]),
                 "top_raw_token_original": str(original["top_raw_token"]),
@@ -486,16 +780,20 @@ def _combine_scores(
                 "p_teacher": float(teacher["probability"]),
                 "logp_teacher": logp_teacher,
                 "rank_teacher": int(teacher["target_rank"]),
+                "entropy_teacher": float(teacher.get("entropy", 0.0)),
                 "top_token_id_teacher": top_teacher_id,
                 "top_token_teacher": str(teacher["top_token"]),
                 "top_raw_token_teacher": top_teacher_raw,
                 "top_p_teacher": float(teacher["top_probability"]),
                 "top_logp_teacher": float(teacher["top_log_probability"]),
+                "top_candidates_original": list(original.get("top_candidates", [])),
+                "top_candidates_teacher": list(teacher.get("top_candidates", [])),
                 "delta_p_teacher_minus_original": (
                     float(teacher["probability"]) - float(original["probability"])
                 ),
                 "delta_logp_teacher_minus_original": logp_teacher - logp_original,
-                "probability_increased_with_privileged_info": logp_teacher > logp_original,
+                "probability_increased_with_privileged_info": logp_teacher
+                > logp_original,
                 "top1_changed": top_original_id != top_teacher_id,
                 "target_is_top_original": top_original_id == token_id,
                 "target_is_top_teacher": top_teacher_id == token_id,
@@ -584,17 +882,26 @@ def _build_mutation_rows(
                 "response_token_indices": token_indices,
                 "decision_token_index": int(decision["index"]) if decision else None,
                 "decision_token": str(decision["token"]) if decision else "",
-                "decision_p_original": float(decision["p_original"]) if decision else None,
-                "decision_p_teacher": float(decision["p_teacher"]) if decision else None,
+                "decision_p_original": float(decision["p_original"])
+                if decision
+                else None,
+                "decision_p_teacher": float(decision["p_teacher"])
+                if decision
+                else None,
                 "decision_delta_logp": (
                     float(decision["delta_logp_teacher_minus_original"])
                     if decision
                     else None
                 ),
-                "sum_logp_original": sum(float(row["logp_original"]) for row in token_rows),
-                "sum_logp_teacher": sum(float(row["logp_teacher"]) for row in token_rows),
+                "sum_logp_original": sum(
+                    float(row["logp_original"]) for row in token_rows
+                ),
+                "sum_logp_teacher": sum(
+                    float(row["logp_teacher"]) for row in token_rows
+                ),
                 "delta_sum_logp": sum(
-                    float(row["delta_logp_teacher_minus_original"]) for row in token_rows
+                    float(row["delta_logp_teacher_minus_original"])
+                    for row in token_rows
                 ),
             }
         )
@@ -620,26 +927,36 @@ def _summarize_rows(
             bool(row["probability_increased_with_privileged_info"]) for row in rows
         ),
         "top1_changed_rate": _mean_bool(bool(row["top1_changed"]) for row in rows),
-        "target_top_rate_original": _mean_bool(bool(row["target_is_top_original"]) for row in rows),
-        "target_top_rate_teacher": _mean_bool(bool(row["target_is_top_teacher"]) for row in rows),
+        "target_top_rate_original": _mean_bool(
+            bool(row["target_is_top_original"]) for row in rows
+        ),
+        "target_top_rate_teacher": _mean_bool(
+            bool(row["target_is_top_teacher"]) for row in rows
+        ),
         "same_surface_different_id_count": sum(
             bool(row["teacher_top_same_surface_different_id"]) for row in rows
         ),
         "teacher_preference_counts": _count_values(
             str(row["teacher_preference"]) for row in rows
         ),
-        "top1_transition_counts": _count_values(str(row["top1_transition"]) for row in rows),
-        "hallucination_token_count": sum(bool(row.get("is_hallucination")) for row in rows),
+        "top1_transition_counts": _count_values(
+            str(row["top1_transition"]) for row in rows
+        ),
+        "hallucination_token_count": sum(
+            bool(row.get("is_hallucination")) for row in rows
+        ),
         "token_label_counts": label_counts,
         "mutation_relation_counts": mutation_counts,
     }
 
 
-def rebuild_api_privileged_report(output_dir: str | Path) -> dict[str, Any]:
+def rebuild_privileged_report(output_dir: str | Path) -> dict[str, Any]:
     output_root = Path(output_dir).expanduser().resolve()
     result_paths = sorted((output_root / "samples").glob("*/result.json"))
     if not result_paths:
-        raise RuntimeError(f"no completed result.json files under {output_root / 'samples'}")
+        raise RuntimeError(
+            f"no completed result.json files under {output_root / 'samples'}"
+        )
     results = [json.loads(path.read_text(encoding="utf-8")) for path in result_paths]
     all_tokens: list[dict[str, Any]] = []
     all_mutations: list[dict[str, Any]] = []
@@ -679,38 +996,53 @@ def _summarize_global(
     deltas = [float(row["delta_logp_teacher_minus_original"]) for row in rows]
     return {
         "schema_version": SCHEMA_VERSION,
-        "created_at": utc_now(),
+        "created_at": _utc_now(),
         "completed_samples": len(results),
         "total_tokens": len(rows),
         "total_mutations": len(mutations),
         "mean_p_original": _mean(float(row["p_original"]) for row in rows),
         "mean_p_teacher": _mean(float(row["p_teacher"]) for row in rows),
         "mean_delta_logp_teacher_minus_original": _mean(deltas),
-        "median_delta_logp_teacher_minus_original": statistics.median(deltas) if deltas else 0.0,
+        "median_delta_logp_teacher_minus_original": statistics.median(deltas)
+        if deltas
+        else 0.0,
         "privileged_probability_gain_rate": _mean_bool(
             bool(row["probability_increased_with_privileged_info"]) for row in rows
         ),
         "top1_changed_rate": _mean_bool(bool(row["top1_changed"]) for row in rows),
-        "target_top_rate_original": _mean_bool(bool(row["target_is_top_original"]) for row in rows),
-        "target_top_rate_teacher": _mean_bool(bool(row["target_is_top_teacher"]) for row in rows),
+        "target_top_rate_original": _mean_bool(
+            bool(row["target_is_top_original"]) for row in rows
+        ),
+        "target_top_rate_teacher": _mean_bool(
+            bool(row["target_is_top_teacher"]) for row in rows
+        ),
         "same_surface_different_id_count": sum(
             bool(row["teacher_top_same_surface_different_id"]) for row in rows
         ),
         "teacher_preference_counts": _count_values(
             str(row["teacher_preference"]) for row in rows
         ),
-        "top1_transition_counts": _count_values(str(row["top1_transition"]) for row in rows),
-        "finish_reason_counts": _count_values(
-            str(result["response"].get("finish_reason", "unknown")) for result in results
+        "top1_transition_counts": _count_values(
+            str(row["top1_transition"]) for row in rows
         ),
-        "token_label_counts": _count_values(str(row.get("token_label", "unknown")) for row in rows),
-        "mutation_relation_counts": _count_values(str(row["relation"]) for row in mutations),
+        "finish_reason_counts": _count_values(
+            str(result["response"].get("finish_reason", "unknown"))
+            for result in results
+        ),
+        "token_label_counts": _count_values(
+            str(row.get("token_label", "unknown")) for row in rows
+        ),
+        "mutation_relation_counts": _count_values(
+            str(row["relation"]) for row in mutations
+        ),
     }
 
 
 def _write_sample_outputs(sample_dir: Path, result: dict[str, Any]) -> None:
     _write_csv(sample_dir / "token_probabilities.csv", result["tokens"])
-    _write_csv(sample_dir / "mutation_probabilities.csv", result["mutation_observations"])
+    _write_csv(
+        sample_dir / "mutation_probabilities.csv", result["mutation_observations"]
+    )
     _write_text_atomic(sample_dir / "report.html", _render_sample_html(result))
 
 
@@ -730,17 +1062,19 @@ def _render_sample_html(result: dict[str, Any]) -> str:
     original_strip = "".join(_probability_span(row, "p_original") for row in rows)
     teacher_strip = "".join(_probability_span(row, "p_teacher") for row in rows)
     delta_strip = "".join(_delta_span(row) for row in rows)
-    mutation_rows = "".join(_mutation_table_row(row) for row in result["mutation_observations"])
+    mutation_rows = "".join(
+        _mutation_table_row(row) for row in result["mutation_observations"]
+    )
     image_name = Path(result["sample"]["image_copy"]).name
     summary = result["summary"]
     return f"""<!doctype html>
 <html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
-<title>{html.escape(result['pair_id'])} privileged probe</title>{_report_css()}</head>
+<title>{html.escape(result["pair_id"])} privileged probe</title>{_report_css()}</head>
 <body><main>
 <nav><a href="../../report.html">汇总报告</a><a href="token_probabilities.csv">Token CSV</a><a href="mutation_probabilities.csv">变异 CSV</a></nav>
-<h1>{html.escape(result['pair_id'])}</h1>
-<div class="stats">{_stat('Tokens', summary['token_count'])}{_stat('Mean p original', summary['mean_p_original'])}{_stat('Mean p teacher', summary['mean_p_teacher'])}{_stat('Mean Δlogp', summary['mean_delta_logp_teacher_minus_original'], signed=True)}{_stat('Top-1 changed', summary['top1_changed_rate'], percent=True)}</div>
-<section class="source-grid"><figure><img src="{html.escape(image_name)}" alt="document page"><figcaption>输入图片</figcaption></figure><div><h2>模型 Response</h2><pre>{html.escape(result['response']['text'])}</pre><details><summary>Ground Truth</summary><pre>{html.escape(result['ground_truth'])}</pre></details></div></section>
+<h1>{html.escape(result["pair_id"])}</h1>
+<div class="stats">{_stat("Tokens", summary["token_count"])}{_stat("Mean p original", summary["mean_p_original"])}{_stat("Mean p teacher", summary["mean_p_teacher"])}{_stat("Mean Δlogp", summary["mean_delta_logp_teacher_minus_original"], signed=True)}{_stat("Top-1 changed", summary["top1_changed_rate"], percent=True)}</div>
+<section class="source-grid"><figure><img src="{html.escape(image_name)}" alt="document page"><figcaption>输入图片</figcaption></figure><div><h2>模型 Response</h2><pre>{html.escape(result["response"]["text"])}</pre><details><summary>Ground Truth</summary><pre>{html.escape(result["ground_truth"])}</pre></details></div></section>
 <section><h2>逐 Token 概率</h2><canvas id="prob-chart" width="1600" height="360"></canvas><h3>原图条件</h3><div class="token-strip">{original_strip}</div><h3>特权信息条件</h3><div class="token-strip">{teacher_strip}</div><h3>Δlogp = teacher - original</h3><div class="token-strip">{delta_strip}</div></section>
 <section><h2>人工变异位置</h2><div class="table-scroll"><table><thead><tr><th>ID</th><th>图片文字</th><th>原词</th><th>模型读回</th><th>关系</th><th>Decision token</th><th>p original</th><th>p teacher</th><th>Δlogp</th></tr></thead><tbody>{mutation_rows}</tbody></table></div></section>
 <section><h2>Token 明细</h2><div class="table-scroll"><table><thead><tr><th>#</th><th>ID</th><th>Token</th><th>GT 标签</th><th>p original</th><th>p teacher</th><th>Δp</th><th>Δlogp</th><th>Original top-1</th><th>Original top-1 ID</th><th>Teacher top-1</th><th>Teacher top-1 ID</th><th>Teacher top-1 p</th><th>Top-1 changed</th><th>解释</th><th>Top-1 transition</th></tr></thead><tbody>{token_rows}</tbody></table></div></section>
@@ -816,7 +1150,11 @@ def _render_aggregate_html(
         for row in alternative_rows[:500]
     )
     scatter = [
-        {"x": float(row["p_original"]), "y": float(row["p_teacher"]), "label": str(row.get("token_label", ""))}
+        {
+            "x": float(row["p_original"]),
+            "y": float(row["p_teacher"]),
+            "label": str(row.get("token_label", "")),
+        }
         for row in _even_sample(tokens, 12000)
     ]
     deltas = [float(row["delta_logp_teacher_minus_original"]) for row in tokens]
@@ -825,10 +1163,10 @@ def _render_aggregate_html(
 <title>Privileged Response Token Probe</title>{_report_css()}</head><body><main>
 <nav><a href="summary.json">Summary JSON</a><a href="sample_summary.csv">Sample CSV</a><a href="token_probabilities.csv">Token CSV</a><a href="mutation_probabilities.csv">Mutation CSV</a></nav>
 <h1>特权信息固定 Response 概率分析</h1>
-<div class="stats">{_stat('Samples', summary['completed_samples'])}{_stat('Tokens', summary['total_tokens'])}{_stat('Mutations', summary['total_mutations'])}{_stat('Mean p original', summary['mean_p_original'])}{_stat('Mean p teacher', summary['mean_p_teacher'])}{_stat('Mean Δlogp', summary['mean_delta_logp_teacher_minus_original'], signed=True)}{_stat('Top-1 changed', summary['top1_changed_rate'], percent=True)}{_stat('Same text / different ID', summary['teacher_preference_counts'].get('same_surface_different_token_id', 0))}{_stat('Teacher different text', summary['teacher_preference_counts'].get('different_surface_top1', 0))}{_stat('Teacher recovers response', summary['top1_transition_counts'].get('teacher_recovers_response', 0))}{_stat('Teacher rejects response', summary['top1_transition_counts'].get('teacher_rejects_response', 0))}</div>
+<div class="stats">{_stat("Samples", summary["completed_samples"])}{_stat("Tokens", summary["total_tokens"])}{_stat("Mutations", summary["total_mutations"])}{_stat("Mean p original", summary["mean_p_original"])}{_stat("Mean p teacher", summary["mean_p_teacher"])}{_stat("Mean Δlogp", summary["mean_delta_logp_teacher_minus_original"], signed=True)}{_stat("Top-1 changed", summary["top1_changed_rate"], percent=True)}{_stat("Same text / different ID", summary["teacher_preference_counts"].get("same_surface_different_token_id", 0))}{_stat("Teacher different text", summary["teacher_preference_counts"].get("different_surface_top1", 0))}{_stat("Teacher recovers response", summary["top1_transition_counts"].get("teacher_recovers_response", 0))}{_stat("Teacher rejects response", summary["top1_transition_counts"].get("teacher_rejects_response", 0))}</div>
 <section class="chart-grid"><div><h2>p original vs p teacher</h2><canvas id="scatter" width="720" height="520"></canvas></div><div><h2>Δlogp 分布</h2><canvas id="histogram" width="720" height="520"></canvas></div></section>
 <section><h2>逐样本</h2><div class="table-scroll"><table><thead><tr><th>Sample</th><th>Tokens</th><th>Mean p original</th><th>Mean p teacher</th><th>Mean Δlogp</th><th>Top-1 changed</th><th>Finish</th></tr></thead><tbody>{sample_table}</tbody></table></div></section>
-<section><h2>{summary['total_mutations']} 个定向变异位置</h2><div class="table-scroll"><table><thead><tr><th>Sample</th><th>图片文字</th><th>原词</th><th>模型读回</th><th>关系</th><th>p original</th><th>p teacher</th><th>Δlogp</th></tr></thead><tbody>{mutation_table}</tbody></table></div></section>
+<section><h2>{summary["total_mutations"]} 个定向变异位置</h2><div class="table-scroll"><table><thead><tr><th>Sample</th><th>图片文字</th><th>原词</th><th>模型读回</th><th>关系</th><th>p original</th><th>p teacher</th><th>Δlogp</th></tr></thead><tbody>{mutation_table}</tbody></table></div></section>
 <section><h2>教师 Top-1 不再是 Response token</h2><div class="table-scroll"><table><thead><tr><th>Sample</th><th>#</th><th>Response token</th><th>Response ID</th><th>p original</th><th>p teacher</th><th>Teacher top-1</th><th>Top-1 ID</th><th>Top-1 p</th><th>解释</th><th>Top-1 transition</th></tr></thead><tbody>{alternatives_table}</tbody></table></div></section>
 <section><h2>|Δlogp| 最大的 Token</h2><div class="table-scroll"><table><thead><tr><th>Sample</th><th>#</th><th>Token</th><th>GT 标签</th><th>p original</th><th>p teacher</th><th>Δlogp</th><th>Teacher top-1</th><th>Top-1 ID</th><th>Top-1 p</th><th>解释</th><th>Top-1 transition</th></tr></thead><tbody>{strongest_table}</tbody></table></div></section>
 </main><script>const SCATTER={json.dumps(scatter, ensure_ascii=False)};const DELTAS={json.dumps(deltas)};{_aggregate_chart_javascript()}</script></body></html>"""
@@ -912,9 +1250,15 @@ function histogram(){const {c,w,h}=ctx('histogram');axes(c,w,h);if(!DELTAS.lengt
 """
 
 
-def _stat(label: str, value: Any, *, percent: bool = False, signed: bool = False) -> str:
+def _stat(
+    label: str, value: Any, *, percent: bool = False, signed: bool = False
+) -> str:
     if isinstance(value, float):
-        rendered = f"{100 * value:.2f}%" if percent else (f"{value:+.4f}" if signed else f"{value:.6f}")
+        rendered = (
+            f"{100 * value:.2f}%"
+            if percent
+            else (f"{value:+.4f}" if signed else f"{value:.6f}")
+        )
     else:
         rendered = str(value)
     return f"<div class='stat'><span>{html.escape(label)}</span><strong>{html.escape(rendered)}</strong></div>"
@@ -935,7 +1279,10 @@ def _optional_float(value: Any, *, signed: bool = False) -> str:
 def _even_sample(values: Sequence[Any], maximum: int) -> list[Any]:
     if len(values) <= maximum:
         return list(values)
-    return [values[min(len(values) - 1, int(index * len(values) / maximum))] for index in range(maximum)]
+    return [
+        values[min(len(values) - 1, int(index * len(values) / maximum))]
+        for index in range(maximum)
+    ]
 
 
 def _count_values(values: Iterable[str]) -> dict[str, int]:
@@ -965,20 +1312,31 @@ def _resolve_release_path(root: Path, value: str) -> Path:
     return resolved
 
 
-def _sample_fingerprint(*, sample: PrivilegedProbeSample, config: dict[str, Any]) -> str:
+def _sample_fingerprint(
+    *, sample: PrivilegedProbeSample, config: dict[str, Any]
+) -> str:
     payload = {
         "schema_version": SCHEMA_VERSION,
         "pair_id": sample.pair_id,
         "image_path": str(sample.image_path),
         "image_size": sample.image_path.stat().st_size,
         "image_mtime_ns": sample.image_path.stat().st_mtime_ns,
-        "ground_truth_sha256": _sha256_text(sample.ground_truth_path.read_text(encoding="utf-8")),
+        "ground_truth_sha256": _sha256_text(
+            sample.ground_truth_path.read_text(encoding="utf-8")
+        ),
         "changes": list(sample.changes),
-        "model": config["model"],
+        "model_id": config["model_id"],
         "prompt": config["prompt"],
         "privileged_instruction": config["privileged_instruction"],
-        "max_tokens": config["max_tokens"],
-        "top_logprobs": config["top_logprobs"],
+        "max_new_tokens": config["max_new_tokens"],
+        "top_k": config["top_k"],
+        "forward_chunk_size": config["forward_chunk_size"],
+        "device_map": config["device_map"],
+        "dtype": config["dtype"],
+        "trust_remote_code": config["trust_remote_code"],
+        "min_pixels": config["min_pixels"],
+        "max_pixels": config["max_pixels"],
+        "image_patch_size": config["image_patch_size"],
         "seed": int(config["seed"]) + sample.ordinal - 1,
     }
     return _sha256_text(json.dumps(payload, sort_keys=True, ensure_ascii=False))
@@ -988,13 +1346,30 @@ def _result_matches(path: Path, fingerprint: str) -> bool:
     if not path.is_file():
         return False
     try:
-        return json.loads(path.read_text(encoding="utf-8")).get("fingerprint") == fingerprint
+        return (
+            json.loads(path.read_text(encoding="utf-8")).get("fingerprint")
+            == fingerprint
+        )
     except (OSError, json.JSONDecodeError):
         return False
 
 
 def _sha256_text(value: str) -> str:
     return hashlib.sha256(value.encode("utf-8")).hexdigest()
+
+
+def _sha256_token_ids(token_ids: Sequence[int]) -> str:
+    payload = ",".join(str(int(token_id)) for token_id in token_ids)
+    return _sha256_text(payload)
+
+
+def _utc_now() -> str:
+    return datetime.now(timezone.utc).isoformat()
+
+
+def _safe_error(exc: BaseException, *, limit: int = 2000) -> str:
+    message = str(exc).replace("\x00", "")
+    return message if len(message) <= limit else message[:limit] + "..."
 
 
 def _write_text_atomic(path: Path, value: str) -> None:
@@ -1005,7 +1380,9 @@ def _write_text_atomic(path: Path, value: str) -> None:
 
 
 def _write_json_atomic(path: Path, value: Any) -> None:
-    _write_text_atomic(path, json.dumps(value, ensure_ascii=False, indent=2, allow_nan=False))
+    _write_text_atomic(
+        path, json.dumps(value, ensure_ascii=False, indent=2, allow_nan=False)
+    )
 
 
 def _append_jsonl(path: Path, value: dict[str, Any]) -> None:
@@ -1041,33 +1418,38 @@ def _csv_value(value: Any) -> Any:
 
 def _build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        prog="qwen-mm-api-privileged-probe",
+        prog="qwen-mm-privileged-probe",
         description=(
-            "Generate OCR once, then score the identical response token IDs under "
-            "the original image prompt and a standalone GT privileged prompt."
+            "Offline Transformers probe: generate OCR once, then directly append "
+            "the identical response ID tensor under original-image and GT prompts."
         ),
     )
-    parser.add_argument("--base-url")
-    parser.add_argument("--model", default=DEFAULT_MODEL)
+    parser.add_argument("--model-id", default=DEFAULT_MODEL_ID)
     parser.add_argument("--dataset-root")
     parser.add_argument("--output-dir", required=True)
-    parser.add_argument("--api-key")
-    parser.add_argument("--api-key-env", default="INF_API_KEY")
     parser.add_argument("--prompt", default=DEFAULT_PROMPT)
     parser.add_argument("--prompt-file")
-    parser.add_argument("--privileged-instruction", default=DEFAULT_PRIVILEGED_INSTRUCTION)
-    parser.add_argument("--max-tokens", type=int, default=4096)
-    parser.add_argument("--top-logprobs", type=int, default=5)
+    parser.add_argument(
+        "--privileged-instruction", default=DEFAULT_PRIVILEGED_INSTRUCTION
+    )
+    parser.add_argument("--max-new-tokens", type=int, default=4096)
+    parser.add_argument("--top-k", type=int, default=5)
+    parser.add_argument("--forward-chunk-size", type=int, default=16)
+    parser.add_argument("--device-map", default="auto")
+    parser.add_argument(
+        "--dtype",
+        choices=("auto", "float16", "bfloat16", "float32"),
+        default="bfloat16",
+    )
+    parser.add_argument("--trust-remote-code", action="store_true")
+    parser.add_argument("--min-pixels", type=int, default=2048)
+    parser.add_argument("--max-pixels", type=int, default=16777216)
+    parser.add_argument("--image-patch-size", type=int, default=16)
     parser.add_argument("--seed", type=int, default=7)
-    parser.add_argument("--timeout-seconds", type=float, default=900.0)
-    parser.add_argument("--max-retries", type=int, default=5)
-    parser.add_argument("--retry-base-seconds", type=float, default=3.0)
-    parser.add_argument("--request-interval-seconds", type=float, default=0.0)
     parser.add_argument("--limit", type=int)
     parser.add_argument("--heartbeat-seconds", type=float, default=30.0)
     parser.add_argument("--no-resume", action="store_true")
     parser.add_argument("--fail-fast", action="store_true")
-    parser.add_argument("--no-verify-tls", action="store_true")
     parser.add_argument(
         "--rebuild-report-only",
         action="store_true",
@@ -1080,37 +1462,35 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser = _build_parser()
     args = parser.parse_args(argv)
     if args.rebuild_report_only:
-        summary = rebuild_api_privileged_report(args.output_dir)
+        summary = rebuild_privileged_report(args.output_dir)
         print(
             f"Rebuilt report: {Path(args.output_dir).expanduser().resolve() / 'report.html'} "
             f"samples={summary['completed_samples']} tokens={summary['total_tokens']}",
             flush=True,
         )
         return 0
-    if not args.base_url:
-        parser.error("--base-url is required unless --rebuild-report-only is used")
     if not args.dataset_root:
         parser.error("--dataset-root is required unless --rebuild-report-only is used")
     prompt = args.prompt
     if args.prompt_file:
         prompt = Path(args.prompt_file).expanduser().read_text(encoding="utf-8")
-    summary = run_api_privileged_probe(
-        base_url=args.base_url,
-        model=args.model,
+    device_map = None if args.device_map.lower() == "none" else args.device_map
+    summary = run_privileged_probe(
+        model_id=args.model_id,
         dataset_root=args.dataset_root,
         output_dir=args.output_dir,
-        api_key=args.api_key,
-        api_key_env=args.api_key_env,
         prompt=prompt,
         privileged_instruction=args.privileged_instruction,
-        max_tokens=args.max_tokens,
-        top_logprobs=args.top_logprobs,
+        max_new_tokens=args.max_new_tokens,
+        top_k=args.top_k,
+        forward_chunk_size=args.forward_chunk_size,
+        device_map=device_map,
+        dtype=args.dtype,
+        trust_remote_code=args.trust_remote_code,
+        min_pixels=args.min_pixels,
+        max_pixels=args.max_pixels,
+        image_patch_size=args.image_patch_size,
         seed=args.seed,
-        verify_tls=not args.no_verify_tls,
-        timeout_seconds=args.timeout_seconds,
-        max_retries=args.max_retries,
-        retry_base_seconds=args.retry_base_seconds,
-        request_interval_seconds=args.request_interval_seconds,
         resume=not args.no_resume,
         fail_fast=args.fail_fast,
         limit=args.limit,

@@ -29,7 +29,7 @@ qwen-mm-token-probe = "qwen_mm_token_probe.cli:main"
 qwen-mm-unique-loop = "qwen_mm_token_probe.unique_loop:main"
 qwen-mm-force-continue = "qwen_mm_token_probe.force_continue:main"
 qwen-mm-blur-batch = "qwen_mm_token_probe.batch_blur:main"
-qwen-mm-api-privileged-probe = "qwen_mm_token_probe.api_privileged_probe:main"
+qwen-mm-privileged-probe = "qwen_mm_token_probe.privileged_probe:main"
 
 [tool.setuptools.packages.find]
 where = ["src"]
