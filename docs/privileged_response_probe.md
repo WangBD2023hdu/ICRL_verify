@@ -58,18 +58,26 @@ side, followed by every generated response token in its original ID order.
 Teacher-signal quality statistics are written to a separate page so the existing
 sample browser and per-token visualization remain unchanged:
 
-- `teacher_signal_audit.html`: four-quadrant audit of correct/wrong response
-  tokens versus increasing/decreasing privileged log-probability;
+- `teacher_signal_audit.html`: mutation-only four-quadrant audit of correct and
+  incorrect mutation readbacks versus increasing/decreasing privileged
+  log-probability;
 - `teacher_signal_audit.json`: aggregate counts, rates, threshold sweep, error
   types, Teacher Top-1 relations, and per-sample summaries;
-- `teacher_signal_tokens.csv`: every response token with its GT-alignment label
-  and selected-threshold signal class;
+- `teacher_signal_mutations.csv`: one row per annotated synthetic mutation,
+  including the full associated response-token span and the selected-threshold
+  signal class;
+- `teacher_signal_tokens.csv`: supporting subtoken rows only for annotated
+  mutation spans; ordinary response tokens are not included;
 - `teacher_signal_sample_summary.csv`: one audit row per sample.
 
-The default active-signal rule is `abs(delta_logp) > 0.05`. Formatting-only
-tokens are excluded. Response omissions are reported separately because a fixed
-response-ID forward has no token at a deleted GT position to score. A token that
-contains any aligned substitution or insertion is treated as incorrect.
+Only annotated mutation words are included; ordinary response words never enter
+the audit denominator. Each mutation is counted once even when its readback has
+multiple tokenizer tokens. `relation=expected` is correct, while
+`opposite_variant` and `other` are incorrect. The signal is the delta-logp of
+the first associated response token, which avoids allowing later prefix-driven
+subtokens to dominate the decision. The default active-signal rule is
+`abs(delta_logp) > 0.05`. Deleted mutations are unscored because the fixed
+response-ID sequence contains no corresponding token.
 
 For each response token, the table shows its probability and rank under the
 original image+prompt context, the probability and rank of that exact same token

@@ -49,14 +49,6 @@ PRIVILEGED_PROMPT_TEMPLATE = (
 )
 DEFAULT_TEACHER_SIGNAL_THRESHOLD = 0.05
 TEACHER_SIGNAL_THRESHOLDS = (0.0, 0.01, 0.05, 0.1, 0.2, 0.5)
-_INCORRECT_TOKEN_LABELS = frozenset(
-    {
-        "mutation_opposite_variant",
-        "mutation_other",
-        "hallucinated_insertion",
-        "hallucinated_substitution",
-    }
-)
 
 
 @dataclass(frozen=True)
@@ -1026,13 +1018,10 @@ def _teacher_signal_correctness(row: dict[str, Any]) -> str:
     existing = str(row.get("correctness", ""))
     if existing in {"correct", "incorrect", "excluded"}:
         return existing
-    label = str(row.get("token_label", "unknown"))
-    normalized_count = int(row.get("normalized_char_count", 1))
-    if label == "formatting" or normalized_count == 0:
-        return "excluded"
-    if label == "correct" and not bool(row.get("is_hallucination", False)):
+    relation = str(row.get("mutation_relation", row.get("relation", "unknown")))
+    if relation == "expected":
         return "correct"
-    if bool(row.get("is_hallucination", False)) or label in _INCORRECT_TOKEN_LABELS:
+    if relation in {"opposite_variant", "other"}:
         return "incorrect"
     return "excluded"
 
@@ -1087,8 +1076,11 @@ def _classify_teacher_signal_row(
     _validate_teacher_signal_threshold(threshold)
     classified = dict(row)
     correctness = _teacher_signal_correctness(classified)
-    delta_logp = float(classified["delta_logp_teacher_minus_original"])
-    direction = _teacher_signal_direction(delta_logp, threshold)
+    delta_value = classified.get("delta_logp_teacher_minus_original")
+    if correctness == "excluded" or delta_value is None:
+        direction = "unscored"
+    else:
+        direction = _teacher_signal_direction(float(delta_value), threshold)
     signal_class, quality = _teacher_signal_class_and_quality(
         correctness,
         direction,
@@ -1117,7 +1109,7 @@ def _classify_teacher_signal_rows(
     return [_classify_teacher_signal_row(row, threshold=threshold) for row in rows]
 
 
-def _prepare_teacher_signal_rows(
+def _prepare_teacher_signal_token_details(
     result: dict[str, Any],
     *,
     sample_report: str,
@@ -1222,6 +1214,115 @@ def _prepare_teacher_signal_rows(
     return prepared, int(alignment.deletions)
 
 
+def _prepare_teacher_signal_mutation_rows(
+    result: dict[str, Any],
+    *,
+    sample_report: str,
+) -> list[dict[str, Any]]:
+    token_details, _ = _prepare_teacher_signal_token_details(
+        result,
+        sample_report=sample_report,
+    )
+    tokens_by_index = {int(row["index"]): row for row in token_details}
+    prepared: list[dict[str, Any]] = []
+    for mutation in result.get("mutation_observations", []):
+        token_indices = [
+            int(index)
+            for index in mutation.get("response_token_indices", [])
+            if isinstance(index, int) or str(index).isdigit()
+        ]
+        linked_tokens = [
+            tokens_by_index[index]
+            for index in token_indices
+            if index in tokens_by_index
+        ]
+        decision = linked_tokens[0] if linked_tokens else None
+        relation = str(mutation.get("relation", "unknown"))
+        if decision is None or relation == "deleted":
+            correctness = "excluded"
+        elif relation == "expected":
+            correctness = "correct"
+        elif relation in {"opposite_variant", "other"}:
+            correctness = "incorrect"
+        else:
+            correctness = "excluded"
+        token_deltas = [
+            float(row["delta_logp_teacher_minus_original"]) for row in linked_tokens
+        ]
+        prepared.append(
+            {
+                "pair_id": str(result.get("pair_id", "")),
+                "sample_report": sample_report,
+                "mutation_id": str(mutation.get("mutation_id", "")),
+                "mutation_relation": relation,
+                "origin_ans": str(mutation.get("origin_ans", "")),
+                "ocr_ans": str(mutation.get("ocr_ans", "")),
+                "predicted": str(mutation.get("predicted", "")),
+                "bbox": list(mutation.get("bbox", [])),
+                "correctness": correctness,
+                "score_unit": "first_associated_response_token",
+                "response_token_count": len(linked_tokens),
+                "response_token_indices": token_indices,
+                "response_tokens": [
+                    {
+                        "index": int(row["index"]),
+                        "token_id": int(row["token_id"]),
+                        "token": str(row["token"]),
+                        "p_original": float(row["p_original"]),
+                        "p_teacher": float(row["p_teacher"]),
+                        "delta_logp_teacher_minus_original": float(
+                            row["delta_logp_teacher_minus_original"]
+                        ),
+                    }
+                    for row in linked_tokens
+                ],
+                "index": int(decision["index"]) if decision else -1,
+                "token_id": int(decision["token_id"]) if decision else -1,
+                "token": str(decision["token"]) if decision else "",
+                "raw_token": str(decision["raw_token"]) if decision else "",
+                "aligned_gt_piece": str(decision["aligned_gt_piece"])
+                if decision
+                else "",
+                "p_original": float(decision["p_original"]) if decision else None,
+                "p_teacher": float(decision["p_teacher"]) if decision else None,
+                "delta_p_teacher_minus_original": float(
+                    decision["delta_p_teacher_minus_original"]
+                )
+                if decision
+                else None,
+                "delta_logp_teacher_minus_original": float(
+                    decision["delta_logp_teacher_minus_original"]
+                )
+                if decision
+                else None,
+                "span_delta_sum_logp": sum(token_deltas) if token_deltas else None,
+                "span_delta_mean_logp": _mean(token_deltas) if token_deltas else None,
+                "top_token_id_teacher": int(decision["top_token_id_teacher"])
+                if decision
+                else -1,
+                "top_token_teacher": str(decision["top_token_teacher"])
+                if decision
+                else "",
+                "top_raw_token_teacher": str(decision["top_raw_token_teacher"])
+                if decision
+                else "",
+                "top_p_teacher": float(decision["top_p_teacher"]) if decision else None,
+                "target_is_top_teacher": bool(decision["target_is_top_teacher"])
+                if decision
+                else False,
+                "teacher_top_same_surface_different_id": bool(
+                    decision["teacher_top_same_surface_different_id"]
+                )
+                if decision
+                else False,
+                "teacher_top1_relation": str(decision["teacher_top1_relation"])
+                if decision
+                else "unscored",
+            }
+        )
+    return prepared
+
+
 def _ratio(numerator: int, denominator: int) -> float | None:
     return numerator / denominator if denominator else None
 
@@ -1250,8 +1351,13 @@ def _teacher_signal_summary(
     wrong_promotion_top1_relations: list[str] = []
     for row in rows:
         correctness = _teacher_signal_correctness(row)
-        delta_logp = float(row["delta_logp_teacher_minus_original"])
-        direction = _teacher_signal_direction(delta_logp, threshold)
+        delta_value = row.get("delta_logp_teacher_minus_original")
+        if correctness == "excluded" or delta_value is None:
+            direction = "unscored"
+            delta_logp = 0.0
+        else:
+            delta_logp = float(delta_value)
+            direction = _teacher_signal_direction(delta_logp, threshold)
         signal_class, _ = _teacher_signal_class_and_quality(
             correctness,
             direction,
@@ -1278,15 +1384,15 @@ def _teacher_signal_summary(
     active_count = harmful_count + helpful_count
     return {
         "threshold": threshold,
-        "total_tokens": len(rows),
-        "evaluable_tokens": evaluable_count,
-        "correct_tokens": correct_count,
-        "incorrect_tokens": incorrect_count,
-        "excluded_tokens": class_counts["excluded"],
-        "active_signal_tokens": active_count,
-        "neutral_tokens": class_counts["neutral"],
-        "neutral_correct_tokens": neutral_correct,
-        "neutral_incorrect_tokens": neutral_incorrect,
+        "total_mutations": len(rows),
+        "evaluable_mutations": evaluable_count,
+        "correct_mutations": correct_count,
+        "incorrect_mutations": incorrect_count,
+        "unscored_mutations": class_counts["excluded"],
+        "active_signal_mutations": active_count,
+        "neutral_mutations": class_counts["neutral"],
+        "neutral_correct_mutations": neutral_correct,
+        "neutral_incorrect_mutations": neutral_incorrect,
         "correct_reinforced": class_counts["correct_reinforced"],
         "harmful_correct_suppressed": class_counts["harmful_correct_suppressed"],
         "harmful_wrong_promoted": class_counts["harmful_wrong_promoted"],
@@ -1294,17 +1400,17 @@ def _teacher_signal_summary(
         "helpful_signal_count": helpful_count,
         "harmful_signal_count": harmful_count,
         "harmful_signal_rate": _ratio(harmful_count, active_count),
-        "harmful_evaluable_token_rate": _ratio(harmful_count, evaluable_count),
-        "correct_reinforcement_rate": _ratio(
+        "harmful_evaluable_mutation_rate": _ratio(harmful_count, evaluable_count),
+        "correct_mutation_reinforcement_rate": _ratio(
             class_counts["correct_reinforced"], correct_count
         ),
-        "correct_suppression_rate": _ratio(
+        "correct_mutation_suppression_rate": _ratio(
             class_counts["harmful_correct_suppressed"], correct_count
         ),
-        "wrong_promotion_rate": _ratio(
+        "wrong_mutation_promotion_rate": _ratio(
             class_counts["harmful_wrong_promoted"], incorrect_count
         ),
-        "wrong_suppression_rate": _ratio(
+        "wrong_mutation_suppression_rate": _ratio(
             class_counts["wrong_suppressed"], incorrect_count
         ),
         "mean_delta_logp_correct": (
@@ -1329,11 +1435,11 @@ def _teacher_signal_error_breakdown(
     for row in rows:
         if _teacher_signal_correctness(row) != "incorrect":
             continue
-        label = str(row.get("token_label", "unknown"))
+        label = str(row.get("mutation_relation", "unknown"))
         values = grouped.setdefault(
             label,
             {
-                "incorrect_tokens": 0,
+                "incorrect_mutations": 0,
                 "wrong_promoted": 0,
                 "wrong_suppressed": 0,
                 "neutral": 0,
@@ -1343,7 +1449,7 @@ def _teacher_signal_error_breakdown(
         delta_logp = float(row["delta_logp_teacher_minus_original"])
         direction = _teacher_signal_direction(delta_logp, threshold)
         signal_class, _ = _teacher_signal_class_and_quality("incorrect", direction)
-        values["incorrect_tokens"] += 1
+        values["incorrect_mutations"] += 1
         values["delta_sum"] += delta_logp
         if signal_class == "harmful_wrong_promoted":
             values["wrong_promoted"] += 1
@@ -1353,40 +1459,22 @@ def _teacher_signal_error_breakdown(
             values["neutral"] += 1
     output: list[dict[str, Any]] = []
     for label, values in sorted(grouped.items()):
-        total = int(values["incorrect_tokens"])
+        total = int(values["incorrect_mutations"])
         promoted = int(values["wrong_promoted"])
         suppressed = int(values["wrong_suppressed"])
         output.append(
             {
-                "token_label": label,
-                "incorrect_tokens": total,
+                "mutation_relation": label,
+                "incorrect_mutations": total,
                 "wrong_promoted": promoted,
-                "wrong_promotion_rate": _ratio(promoted, total),
+                "wrong_mutation_promotion_rate": _ratio(promoted, total),
                 "wrong_suppressed": suppressed,
-                "wrong_suppression_rate": _ratio(suppressed, total),
+                "wrong_mutation_suppression_rate": _ratio(suppressed, total),
                 "neutral": int(values["neutral"]),
                 "mean_delta_logp": float(values["delta_sum"]) / total,
             }
         )
     return output
-
-
-def _result_deletion_count(result: dict[str, Any]) -> int:
-    cached = result.get("_teacher_signal_unscored_deletion_characters")
-    if cached is not None:
-        return int(cached)
-    ground_truth = str(result.get("ground_truth", ""))
-    response_text = str(result.get("response", {}).get("text", ""))
-    if not ground_truth and not response_text:
-        return 0
-    normalized_gt = normalize_ocr_text(ground_truth)
-    normalized_response = normalize_ocr_text(response_text)
-    alignment = recover_relocated_matches(
-        normalized_gt.text,
-        normalized_response.text,
-        align_normalized_text(normalized_gt.text, normalized_response.text),
-    )
-    return int(alignment.deletions)
 
 
 def _build_teacher_signal_audit(
@@ -1412,13 +1500,11 @@ def _build_teacher_signal_audit(
     sample_summary: list[dict[str, Any]] = []
     for pair_id in pair_ids:
         pair_rows = rows_by_pair.get(pair_id, [])
-        result = result_by_pair.get(pair_id, {})
         report = str(pair_rows[0].get("sample_report", "")) if pair_rows else ""
         sample_summary.append(
             {
                 "pair_id": pair_id,
                 "sample_report": report,
-                "unscored_deletion_characters": _result_deletion_count(result),
                 **_teacher_signal_summary(
                     pair_rows,
                     threshold=selected_threshold,
@@ -1431,18 +1517,19 @@ def _build_teacher_signal_audit(
         for mutation in result.get("mutation_observations", [])
     )
     return {
-        "schema_version": 1,
+        "schema_version": 2,
         "created_at": _utc_now(),
         "selected_threshold": selected_threshold,
         "teacher_is_same_model_under_privileged_context": True,
-        "signal_delta": "logp_teacher_minus_original",
+        "audit_unit": "synthetic_mutation_word",
+        "only_mutations_included": True,
+        "signal_delta": "decision_token_logp_teacher_minus_original",
+        "decision_token_rule": "first_associated_response_token",
         "active_signal_rule": "abs(delta_logp) > threshold",
-        "correctness_reference": "normalized response-to-GT character alignment",
-        "formatting_tokens_excluded": True,
-        "completed_samples": len(pair_ids),
-        "unscored_deletion_characters": sum(
-            int(row["unscored_deletion_characters"]) for row in sample_summary
+        "correctness_reference": (
+            "mutation relation: expected=correct; opposite_variant/other=incorrect"
         ),
+        "completed_samples": len(pair_ids),
         "unscored_deleted_mutations": deleted_mutations,
         **selected_summary,
         "threshold_sweep": [
@@ -1489,11 +1576,10 @@ def rebuild_privileged_report(
             all_tokens.append({"pair_id": result["pair_id"], **row})
         for row in result["mutation_observations"]:
             all_mutations.append({"pair_id": result["pair_id"], **row})
-        prepared_rows, deletion_count = _prepare_teacher_signal_rows(
+        prepared_rows = _prepare_teacher_signal_mutation_rows(
             result,
             sample_report=relative_report.as_posix(),
         )
-        result["_teacher_signal_unscored_deletion_characters"] = deletion_count
         teacher_signal_rows.extend(prepared_rows)
 
     _write_csv(output_root / "token_probabilities.csv", all_tokens)
@@ -1520,8 +1606,23 @@ def rebuild_privileged_report(
         teacher_signal_audit,
     )
     _write_csv(
-        output_root / "teacher_signal_tokens.csv",
+        output_root / "teacher_signal_mutations.csv",
         teacher_signal_rows,
+    )
+    mutation_token_rows = [
+        {
+            "pair_id": row["pair_id"],
+            "mutation_id": row["mutation_id"],
+            "mutation_relation": row["mutation_relation"],
+            "correctness": row["correctness"],
+            **dict(token),
+        }
+        for row in teacher_signal_rows
+        for token in row.get("response_tokens", [])
+    ]
+    _write_csv(
+        output_root / "teacher_signal_tokens.csv",
+        mutation_token_rows,
     )
     _write_csv(
         output_root / "teacher_signal_sample_summary.csv",
@@ -1734,10 +1835,21 @@ def _audit_top1_relation_label(value: str) -> str:
 
 def _audit_error_label(value: str) -> str:
     return {
-        "mutation_opposite_variant": "变异词读回原词",
-        "mutation_other": "变异词其他误读",
-        "hallucinated_substitution": "普通替换错误",
-        "hallucinated_insertion": "额外插入",
+        "expected": "正确读出图片 / GT 变异词",
+        "opposite_variant": "错误读回变异前原词",
+        "other": "变异词其他误读",
+        "deleted": "变异词漏读",
+    }.get(value, value)
+
+
+def _audit_signal_class_label(value: str) -> str:
+    return {
+        "correct_reinforced": "正确变异词被强化",
+        "harmful_correct_suppressed": "有害：正确变异词被抑制",
+        "harmful_wrong_promoted": "有害：错误读回被强化",
+        "wrong_suppressed": "错误读回被抑制",
+        "neutral": "中性",
+        "excluded": "无法打分",
     }.get(value, value)
 
 
@@ -1745,14 +1857,14 @@ def _audit_threshold_row(row: dict[str, Any]) -> str:
     return (
         "<tr>"
         f"<td>{float(row['threshold']):.2f}</td>"
-        f"<td>{int(row['active_signal_tokens'])}</td>"
+        f"<td>{int(row['active_signal_mutations'])}</td>"
         f"<td>{int(row['harmful_correct_suppressed'])}</td>"
-        f"<td>{_audit_rate(row['correct_suppression_rate'])}</td>"
+        f"<td>{_audit_rate(row['correct_mutation_suppression_rate'])}</td>"
         f"<td>{int(row['harmful_wrong_promoted'])}</td>"
-        f"<td>{_audit_rate(row['wrong_promotion_rate'])}</td>"
+        f"<td>{_audit_rate(row['wrong_mutation_promotion_rate'])}</td>"
         f"<td>{int(row['harmful_signal_count'])}</td>"
         f"<td>{_audit_rate(row['harmful_signal_rate'])}</td>"
-        f"<td>{int(row['neutral_tokens'])}</td>"
+        f"<td>{int(row['neutral_mutations'])}</td>"
         "</tr>"
     )
 
@@ -1760,13 +1872,13 @@ def _audit_threshold_row(row: dict[str, Any]) -> str:
 def _audit_error_type_row(row: dict[str, Any]) -> str:
     return (
         "<tr>"
-        f"<td>{html.escape(_audit_error_label(str(row['token_label'])))}</td>"
-        f"<td><code>{html.escape(str(row['token_label']))}</code></td>"
-        f"<td>{int(row['incorrect_tokens'])}</td>"
+        f"<td>{html.escape(_audit_error_label(str(row['mutation_relation'])))}</td>"
+        f"<td><code>{html.escape(str(row['mutation_relation']))}</code></td>"
+        f"<td>{int(row['incorrect_mutations'])}</td>"
         f"<td class='harmful-text'>{int(row['wrong_promoted'])}</td>"
-        f"<td>{_audit_rate(row['wrong_promotion_rate'])}</td>"
+        f"<td>{_audit_rate(row['wrong_mutation_promotion_rate'])}</td>"
         f"<td class='helpful-text'>{int(row['wrong_suppressed'])}</td>"
-        f"<td>{_audit_rate(row['wrong_suppression_rate'])}</td>"
+        f"<td>{_audit_rate(row['wrong_mutation_suppression_rate'])}</td>"
         f"<td>{int(row['neutral'])}</td>"
         f"<td class='{_delta_class(row['mean_delta_logp'])}'>"
         f"{float(row['mean_delta_logp']):+.4f}</td>"
@@ -1786,13 +1898,14 @@ def _audit_sample_row(row: dict[str, Any]) -> str:
     return (
         "<tr>"
         f"<td>{pair_cell}</td>"
-        f"<td>{int(row['evaluable_tokens'])}</td>"
-        f"<td>{int(row['incorrect_tokens'])}</td>"
+        f"<td>{int(row['total_mutations'])}</td>"
+        f"<td>{int(row['evaluable_mutations'])}</td>"
+        f"<td>{int(row['incorrect_mutations'])}</td>"
         f"<td class='harmful-text'>{int(row['harmful_correct_suppressed'])}</td>"
         f"<td class='harmful-text'>{int(row['harmful_wrong_promoted'])}</td>"
         f"<td>{int(row['harmful_signal_count'])}</td>"
         f"<td>{_audit_rate(row['harmful_signal_rate'])}</td>"
-        f"<td>{int(row['unscored_deletion_characters'])}</td>"
+        f"<td>{int(row['unscored_mutations'])}</td>"
         "</tr>"
     )
 
@@ -1802,29 +1915,53 @@ def _audit_example_row(row: dict[str, Any]) -> str:
     teacher_top = _display_token(str(row.get("top_raw_token_teacher", "")))
     report = str(row.get("sample_report", ""))
     index = int(row.get("index", -1))
-    target = f"{report}#token-{index}" if report else ""
+    target = f"{report}#token-{index}" if report and index >= 0 else ""
     location = (
         f"<a href='{html.escape(target, quote=True)}' target='_blank'>查看</a>"
         if target
         else "-"
     )
-    mutation_ids = str(row.get("mutation_ids", "")) or "-"
+    response_tokens = list(row.get("response_tokens", []))
+    response_token_text = (
+        " ".join(
+            f"#{int(item.get('index', -1))}:{_display_token(str(item.get('token', '')))}"
+            for item in response_tokens
+        )
+        or "-"
+    )
+    p_original = row.get("p_original")
+    p_teacher = row.get("p_teacher")
+    delta_logp = row.get("delta_logp_teacher_minus_original")
+    teacher_top_id = int(row.get("top_token_id_teacher", -1))
+    teacher_top_p = row.get("top_p_teacher")
+    teacher_top_display = (
+        f"<code>{html.escape(teacher_top) or '&lt;empty&gt;'}</code><br>"
+        f"<small>ID {teacher_top_id} · p {float(teacher_top_p):.6f}</small>"
+        if teacher_top_p is not None and teacher_top_id >= 0
+        else "-"
+    )
+    decision_display = (
+        f"#{index} · ID {int(row.get('token_id', -1))}<br>"
+        f"<code>{html.escape(token) or '&lt;empty&gt;'}</code><br>"
+        f"<small>{html.escape(response_token_text)}</small>"
+        if index >= 0
+        else "未对齐到 Response token"
+    )
     return (
         "<tr>"
         f"<td>{html.escape(str(row.get('pair_id', '')))}</td>"
-        f"<td>#{index}<br><small>ID {int(row.get('token_id', -1))}</small></td>"
-        f"<td><code>{html.escape(token) or '&lt;empty&gt;'}</code></td>"
-        f"<td><code>{html.escape(str(row.get('aligned_gt_piece', ''))) or '-'}"
-        "</code></td>"
-        f"<td>{html.escape(_audit_error_label(str(row.get('token_label', ''))))}"
-        f"<br><small>{html.escape(mutation_ids)}</small></td>"
-        f"<td>{float(row['p_original']):.6f}</td>"
-        f"<td>{float(row['p_teacher']):.6f}</td>"
-        f"<td class='{_delta_class(row['delta_logp_teacher_minus_original'])}'>"
-        f"{float(row['delta_logp_teacher_minus_original']):+.4f}</td>"
-        f"<td><code>{html.escape(teacher_top) or '&lt;empty&gt;'}</code>"
-        f"<br><small>ID {int(row.get('top_token_id_teacher', -1))} · "
-        f"p {float(row.get('top_p_teacher', 0.0)):.6f}</small></td>"
+        f"<td><code>{html.escape(str(row.get('mutation_id', '')))}</code></td>"
+        f"<td><code>{html.escape(str(row.get('origin_ans', '')))}</code></td>"
+        f"<td><code>{html.escape(str(row.get('ocr_ans', '')))}</code></td>"
+        f"<td><code>{html.escape(str(row.get('predicted', ''))) or '-'}</code></td>"
+        f"<td>{html.escape(_audit_error_label(str(row.get('mutation_relation', ''))))}</td>"
+        f"<td>{html.escape(_audit_signal_class_label(str(row.get('teacher_signal_class', 'excluded'))))}</td>"
+        f"<td>{decision_display}</td>"
+        f"<td>{_optional_float(p_original)}</td>"
+        f"<td>{_optional_float(p_teacher)}</td>"
+        f"<td class='{_delta_class(delta_logp)}'>"
+        f"{_optional_float(delta_logp, signed=True)}</td>"
+        f"<td>{teacher_top_display}</td>"
         f"<td>{html.escape(_audit_top1_relation_label(_teacher_top1_relation(row)))}</td>"
         f"<td>{location}</td>"
         "</tr>"
@@ -1839,10 +1976,10 @@ def _audit_examples_table(
     body = "".join(_audit_example_row(row) for row in rows)
     if not body:
         body = (
-            f"<tr><td colspan='11' class='empty'>{html.escape(empty_message)}</td></tr>"
+            f"<tr><td colspan='14' class='empty'>{html.escape(empty_message)}</td></tr>"
         )
     return f"""<div class="audit-table-scroll"><table class="examples-table">
-<thead><tr><th>样本</th><th>位置</th><th>Response token</th><th>对齐 GT</th><th>错误标签 / 变异</th><th>p original</th><th>p teacher</th><th>Δlogp</th><th>Teacher Top-1</th><th>Top-1 关系</th><th>原页面</th></tr></thead>
+<thead><tr><th>样本</th><th>变异 ID</th><th>变异前原词</th><th>图片 / GT 变异词</th><th>模型读回</th><th>读回关系</th><th>教师信号分类</th><th>决策 token / 全部关联 token</th><th>p original</th><th>p teacher</th><th>决策 Δlogp</th><th>Teacher Top-1</th><th>Top-1 关系</th><th>原页面</th></tr></thead>
 <tbody>{body}</tbody></table></div>"""
 
 
@@ -1851,19 +1988,24 @@ def _render_teacher_signal_audit_html(
     audit_rows: Sequence[dict[str, Any]],
 ) -> str:
     threshold = float(audit["selected_threshold"])
+    classified_rows = _classify_teacher_signal_rows(
+        audit_rows,
+        threshold=threshold,
+    )
+    all_mutations = sorted(
+        classified_rows,
+        key=lambda row: (
+            str(row.get("pair_id", "")),
+            str(row.get("mutation_id", "")),
+        ),
+    )
     example_limit = 200
     wrong_promoted = nlargest(
         example_limit,
         (
             row
-            for row in audit_rows
-            if _teacher_signal_class_and_quality(
-                _teacher_signal_correctness(row),
-                _teacher_signal_direction(
-                    float(row["delta_logp_teacher_minus_original"]), threshold
-                ),
-            )[0]
-            == "harmful_wrong_promoted"
+            for row in classified_rows
+            if row["teacher_signal_class"] == "harmful_wrong_promoted"
         ),
         key=lambda row: float(row["delta_logp_teacher_minus_original"]),
     )
@@ -1871,14 +2013,8 @@ def _render_teacher_signal_audit_html(
         example_limit,
         (
             row
-            for row in audit_rows
-            if _teacher_signal_class_and_quality(
-                _teacher_signal_correctness(row),
-                _teacher_signal_direction(
-                    float(row["delta_logp_teacher_minus_original"]), threshold
-                ),
-            )[0]
-            == "harmful_correct_suppressed"
+            for row in classified_rows
+            if row["teacher_signal_class"] == "harmful_correct_suppressed"
         ),
         key=lambda row: float(row["delta_logp_teacher_minus_original"]),
     )
@@ -1889,7 +2025,7 @@ def _render_teacher_signal_audit_html(
     )
     error_rows = (
         "".join(_audit_error_type_row(row) for row in audit["error_type_breakdown"])
-        or "<tr><td colspan='9' class='empty'>没有对齐到错误 Response token</td></tr>"
+        or "<tr><td colspan='9' class='empty'>没有读错的可打分变异词</td></tr>"
     )
     top1_counts = dict(audit["wrong_promotion_teacher_top1_relation_counts"])
     top1_rows = (
@@ -1902,7 +2038,7 @@ def _render_teacher_signal_audit_html(
             "</tr>"
             for relation, count in top1_counts.items()
         )
-        or "<tr><td colspan='4' class='empty'>当前阈值下没有错误 token 被强化</td></tr>"
+        or "<tr><td colspan='4' class='empty'>当前阈值下没有错误变异词被强化</td></tr>"
     )
     sample_rows = "".join(
         _audit_sample_row(row)
@@ -1910,22 +2046,23 @@ def _render_teacher_signal_audit_html(
             audit["sample_summary"],
             key=lambda row: (
                 int(row["harmful_signal_count"]),
-                int(row["incorrect_tokens"]),
+                int(row["incorrect_mutations"]),
             ),
             reverse=True,
         )
     )
     metrics = "".join(
         [
-            _audit_metric("有效 Response token", audit["evaluable_tokens"]),
-            _audit_metric("错误 Response token", audit["incorrect_tokens"]),
+            _audit_metric("人工变异词", audit["total_mutations"]),
+            _audit_metric("可打分变异词", audit["evaluable_mutations"]),
+            _audit_metric("模型读错变异词", audit["incorrect_mutations"]),
             _audit_metric(
-                "正确 token 被抑制",
+                "正确变异词被抑制",
                 audit["harmful_correct_suppressed"],
                 tone="harmful",
             ),
             _audit_metric(
-                "错误 token 被强化",
+                "错误变异词被强化",
                 audit["harmful_wrong_promoted"],
                 tone="harmful",
             ),
@@ -1934,35 +2071,36 @@ def _render_teacher_signal_audit_html(
                 audit["harmful_signal_rate"],
                 tone="harmful",
             ),
-            _audit_metric("中性 token", audit["neutral_tokens"], tone="neutral"),
+            _audit_metric("中性变异词", audit["neutral_mutations"], tone="neutral"),
             _audit_metric(
-                "无法打分的漏字字符",
-                audit["unscored_deletion_characters"],
+                "无法打分的变异词",
+                audit["unscored_mutations"],
                 tone="warning",
             ),
         ]
     )
-    correct_count = int(audit["correct_tokens"])
-    incorrect_count = int(audit["incorrect_tokens"])
+    correct_count = int(audit["correct_mutations"])
+    incorrect_count = int(audit["incorrect_mutations"])
     return f"""<!doctype html>
 <html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
-<title>GT Teacher 信号质量审计</title>{_teacher_signal_audit_css()}</head><body><main>
-<nav><a href="report.html">逐 Token 原始可视化</a><a href="teacher_signal_tokens.csv">全量审计 Token CSV</a><a href="teacher_signal_sample_summary.csv">样本统计 CSV</a><a href="teacher_signal_audit.json">审计 JSON</a></nav>
-<header><h1>GT Teacher 信号质量审计</h1><p>同一组固定 Response ID：比较原图条件与 GT 特权条件下的 token 对数概率。当前有效信号阈值为 <code>|Δlogp| &gt; {threshold:.2f}</code>。</p></header>
+<title>变异词 GT Teacher 信号质量审计</title>{_teacher_signal_audit_css()}</head><body><main>
+<nav><a href="report.html">逐 Token 原始可视化</a><a href="teacher_signal_mutations.csv">变异词审计 CSV</a><a href="teacher_signal_sample_summary.csv">样本统计 CSV</a><a href="teacher_signal_audit.json">审计 JSON</a></nav>
+<header><h1>变异词 GT Teacher 信号质量审计</h1><p>仅分析人工变异词，每个变异词统计一次。信号取该词第一个关联 Response token 的 <code>Δlogp</code>，当前有效阈值为 <code>|Δlogp| &gt; {threshold:.2f}</code>。</p></header>
 <section aria-labelledby="overview"><h2 id="overview">总体结果</h2><div class="audit-metrics">{metrics}</div></section>
-<section aria-labelledby="quadrants"><h2 id="quadrants">教师信号四象限</h2>
-<div class="audit-table-scroll"><table class="matrix"><thead><tr><th>学生 token</th><th>Teacher 提高概率</th><th>Teacher 降低概率</th><th>中性</th></tr></thead><tbody>
-<tr><th>与 GT 一致<br><small>{correct_count} tokens</small></th>{_audit_matrix_cell(int(audit["correct_reinforced"]), correct_count, tone="helpful", label="正确强化", internal_label="correct_reinforced")}{_audit_matrix_cell(int(audit["harmful_correct_suppressed"]), correct_count, tone="harmful", label="有害：正确被抑制", internal_label="harmful_correct_suppressed")}{_audit_matrix_cell(int(audit["neutral_correct_tokens"]), correct_count, tone="neutral", label="变化不足阈值", internal_label="neutral")}</tr>
-<tr><th>与 GT 不一致<br><small>{incorrect_count} tokens</small></th>{_audit_matrix_cell(int(audit["harmful_wrong_promoted"]), incorrect_count, tone="harmful", label="有害：错误被强化", internal_label="harmful_wrong_promoted")}{_audit_matrix_cell(int(audit["wrong_suppressed"]), incorrect_count, tone="helpful", label="错误被抑制", internal_label="wrong_suppressed")}{_audit_matrix_cell(int(audit["neutral_incorrect_tokens"]), incorrect_count, tone="neutral", label="变化不足阈值", internal_label="neutral")}</tr>
+<section aria-labelledby="quadrants"><h2 id="quadrants">变异词教师信号四象限</h2>
+<div class="audit-table-scroll"><table class="matrix"><thead><tr><th>学生对变异词的读回</th><th>Teacher 提高决策 token 概率</th><th>Teacher 降低决策 token 概率</th><th>中性</th></tr></thead><tbody>
+<tr><th>读对图片 / GT 变异词<br><small>{correct_count} mutations</small></th>{_audit_matrix_cell(int(audit["correct_reinforced"]), correct_count, tone="helpful", label="正确变异词被强化", internal_label="correct_reinforced")}{_audit_matrix_cell(int(audit["harmful_correct_suppressed"]), correct_count, tone="harmful", label="有害：正确变异词被抑制", internal_label="harmful_correct_suppressed")}{_audit_matrix_cell(int(audit["neutral_correct_mutations"]), correct_count, tone="neutral", label="变化不足阈值", internal_label="neutral")}</tr>
+<tr><th>读错变异词<br><small>{incorrect_count} mutations</small></th>{_audit_matrix_cell(int(audit["harmful_wrong_promoted"]), incorrect_count, tone="harmful", label="有害：错误读回被强化", internal_label="harmful_wrong_promoted")}{_audit_matrix_cell(int(audit["wrong_suppressed"]), incorrect_count, tone="helpful", label="错误读回被抑制", internal_label="wrong_suppressed")}{_audit_matrix_cell(int(audit["neutral_incorrect_mutations"]), incorrect_count, tone="neutral", label="变化不足阈值", internal_label="neutral")}</tr>
 </tbody></table></div>
-<p class="footnote">有害信号率的分母只包含超过阈值的活跃信号；纯 Markdown 格式 token 被排除。</p></section>
-<section aria-labelledby="sensitivity"><h2 id="sensitivity">阈值敏感性</h2><div class="audit-table-scroll"><table><thead><tr><th>τ（|Δlogp|）</th><th>活跃信号</th><th>正确被抑制</th><th>正确抑制率</th><th>错误被强化</th><th>错误强化率</th><th>有害信号</th><th>有害信号率</th><th>中性</th></tr></thead><tbody>{threshold_rows}</tbody></table></div></section>
-<section aria-labelledby="errors"><h2 id="errors">错误类型</h2><div class="audit-table-scroll"><table><thead><tr><th>错误类型</th><th>内部标签</th><th>错误 token</th><th>被强化</th><th>强化率</th><th>被抑制</th><th>抑制率</th><th>中性</th><th>平均 Δlogp</th></tr></thead><tbody>{error_rows}</tbody></table></div></section>
-<section aria-labelledby="top1"><h2 id="top1">错误被强化时的 Teacher Top-1</h2><div class="audit-table-scroll compact"><table><thead><tr><th>Top-1 与 Response/GT 的关系</th><th>内部标签</th><th>数量</th><th>占错误强化比例</th></tr></thead><tbody>{top1_rows}</tbody></table></div></section>
-<section aria-labelledby="harmful-wrong"><div class="section-heading"><h2 id="harmful-wrong">有害案例：错误 token 被强化</h2><span>显示 {len(wrong_promoted)} / {wrong_promoted_total}</span></div>{_audit_examples_table(wrong_promoted, empty_message="当前阈值下没有错误 token 被强化")}</section>
-<section aria-labelledby="harmful-correct"><div class="section-heading"><h2 id="harmful-correct">有害案例：正确 token 被抑制</h2><span>显示 {len(correct_suppressed)} / {correct_suppressed_total}</span></div>{_audit_examples_table(correct_suppressed, empty_message="当前阈值下没有正确 token 被抑制")}</section>
-<section aria-labelledby="samples"><h2 id="samples">按样本统计</h2><div class="audit-table-scroll"><table><thead><tr><th>样本</th><th>有效 token</th><th>错误 token</th><th>正确被抑制</th><th>错误被强化</th><th>有害信号</th><th>有害信号率</th><th>漏字字符</th></tr></thead><tbody>{sample_rows}</tbody></table></div></section>
-<section class="method" aria-labelledby="scope"><h2 id="scope">统计边界</h2><p>“正确/错误”来自去除 Markdown/HTML 布局符号后的 Response-GT 字符对齐；一个多字符 token 只要包含替换或插入字符，就按错误 token 统计。Teacher 是同一模型在 GT 特权 prompt 下的条件分布，不是独立模型。</p><p>漏字在固定 Response ID 中没有对应 token，因此不进入四象限；本批次共有 <strong>{int(audit["unscored_deletion_characters"])}</strong> 个未打分漏字字符、<strong>{int(audit["unscored_deleted_mutations"])}</strong> 个未读出的定向变异。</p></section>
+<p class="footnote">有害信号率的分母只包含超过阈值的可打分变异词；一个变异词即使对应多个 tokenizer token，也只计数一次。</p></section>
+<section aria-labelledby="sensitivity"><h2 id="sensitivity">阈值敏感性</h2><div class="audit-table-scroll"><table><thead><tr><th>τ（决策 token |Δlogp|）</th><th>活跃变异词</th><th>正确变异词被抑制</th><th>正确抑制率</th><th>错误读回被强化</th><th>错误强化率</th><th>有害信号</th><th>有害信号率</th><th>中性变异词</th></tr></thead><tbody>{threshold_rows}</tbody></table></div></section>
+<section aria-labelledby="errors"><h2 id="errors">错误读回类型</h2><div class="audit-table-scroll"><table><thead><tr><th>错误类型</th><th>内部关系</th><th>错误变异词</th><th>被强化</th><th>强化率</th><th>被抑制</th><th>抑制率</th><th>中性</th><th>平均决策 Δlogp</th></tr></thead><tbody>{error_rows}</tbody></table></div></section>
+<section aria-labelledby="top1"><h2 id="top1">错误变异词被强化时的 Teacher Top-1</h2><div class="audit-table-scroll compact"><table><thead><tr><th>Top-1 与决策 token/GT 的关系</th><th>内部标签</th><th>变异词数量</th><th>占错误强化比例</th></tr></thead><tbody>{top1_rows}</tbody></table></div></section>
+<section aria-labelledby="all-mutations"><div class="section-heading"><h2 id="all-mutations">全部人工变异词</h2><span>{len(all_mutations)} mutations</span></div>{_audit_examples_table(all_mutations, empty_message="没有人工变异词记录")}</section>
+<section aria-labelledby="harmful-wrong"><div class="section-heading"><h2 id="harmful-wrong">有害案例：错误变异词被强化</h2><span>显示 {len(wrong_promoted)} / {wrong_promoted_total}</span></div>{_audit_examples_table(wrong_promoted, empty_message="当前阈值下没有错误变异词被强化")}</section>
+<section aria-labelledby="harmful-correct"><div class="section-heading"><h2 id="harmful-correct">有害案例：正确变异词被抑制</h2><span>显示 {len(correct_suppressed)} / {correct_suppressed_total}</span></div>{_audit_examples_table(correct_suppressed, empty_message="当前阈值下没有正确变异词被抑制")}</section>
+<section aria-labelledby="samples"><h2 id="samples">按样本统计</h2><div class="audit-table-scroll"><table><thead><tr><th>样本</th><th>人工变异词</th><th>可打分</th><th>读错</th><th>正确被抑制</th><th>错误被强化</th><th>有害信号</th><th>有害信号率</th><th>无法打分</th></tr></thead><tbody>{sample_rows}</tbody></table></div></section>
+<section class="method" aria-labelledby="scope"><h2 id="scope">统计边界</h2><p>只纳入数据集标注的人工变异词：模型读出图片 / GT 中的 <code>ocr_ans</code> 记为正确；读回变异前 <code>origin_ans</code> 或其他文本记为错误。每个变异词使用第一个关联 Response token 作为决策 token，后续子 token 仅展示，不参与阈值判定。Teacher 是同一模型在 GT 特权 prompt 下的条件分布，不是独立模型。</p><p>未读出的变异词没有对应 Response token，因此不进入四象限；本批次共有 <strong>{int(audit["unscored_deleted_mutations"])}</strong> 个此类变异词。</p></section>
 </main></body></html>"""
 
 
@@ -2956,8 +3094,8 @@ def _build_parser() -> argparse.ArgumentParser:
         type=float,
         default=DEFAULT_TEACHER_SIGNAL_THRESHOLD,
         help=(
-            "Absolute delta-logp threshold used only by the separate "
-            "teacher_signal_audit.html report (default: 0.05)."
+            "Absolute decision-token delta-logp threshold used only by the "
+            "mutation-level teacher_signal_audit.html report (default: 0.05)."
         ),
     )
     parser.add_argument("--no-resume", action="store_true")

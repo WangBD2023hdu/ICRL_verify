@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import csv
 import json
 import math
 from html.parser import HTMLParser
@@ -244,9 +245,7 @@ def test_text_teacher_prompt_is_text_only_and_verbatim() -> None:
         prompt=prompt,
     )
 
-    assert bundle.tokenizer.messages == [
-        {"role": "user", "content": prompt}
-    ]
+    assert bundle.tokenizer.messages == [{"role": "user", "content": prompt}]
     assert inputs["input_ids"].tolist() == [[4, 5, 6]]
     assert "pixel_values" not in inputs
 
@@ -470,30 +469,102 @@ def test_sample_report_visualizes_mutations_and_keeps_complete_token_order() -> 
         rows,
         [
             [
-                {"rank": 1, "token_id": 7, "token": "A", "raw_token": "A", "probability": 0.6},
-                {"rank": 2, "token_id": 8, "token": "B", "raw_token": "B", "probability": 0.2},
+                {
+                    "rank": 1,
+                    "token_id": 7,
+                    "token": "A",
+                    "raw_token": "A",
+                    "probability": 0.6,
+                },
+                {
+                    "rank": 2,
+                    "token_id": 8,
+                    "token": "B",
+                    "raw_token": "B",
+                    "probability": 0.2,
+                },
             ],
             [
-                {"rank": 1, "token_id": 7, "token": "A", "raw_token": "A", "probability": 0.9},
-                {"rank": 2, "token_id": 8, "token": "B", "raw_token": "B", "probability": 0.05},
+                {
+                    "rank": 1,
+                    "token_id": 7,
+                    "token": "A",
+                    "raw_token": "A",
+                    "probability": 0.9,
+                },
+                {
+                    "rank": 2,
+                    "token_id": 8,
+                    "token": "B",
+                    "raw_token": "B",
+                    "probability": 0.05,
+                },
             ],
             [
-                {"rank": 1, "token_id": 8, "token": "B", "raw_token": "B", "probability": 0.7},
-                {"rank": 2, "token_id": 9, "token": "X", "raw_token": "X", "probability": 0.1},
+                {
+                    "rank": 1,
+                    "token_id": 8,
+                    "token": "B",
+                    "raw_token": "B",
+                    "probability": 0.7,
+                },
+                {
+                    "rank": 2,
+                    "token_id": 9,
+                    "token": "X",
+                    "raw_token": "X",
+                    "probability": 0.1,
+                },
             ],
         ],
         [
             [
-                {"rank": 1, "token_id": 8, "token": "B", "raw_token": "B", "probability": 0.4},
-                {"rank": 2, "token_id": 7, "token": "A", "raw_token": "A", "probability": 0.2},
+                {
+                    "rank": 1,
+                    "token_id": 8,
+                    "token": "B",
+                    "raw_token": "B",
+                    "probability": 0.4,
+                },
+                {
+                    "rank": 2,
+                    "token_id": 7,
+                    "token": "A",
+                    "raw_token": "A",
+                    "probability": 0.2,
+                },
             ],
             [
-                {"rank": 1, "token_id": 9, "token": "X", "raw_token": "X", "probability": 0.5},
-                {"rank": 2, "token_id": 7, "token": "A", "raw_token": "A", "probability": 0.3},
+                {
+                    "rank": 1,
+                    "token_id": 9,
+                    "token": "X",
+                    "raw_token": "X",
+                    "probability": 0.5,
+                },
+                {
+                    "rank": 2,
+                    "token_id": 7,
+                    "token": "A",
+                    "raw_token": "A",
+                    "probability": 0.3,
+                },
             ],
             [
-                {"rank": 1, "token_id": 9, "token": "X", "raw_token": "X", "probability": 0.8},
-                {"rank": 2, "token_id": 7, "token": "A", "raw_token": "A", "probability": 0.1},
+                {
+                    "rank": 1,
+                    "token_id": 9,
+                    "token": "X",
+                    "raw_token": "X",
+                    "probability": 0.8,
+                },
+                {
+                    "rank": 2,
+                    "token_id": 7,
+                    "token": "A",
+                    "raw_token": "A",
+                    "probability": 0.1,
+                },
             ],
         ],
     ):
@@ -614,10 +685,7 @@ def test_sample_report_visualizes_mutations_and_keeps_complete_token_order() -> 
         assert f"{p_original:.6f}" in cells[2]
         assert f"{p_teacher:.6f}" in cells[6]
         assert f"{p_teacher - p_original:+.6f}" in cells[10]
-        assert (
-            f"{math.log(p_teacher) - math.log(p_original):+.4f}"
-            in cells[11]
-        )
+        assert f"{math.log(p_teacher) - math.log(p_original):+.4f}" in cells[11]
 
     assert "0.200000" in parser.token_rows[0][1][2]
     assert "p 0.600000" in parser.token_rows[0][1][4]
@@ -698,26 +766,30 @@ def test_cli_contains_no_api_transport_arguments() -> None:
 def _teacher_signal_fixture() -> tuple[
     list[dict[str, object]], list[dict[str, object]]
 ]:
-    specs = [
-        ("A", "correct", 0.20, 0.32, 101, "A", 0.32, 1),
-        ("B", "correct", 0.32, 0.20, 900, "other", 0.70, 2),
-        ("C", "hallucinated_insertion", 0.18, 0.30, 103, "C", 0.30, 1),
-        ("D", "mutation_opposite_variant", 0.22, 0.34, 903, "other", 0.75, 2),
-        ("E", "hallucinated_substitution", 0.40, 0.30, 904, "other", 0.60, 2),
-        ("F", "correct", 0.50, 0.52, 106, "F", 0.52, 1),
-        (" ", "formatting", 0.10, 0.40, 907, "space", 0.40, 1),
+    token_specs = [
+        # m001 is deliberately multi-token. Its second subtoken moves in
+        # the opposite direction so an average would classify the mutation
+        # incorrectly; the first token is the decision token.
+        ("A", 0.20, 0.30, 101, "A", 0.30, 1, "m001"),
+        ("B", 0.20, 0.01, 102, "B", 0.01, 1, "m001"),
+        ("C", 0.30, 0.20, 9003, "X", 0.60, 2, "m002"),
+        ("D", 0.20, 0.30, 104, "D", 0.30, 1, "m003"),
+        ("E", 0.20, 0.30, 9005, "Z", 0.60, 2, "m004"),
+        ("F", 0.30, 0.20, 9006, "Y", 0.60, 2, "m005"),
+        ("G", 0.25, 0.26, 107, "G", 0.26, 1, "m006"),
+        ("Q", 0.90, 0.95, 108, "Q", 0.95, 1, ""),
     ]
     rows: list[dict[str, object]] = []
     for index, (
         raw_token,
-        token_label,
         p_original,
         p_teacher,
         top_id,
         top_token,
         top_p,
         teacher_rank,
-    ) in enumerate(specs):
+        mutation_id,
+    ) in enumerate(token_specs):
         token_id = 101 + index
         original = _score_record(
             token_id,
@@ -738,40 +810,79 @@ def _teacher_signal_fixture() -> tuple[
             target_rank=teacher_rank,
         )
         row = probe._combine_scores([token_id], [original], [teacher])[0]
-        excluded = token_label == "formatting"
         row.update(
             {
                 "pair_id": "pair-1",
                 "report": "samples/001_pair-1/report.html",
                 "sample_report": "samples/001_pair-1/report.html",
                 "index": index,
-                "token_label": token_label,
-                "is_hallucination": token_label not in {"correct", "formatting"},
-                "lexical_role": "formatting" if excluded else "word_initial",
-                "normalized_piece": "" if excluded else raw_token,
-                "normalized_char_count": 0 if excluded else 1,
-                "script": "formatting" if excluded else "latin",
+                "raw_source_start": index,
+                "raw_source_end": index + 1,
+                "mutation_ids": mutation_id,
             }
         )
         rows.append(row)
 
+    mutation_specs = [
+        ("m001", "opposite_variant", "AB", "BA", "BA", [0, 1], [0, 2]),
+        ("m002", "expected", "C", "c0", "C", [2], [2, 3]),
+        ("m003", "expected", "D", "d0", "D", [3], [3, 4]),
+        ("m004", "other", "E", "e0", "Z", [4], [4, 5]),
+        ("m005", "opposite_variant", "F", "f0", "F", [5], [5, 6]),
+        ("m006", "expected", "G", "g0", "G", [6], [6, 7]),
+        ("m007", "deleted", "H", "h0", "", [], [7, 8]),
+    ]
+    mutations = [
+        {
+            "mutation_id": mutation_id,
+            "ocr_ans": ocr_ans,
+            "origin_ans": origin_ans,
+            "bbox": [index, 0, index + 1, 1],
+            "predicted": predicted,
+            "relation": relation,
+            "response_token_indices": response_token_indices,
+        }
+        for index, (
+            mutation_id,
+            relation,
+            ocr_ans,
+            origin_ans,
+            predicted,
+            response_token_indices,
+            _,
+        ) in enumerate(mutation_specs)
+    ]
     result = {
         "pair_id": "pair-1",
-        "sample": {"image_copy": "input.png", "changes": []},
-        "ground_truth": "ABCDEF",
+        "sample": {
+            "image_copy": "input.png",
+            "changes": [
+                {
+                    "ocr_ans": ocr_ans,
+                    "origin_ans": origin_ans,
+                    "markdown_span": markdown_span,
+                }
+                for _, _, ocr_ans, origin_ans, _, _, markdown_span in mutation_specs
+            ],
+        },
+        "ground_truth": "ABCDEFGHQ",
         "response": {
-            "text": "ABCDEF ",
+            "text": "ABCDEFGQ",
             "token_ids": [int(row["token_id"]) for row in rows],
             "finish_reason": "stop",
         },
         "summary": {"token_count": len(rows)},
-        "mutation_observations": [],
+        "mutation_observations": mutations,
         "tokens": [dict(row) for row in rows],
     }
-    return [result], rows
+    audit_rows = probe._prepare_teacher_signal_mutation_rows(
+        result,
+        sample_report="samples/001_pair-1/report.html",
+    )
+    return [result], audit_rows
 
 
-def _audit_value(audit: dict[str, object], *keys: str) -> object:
+def _audit_value(audit: dict[str, object], key: str) -> object:
     sections: list[dict[str, object]] = [audit]
     for section_name in (
         "counts",
@@ -787,29 +898,51 @@ def _audit_value(audit: dict[str, object], *keys: str) -> object:
         section = audit.get(section_name)
         if isinstance(section, dict):
             sections.append(section)
-    for key in keys:
-        for section in sections:
-            if key in section:
-                return section[key]
-    raise AssertionError(f"audit does not report any of {keys!r}")
+    for section in sections:
+        if key in section:
+            return section[key]
+    raise AssertionError(f"audit does not report {key!r}")
 
 
-def _audit_count(audit: dict[str, object], *keys: str) -> int:
-    value = _audit_value(audit, *keys)
+def _audit_count(audit: dict[str, object], key: str) -> int:
+    value = _audit_value(audit, key)
     assert isinstance(value, (int, float)) and not isinstance(value, bool)
     return int(value)
 
 
-def _relation_count(relation: dict[str, object], *keys: str) -> int:
-    for key in keys:
-        value = relation.get(key)
-        if isinstance(value, (int, float)) and not isinstance(value, bool):
-            return int(value)
-    raise AssertionError(f"relation does not report any of {keys!r}")
-
-
-def test_teacher_signal_audit_classifies_lexical_tokens_and_denominators() -> None:
+def test_teacher_signal_audit_classifies_mutations_and_uses_decision_token() -> None:
     results, audit_rows = _teacher_signal_fixture()
+    result = results[0]
+    mutation_observations = result["mutation_observations"]
+    assert isinstance(mutation_observations, list)
+
+    assert len(audit_rows) == 7
+    assert len(result["tokens"]) == 8
+    assert [str(row["mutation_id"]) for row in audit_rows] == [
+        str(mutation["mutation_id"]) for mutation in mutation_observations
+    ]
+    assert all("token_label" not in row for row in audit_rows)
+
+    multi_token_row = audit_rows[0]
+    assert multi_token_row["mutation_relation"] == "opposite_variant"
+    assert multi_token_row["response_token_indices"] == [0, 1]
+    assert multi_token_row["response_token_count"] == 2
+    assert multi_token_row["score_unit"] == "first_associated_response_token"
+    assert multi_token_row["index"] == 0
+    response_tokens = multi_token_row["response_tokens"]
+    assert isinstance(response_tokens, list)
+    assert len(response_tokens) == 2
+    decision_delta = float(multi_token_row["delta_logp_teacher_minus_original"])
+    first_token_delta = float(response_tokens[0]["delta_logp_teacher_minus_original"])
+    span_mean_delta = float(multi_token_row["span_delta_mean_logp"])
+    assert decision_delta == pytest.approx(first_token_delta)
+    assert not math.isclose(decision_delta, span_mean_delta)
+
+    deleted_row = audit_rows[-1]
+    assert deleted_row["mutation_relation"] == "deleted"
+    assert deleted_row["response_token_indices"] == []
+    assert deleted_row["delta_logp_teacher_minus_original"] is None
+    assert deleted_row["correctness"] == "excluded"
 
     audit = probe._build_teacher_signal_audit(
         results,
@@ -818,21 +951,25 @@ def test_teacher_signal_audit_classifies_lexical_tokens_and_denominators() -> No
     )
 
     assert _audit_value(audit, "selected_threshold") == pytest.approx(0.05)
-    assert _audit_count(audit, "total_tokens", "total_rows") == 7
-    assert _audit_count(audit, "evaluable_tokens", "lexical_tokens") == 6
-    assert _audit_count(audit, "correct_tokens", "correct_token_count") == 3
-    assert _audit_count(audit, "incorrect_tokens", "incorrect_token_count") == 3
-    assert _audit_count(audit, "excluded_tokens", "excluded_token_count") == 1
+    assert _audit_count(audit, "total_mutations") == 7
+    assert _audit_count(audit, "evaluable_mutations") == 6
+    assert _audit_count(audit, "correct_mutations") == 3
+    assert _audit_count(audit, "incorrect_mutations") == 3
+    assert _audit_count(audit, "unscored_mutations") == 1
+    assert _audit_count(audit, "active_signal_mutations") == 5
 
     assert _audit_count(audit, "correct_reinforced") == 1
     assert _audit_count(audit, "harmful_correct_suppressed") == 1
     assert _audit_count(audit, "harmful_wrong_promoted") == 2
     assert _audit_count(audit, "wrong_suppressed") == 1
-    assert _audit_count(audit, "neutral", "neutral_tokens") == 1
+    assert _audit_count(audit, "neutral_mutations") == 1
+    assert _audit_count(audit, "harmful_signal_count") == 3
 
     assert _audit_value(audit, "harmful_signal_rate") == pytest.approx(3 / 5)
-    assert _audit_value(audit, "correct_suppression_rate") == pytest.approx(1 / 3)
-    assert _audit_value(audit, "wrong_promotion_rate") == pytest.approx(2 / 3)
+    assert _audit_value(audit, "correct_mutation_suppression_rate") == pytest.approx(
+        1 / 3
+    )
+    assert _audit_value(audit, "wrong_mutation_promotion_rate") == pytest.approx(2 / 3)
 
     threshold_sweep = _audit_value(audit, "threshold_sweep")
     assert isinstance(threshold_sweep, list)
@@ -840,42 +977,24 @@ def test_teacher_signal_audit_classifies_lexical_tokens_and_denominators() -> No
     assert any(
         isinstance(point, dict)
         and math.isclose(float(point["threshold"]), 0.05)
+        and point["total_mutations"] == 7
         for point in threshold_sweep
     )
 
-    error_breakdown = _audit_value(
-        audit,
-        "error_label_breakdown",
-        "error_type_breakdown",
-    )
+    error_breakdown = _audit_value(audit, "error_type_breakdown")
     assert isinstance(error_breakdown, list)
-    errors_by_label = {
-        str(row["token_label"]): row for row in error_breakdown
-    }
-    assert errors_by_label["hallucinated_insertion"]["incorrect_tokens"] == 1
-    assert errors_by_label["mutation_opposite_variant"]["incorrect_tokens"] == 1
-    assert errors_by_label["hallucinated_substitution"]["incorrect_tokens"] == 1
+    errors_by_relation = {str(row["mutation_relation"]): row for row in error_breakdown}
+    assert errors_by_relation["opposite_variant"]["incorrect_mutations"] == 2
+    assert errors_by_relation["opposite_variant"]["wrong_promoted"] == 1
+    assert errors_by_relation["opposite_variant"]["wrong_suppressed"] == 1
+    assert errors_by_relation["other"]["incorrect_mutations"] == 1
 
-    top1_relation = _audit_value(
-        audit,
-        "harmful_wrong_teacher_top1_relation",
-        "harmful_wrong_top1_relation",
-        "wrong_promotion_teacher_top1_relation_counts",
-    )
+    top1_relation = _audit_value(audit, "wrong_promotion_teacher_top1_relation_counts")
     assert isinstance(top1_relation, dict)
-    assert _relation_count(
-        top1_relation,
-        "response_token_top1",
-        "same_response_id",
-    ) == 1
-    assert _relation_count(
-        top1_relation,
-        "different_surface_top1",
-        "different_surface",
-    ) == 1
+    assert top1_relation == {"same_response_id": 1, "different_surface": 1}
 
 
-def test_teacher_signal_audit_html_is_standalone_and_links_sample_tokens() -> None:
+def test_teacher_signal_audit_html_is_standalone_and_links_mutation_decisions() -> None:
     results, audit_rows = _teacher_signal_fixture()
     audit = probe._build_teacher_signal_audit(
         results,
@@ -890,15 +1009,20 @@ def test_teacher_signal_audit_html_is_standalone_and_links_sample_tokens() -> No
     assert "</html>" in rendered
     assert "0.05" in rendered
     for label in (
-        "正确强化",
-        "有害：正确被抑制",
-        "有害：错误被强化",
-        "错误被抑制",
+        "正确变异词被强化",
+        "有害：正确变异词被抑制",
+        "有害：错误读回被强化",
+        "错误读回被抑制",
     ):
         assert label in rendered
+    assert "变异词" in rendered
+    assert "有效 Response token" not in rendered
+    assert "全量审计 Token CSV" not in rendered
+    assert "teacher_signal_mutations.csv" in rendered
     assert "Teacher Top-1" in rendered
-    assert "samples/001_pair-1/report.html#token-2" in rendered
-    assert "samples/001_pair-1/report.html#token-3" in rendered
+    for decision_index in (0, 3, 4):
+        assert f"samples/001_pair-1/report.html#token-{decision_index}" in rendered
+    assert "samples/001_pair-1/report.html#token-1" not in rendered
 
 
 def test_rebuild_privileged_report_writes_teacher_signal_artifacts(
@@ -921,12 +1045,13 @@ def test_rebuild_privileged_report_writes_teacher_signal_artifacts(
         "finish_reason": "stop",
         **results[0]["summary"],
     }
-    assert (output_dir / "report.html").read_text(encoding="utf-8") == probe._render_aggregate_html(
-        [expected_sample_row]
-    )
+    assert (output_dir / "report.html").read_text(
+        encoding="utf-8"
+    ) == probe._render_aggregate_html([expected_sample_row])
     for filename in (
         "teacher_signal_audit.html",
         "teacher_signal_audit.json",
+        "teacher_signal_mutations.csv",
         "teacher_signal_tokens.csv",
         "teacher_signal_sample_summary.csv",
     ):
@@ -936,6 +1061,32 @@ def test_rebuild_privileged_report_writes_teacher_signal_artifacts(
         (output_dir / "teacher_signal_audit.json").read_text(encoding="utf-8")
     )
     assert _audit_value(audit, "selected_threshold") == pytest.approx(0.05)
+    assert _audit_count(audit, "total_mutations") == 7
+
+    with (output_dir / "teacher_signal_mutations.csv").open(
+        encoding="utf-8", newline=""
+    ) as handle:
+        mutation_rows = list(csv.DictReader(handle))
+    assert len(mutation_rows) == 7
+    assert {row["mutation_id"] for row in mutation_rows} == {
+        f"m{index:03d}" for index in range(1, 8)
+    }
+
+    with (output_dir / "teacher_signal_tokens.csv").open(
+        encoding="utf-8", newline=""
+    ) as handle:
+        mutation_token_rows = list(csv.DictReader(handle))
+    assert len(mutation_token_rows) == 7
+    assert all(row["mutation_id"] for row in mutation_token_rows)
+    assert "108" not in {row["token_id"] for row in mutation_token_rows}
+
+    with (output_dir / "teacher_signal_sample_summary.csv").open(
+        encoding="utf-8", newline=""
+    ) as handle:
+        sample_summary_rows = list(csv.DictReader(handle))
+    assert len(sample_summary_rows) == 1
+    assert sample_summary_rows[0]["total_mutations"] == "7"
+    assert sample_summary_rows[0]["evaluable_mutations"] == "6"
 
 
 def test_cli_exposes_teacher_signal_threshold() -> None:
