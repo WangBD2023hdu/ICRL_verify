@@ -73,9 +73,19 @@ class SampleReportParser(HTMLParser):
         super().__init__()
         self.transcripts: list[str] = []
         self.token_rows: list[tuple[str, list[str]]] = []
+        self.token_row_attributes: dict[str, dict[str, str | None]] = {}
+        self.transcript_marks: list[
+            tuple[int, dict[str, str | None], str, int, int]
+        ] = []
         self._transcript_parts: list[str] | None = None
+        self._transcript_index: int | None = None
         self._token_row: tuple[str, list[str]] | None = None
+        self._token_row_attributes: dict[str, str | None] | None = None
         self._cell_parts: list[str] | None = None
+        self._mark_attributes: dict[str, str | None] | None = None
+        self._mark_parts: list[str] | None = None
+        self._mark_transcript_index: int | None = None
+        self._mark_start: int | None = None
 
     def handle_starttag(
         self,
@@ -85,29 +95,65 @@ class SampleReportParser(HTMLParser):
         attributes = dict(attrs)
         if tag == "pre" and attributes.get("class") == "transcript":
             self._transcript_parts = []
+            self._transcript_index = len(self.transcripts)
         if tag == "tr":
             row_id = attributes.get("id")
             if row_id is not None and row_id.startswith("token-"):
                 self._token_row = (row_id, [])
+                self._token_row_attributes = attributes
         if tag == "td" and self._token_row is not None:
             self._cell_parts = []
+        if tag == "mark":
+            self._mark_attributes = attributes
+            self._mark_parts = []
+            self._mark_transcript_index = self._transcript_index
+            self._mark_start = (
+                len("".join(self._transcript_parts))
+                if self._transcript_parts is not None
+                else None
+            )
 
     def handle_data(self, data: str) -> None:
         if self._transcript_parts is not None:
             self._transcript_parts.append(data)
         if self._cell_parts is not None:
             self._cell_parts.append(data)
+        if self._mark_parts is not None:
+            self._mark_parts.append(data)
 
     def handle_endtag(self, tag: str) -> None:
         if tag == "pre" and self._transcript_parts is not None:
             self.transcripts.append("".join(self._transcript_parts))
             self._transcript_parts = None
+            self._transcript_index = None
+        elif tag == "mark" and self._mark_parts is not None:
+            text = "".join(self._mark_parts)
+            start = self._mark_start if self._mark_start is not None else -1
+            self.transcript_marks.append(
+                (
+                    self._mark_transcript_index
+                    if self._mark_transcript_index is not None
+                    else -1,
+                    self._mark_attributes or {},
+                    text,
+                    start,
+                    start + len(text) if start >= 0 else -1,
+                )
+            )
+            self._mark_attributes = None
+            self._mark_parts = None
+            self._mark_transcript_index = None
+            self._mark_start = None
         elif tag == "td" and self._token_row is not None:
             self._token_row[1].append("".join(self._cell_parts or []))
             self._cell_parts = None
         elif tag == "tr" and self._token_row is not None:
+            self.token_row_attributes[self._token_row[0]] = (
+                self._token_row_attributes or {}
+            )
             self.token_rows.append(self._token_row)
             self._token_row = None
+            self._token_row_attributes = None
 
 
 def _bundle(model: torch.nn.Module | None = None) -> ModelBundle:
@@ -315,7 +361,7 @@ def test_combine_scores_reports_teacher_alternative() -> None:
     assert rows[0]["delta_logp_teacher_minus_original"] < 0
 
 
-def test_sample_report_keeps_complete_response_token_table_in_order() -> None:
+def test_sample_report_visualizes_mutations_and_keeps_complete_token_order() -> None:
     response_ids = [8, 7, 9]
     rows = probe._combine_scores(
         response_ids,
@@ -429,7 +475,7 @@ def test_sample_report_keeps_complete_response_token_table_in_order() -> None:
         "relation": "opposite_variant",
         "response_token_indices": [1],
     }
-    ground_truth = "A\nGround truth tail"
+    ground_truth = "prefix A suffix"
     response_text = "BAX"
     result = {
         "pair_id": "pair-1",
@@ -439,7 +485,7 @@ def test_sample_report_keeps_complete_response_token_table_in_order() -> None:
                 {
                     "ocr_ans": "B",
                     "origin_ans": "A",
-                    "markdown_span": [0, 1],
+                    "markdown_span": [7, 8],
                 }
             ],
         },
@@ -473,7 +519,31 @@ def test_sample_report_keeps_complete_response_token_table_in_order() -> None:
     assert "Top-2" in report
     assert '<div class="stats">' not in report
     assert "data-token-filter=" not in report
-    assert '<article class="mutation-focus">' not in report
+
+    assert [
+        (transcript, attrs["class"], attrs["title"], text, start, end)
+        for transcript, attrs, text, start, end in parser.transcript_marks
+    ] == [
+        (0, "mutation-mark", "m001: A -> B", "A", 7, 8),
+        (1, "mutation-mark", "#1 · ID 7 · m001", "A", 1, 2),
+    ]
+
+    mutation_section_start = report.index('<section id="mutation-details">')
+    token_section_start = report.index('<section id="token-details">')
+    mutation_section = report[mutation_section_start:token_section_start]
+    assert "变异词对照" in mutation_section
+    assert "m001" in mutation_section
+    assert "原词" in mutation_section
+    assert "图片 / GT 变异词" in mutation_section
+    assert "模型读回" in mutation_section
+    assert "<code>A</code>" in mutation_section
+    assert "<code>B</code>" in mutation_section
+    assert "关联 Response token" in mutation_section
+    assert "#1 · ID 7" in mutation_section
+    assert "0.900000" in mutation_section
+    assert "0.300000" in mutation_section
+    assert "-0.600000" in mutation_section
+    assert "-1.0986" in mutation_section
 
     assert [row_id for row_id, _ in parser.token_rows] == [
         "token-0",
@@ -482,6 +552,10 @@ def test_sample_report_keeps_complete_response_token_table_in_order() -> None:
     ]
     assert len(parser.token_rows) == len(response_ids)
     assert report.count("class='token-row") == len(response_ids)
+    assert parser.token_row_attributes["token-0"]["class"] == "token-row"
+    assert "mutation-token-row" in parser.token_row_attributes["token-1"]["class"]
+    assert "m001" in parser.token_rows[1][1][1]
+    assert "mutation-token-row" not in parser.token_row_attributes["token-2"]["class"]
     expected = [
         (0, 8, "B", 0.2, 0.4),
         (1, 7, "A", 0.9, 0.3),
@@ -507,6 +581,17 @@ def test_sample_report_keeps_complete_response_token_table_in_order() -> None:
     assert "p 0.600000" in parser.token_rows[0][1][4]
     assert "0.400000" in parser.token_rows[0][1][6]
     assert "p 0.400000" in parser.token_rows[0][1][8]
+
+    no_mutation_rows = [dict(row, mutation_ids="") for row in rows]
+    no_mutation_result = {
+        **result,
+        "sample": {**result["sample"], "changes": []},
+        "mutation_observations": [],
+        "tokens": no_mutation_rows,
+    }
+    no_mutation_report = probe._render_sample_html(no_mutation_result)
+    assert '<section id="mutation-details">' not in no_mutation_report
+    assert "<mark" not in no_mutation_report
 
 
 @pytest.mark.parametrize(

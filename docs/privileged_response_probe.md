@@ -52,6 +52,12 @@ that every row index and token ID still matches the generated `response_ids`;
 it never sorts or filters the sequence. Existing results can be rendered with
 this layout without another model forward:
 
+Mutation metadata is visualized without filtering the response sequence. The
+report highlights each mutation span in Ground Truth and its aligned token span
+in the model Response, shows `origin_ans`, image/GT `ocr_ans`, the model readback,
+and the aligned tokens' original/teacher probabilities and deltas. The same
+`mutation_id` is attached to the corresponding rows in the complete token table.
+
 ```bash
 qwen-mm-privileged-probe \
   --output-dir outputs/arxiv_confusable_privileged_probe_v1 \

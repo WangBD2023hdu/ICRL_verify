@@ -1101,9 +1101,22 @@ def _response_rows_in_generation_order(
 def _render_sample_html(result: dict[str, Any]) -> str:
     rows = _response_rows_in_generation_order(result)
     token_rows = "".join(_token_table_row(row) for row in rows)
+    mutations = list(result.get("mutation_observations", []))
+    mutation_cards = "".join(
+        _mutation_focus_card(mutation, rows) for mutation in mutations
+    )
+    mutation_section = ""
+    if mutation_cards:
+        mutation_section = (
+            '<section id="mutation-details"><h2>变异词对照</h2>'
+            f'<div class="mutation-list">{mutation_cards}</div></section>'
+        )
     image_name = Path(result["sample"]["image_copy"]).name
-    ground_truth = html.escape(str(result["ground_truth"]))
-    response_text = html.escape(str(result["response"]["text"]))
+    ground_truth = _highlight_ground_truth(
+        str(result["ground_truth"]),
+        result.get("sample", {}).get("changes", []),
+    )
+    response_text = _highlight_response(str(result["response"]["text"]), rows)
     return f"""<!doctype html>
 <html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
 <title>{html.escape(result["pair_id"])} privileged probe</title>{_report_css()}</head>
@@ -1118,6 +1131,7 @@ def _render_sample_html(result: dict[str, Any]) -> str:
 <div class="transcript-panel"><div class="panel-heading"><h3>模型 Response</h3><span>{len(rows)} tokens</span></div><pre class="transcript">{response_text}</pre></div>
 </div></div>
 </section>
+{mutation_section}
 <section id="token-details"><div class="section-heading"><h2>全部 Response Token（严格按生成顺序）</h2><output>{len(rows)} tokens</output></div>
 <div class="table-scroll token-table-scroll"><table class="token-detail-table">
 <thead><tr><th rowspan="2">生成索引</th><th rowspan="2">Response token</th><th colspan="4" class="condition original-condition">原图条件（image + prompt）</th><th colspan="4" class="condition teacher-condition">GT Teacher-Forcing 条件</th><th colspan="2" class="condition delta-condition">概率变化（Teacher - Original）</th></tr>
@@ -1231,12 +1245,22 @@ def _probability_cell(value: Any, condition: str) -> str:
 def _token_table_row(row: dict[str, Any]) -> str:
     delta = float(row["delta_logp_teacher_minus_original"])
     delta_p = float(row["delta_p_teacher_minus_original"])
+    mutation_ids = [
+        mutation_id
+        for mutation_id in str(row.get("mutation_ids", "")).split(",")
+        if mutation_id
+    ]
+    classes = "token-row mutation-token-row" if mutation_ids else "token-row"
+    mutation_badges = "".join(
+        f"<span class='mutation-id'>{html.escape(mutation_id)}</span>"
+        for mutation_id in mutation_ids
+    )
     return (
-        f"<tr id='token-{int(row['index'])}' class='token-row'>"
+        f"<tr id='token-{int(row['index'])}' class='{classes}'>"
         f"<td>{int(row['index'])}</td>"
         "<td><div class='response-token'>"
         f"<code>{html.escape(str(row['token'])) or '&lt;empty&gt;'}</code>"
-        f"<span>ID {int(row['token_id'])}</span></div></td>"
+        f"<span>ID {int(row['token_id'])}</span>{mutation_badges}</div></td>"
         f"<td>{_probability_cell(row['p_original'], 'original')}</td>"
         f"<td>{int(row['rank_original'])}</td>"
         f"<td>{_candidate_block(row, 'original', 1)}</td>"
@@ -1269,39 +1293,37 @@ def _mutation_focus_card(
     detail_rows = "".join(_mutation_token_detail_row(row) for row in token_rows)
     if not detail_rows:
         detail_rows = (
-            "<tr><td colspan='8' class='empty-state'>"
+            "<tr><td colspan='5' class='empty-state'>"
             "未对齐到模型 Response token</td></tr>"
         )
     relation = str(mutation.get("relation", "unknown"))
-    relation_class = "gain" if relation == "expected" else "drop"
     bbox = mutation.get("bbox", [])
     bbox_text = json.dumps(bbox, ensure_ascii=False) if bbox else "-"
     return f"""<article class="mutation-focus">
-<div class="mutation-heading"><div><span class="mutation-id">{html.escape(mutation_id)}</span><strong>变异词对比</strong></div><span class="{relation_class}">{html.escape(relation)}</span></div>
+<div class="mutation-heading"><div><span class="mutation-id">{html.escape(mutation_id)}</span><strong>变异词</strong></div><span class="mutation-relation">{html.escape(relation)}</span></div>
 <div class="mutation-terms">
-<div><span>图片中的变异词</span><code>{html.escape(str(mutation.get("ocr_ans", "")))}</code></div>
 <div><span>原词</span><code>{html.escape(str(mutation.get("origin_ans", "")))}</code></div>
+<div><span>图片 / GT 变异词</span><code>{html.escape(str(mutation.get("ocr_ans", "")))}</code></div>
 <div><span>模型读回</span><code>{html.escape(str(mutation.get("predicted", "")))}</code></div>
 <div><span>BBox</span><code>{html.escape(bbox_text)}</code></div>
 </div>
-<div class="table-scroll mutation-token-table"><table><thead><tr><th>Response token</th><th>p original</th><th>p teacher</th><th>Δlogp</th><th>Original Top-1</th><th>Original Top-2</th><th>Teacher Top-1</th><th>Teacher Top-2</th></tr></thead><tbody>{detail_rows}</tbody></table></div>
+<div class="table-scroll mutation-token-table"><table><thead><tr><th>关联 Response token</th><th>p original</th><th>p teacher</th><th>Δp</th><th>Δlogp</th></tr></thead><tbody>{detail_rows}</tbody></table></div>
 </article>"""
 
 
 def _mutation_token_detail_row(row: dict[str, Any]) -> str:
     delta = float(row["delta_logp_teacher_minus_original"])
+    delta_p = float(row["delta_p_teacher_minus_original"])
     return (
         "<tr>"
         "<td><div class='response-token'>"
-        f"<code>{html.escape(str(row['token'])) or '&lt;empty&gt;'}</code>"
+        f"<a class='mutation-token-link' href='#token-{int(row['index'])}'>"
+        f"<code>{html.escape(str(row['token'])) or '&lt;empty&gt;'}</code></a>"
         f"<span>#{int(row['index'])} · ID {int(row['token_id'])}</span></div></td>"
         f"<td>{_probability_cell(row['p_original'], 'original')}</td>"
         f"<td>{_probability_cell(row['p_teacher'], 'teacher')}</td>"
+        f"<td class='{_delta_class(delta_p)}'>{delta_p:+.6f}</td>"
         f"<td class='{_delta_class(delta)}'>{delta:+.4f}</td>"
-        f"<td>{_candidate_block(row, 'original', 1)}</td>"
-        f"<td>{_candidate_block(row, 'original', 2)}</td>"
-        f"<td>{_candidate_block(row, 'teacher', 1)}</td>"
-        f"<td>{_candidate_block(row, 'teacher', 2)}</td>"
         "</tr>"
     )
 
@@ -1345,23 +1367,41 @@ def _highlight_response(
 ) -> str:
     reconstructed = "".join(str(row.get("raw_token", "")) for row in rows)
     if reconstructed != response_text:
-        return html.escape(response_text)
+        spans: list[tuple[int, int, str]] = []
+        for row in rows:
+            mutation_ids = str(row.get("mutation_ids", "")).strip()
+            if not mutation_ids:
+                continue
+            start = int(row.get("raw_source_start", -1))
+            end = int(row.get("raw_source_end", -1))
+            if start < 0 or end <= start or end > len(response_text):
+                continue
+            title = f"#{row.get('index')} · ID {row.get('token_id')} · {mutation_ids}"
+            spans.append((start, end, title))
+        if not spans:
+            return html.escape(response_text)
+        parts: list[str] = []
+        cursor = 0
+        for start, end, title in sorted(spans):
+            if start < cursor:
+                continue
+            parts.append(html.escape(response_text[cursor:start]))
+            parts.append(
+                f"<mark class='mutation-mark' title='{html.escape(title, quote=True)}'>"
+                f"{html.escape(response_text[start:end])}</mark>"
+            )
+            cursor = end
+        parts.append(html.escape(response_text[cursor:]))
+        return "".join(parts)
     parts: list[str] = []
     for row in rows:
         raw_token = str(row.get("raw_token", ""))
         escaped = html.escape(raw_token)
         mutation_ids = str(row.get("mutation_ids", "")).strip()
-        is_mismatch = bool(row.get("is_hallucination"))
         if mutation_ids:
             title = f"#{row.get('index')} · ID {row.get('token_id')} · {mutation_ids}"
             parts.append(
                 f"<mark class='mutation-mark' title='{html.escape(title, quote=True)}'>"
-                f"{escaped}</mark>"
-            )
-        elif is_mismatch:
-            title = f"#{row.get('index')} · ID {row.get('token_id')} · GT 不一致"
-            parts.append(
-                f"<mark class='mismatch-mark' title='{html.escape(title, quote=True)}'>"
                 f"{escaped}</mark>"
             )
         else:
@@ -1563,6 +1603,7 @@ mark.mismatch-mark {
 }
 .mutation-heading { min-height: 46px; padding: 10px 12px; border-bottom: 1px solid #dfe5e3; }
 .mutation-heading > div { display: flex; align-items: center; gap: 9px; }
+.mutation-relation { color: #65767b; font: 11px ui-monospace, SFMono-Regular, Menlo, monospace; }
 .mutation-id {
   padding: 2px 6px;
   background: #e8eeee;
@@ -1581,6 +1622,8 @@ mark.mismatch-mark {
 .mutation-terms span { display: block; margin-bottom: 4px; color: #65767b; font-size: 11px; }
 .mutation-terms code { display: block; overflow-wrap: anywhere; font-size: 13px; }
 .mutation-token-table { border: 0; }
+.mutation-token-link { color: inherit; text-decoration: none; }
+.mutation-token-link:hover code { color: #08748d; text-decoration: underline; }
 .chart-grid {
   display: grid;
   grid-template-columns: repeat(2, minmax(360px, 1fr));
@@ -1687,6 +1730,13 @@ td:first-child, th:first-child { text-align: left; }
   font-size: 13px;
 }
 .response-token span { color: #708086; font: 10px ui-monospace, SFMono-Regular, Menlo, monospace; }
+.response-token .mutation-id {
+  width: max-content;
+  padding: 1px 5px;
+  background: #ffe083;
+  color: #6b4b00;
+  font-size: 10px;
+}
 .label-cell { max-width: 180px; overflow: hidden; text-overflow: ellipsis; text-align: left; }
 .probability-cell { display: grid; min-width: 92px; gap: 4px; }
 .probability-cell strong { font: 11px ui-monospace, SFMono-Regular, Menlo, monospace; }
