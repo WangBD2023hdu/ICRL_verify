@@ -693,3 +693,260 @@ def test_cli_contains_no_api_transport_arguments() -> None:
     assert "--base-url" not in option_strings
     assert "--api-key" not in option_strings
     assert "--max-new-tokens" in option_strings
+
+
+def _teacher_signal_fixture() -> tuple[
+    list[dict[str, object]], list[dict[str, object]]
+]:
+    specs = [
+        ("A", "correct", 0.20, 0.32, 101, "A", 0.32, 1),
+        ("B", "correct", 0.32, 0.20, 900, "other", 0.70, 2),
+        ("C", "hallucinated_insertion", 0.18, 0.30, 103, "C", 0.30, 1),
+        ("D", "mutation_opposite_variant", 0.22, 0.34, 903, "other", 0.75, 2),
+        ("E", "hallucinated_substitution", 0.40, 0.30, 904, "other", 0.60, 2),
+        ("F", "correct", 0.50, 0.52, 106, "F", 0.52, 1),
+        (" ", "formatting", 0.10, 0.40, 907, "space", 0.40, 1),
+    ]
+    rows: list[dict[str, object]] = []
+    for index, (
+        raw_token,
+        token_label,
+        p_original,
+        p_teacher,
+        top_id,
+        top_token,
+        top_p,
+        teacher_rank,
+    ) in enumerate(specs):
+        token_id = 101 + index
+        original = _score_record(
+            token_id,
+            raw_token,
+            p_original,
+            top_token_id=token_id,
+            top_raw_token=raw_token,
+            top_probability=p_original,
+            target_rank=1,
+        )
+        teacher = _score_record(
+            token_id,
+            raw_token,
+            p_teacher,
+            top_token_id=top_id,
+            top_raw_token=top_token,
+            top_probability=top_p,
+            target_rank=teacher_rank,
+        )
+        row = probe._combine_scores([token_id], [original], [teacher])[0]
+        excluded = token_label == "formatting"
+        row.update(
+            {
+                "pair_id": "pair-1",
+                "report": "samples/001_pair-1/report.html",
+                "sample_report": "samples/001_pair-1/report.html",
+                "index": index,
+                "token_label": token_label,
+                "is_hallucination": token_label not in {"correct", "formatting"},
+                "lexical_role": "formatting" if excluded else "word_initial",
+                "normalized_piece": "" if excluded else raw_token,
+                "normalized_char_count": 0 if excluded else 1,
+                "script": "formatting" if excluded else "latin",
+            }
+        )
+        rows.append(row)
+
+    result = {
+        "pair_id": "pair-1",
+        "sample": {"image_copy": "input.png", "changes": []},
+        "ground_truth": "ABCDEF",
+        "response": {
+            "text": "ABCDEF ",
+            "token_ids": [int(row["token_id"]) for row in rows],
+            "finish_reason": "stop",
+        },
+        "summary": {"token_count": len(rows)},
+        "mutation_observations": [],
+        "tokens": [dict(row) for row in rows],
+    }
+    return [result], rows
+
+
+def _audit_value(audit: dict[str, object], *keys: str) -> object:
+    sections: list[dict[str, object]] = [audit]
+    for section_name in (
+        "counts",
+        "classification_counts",
+        "signal_class_counts",
+        "class_counts",
+        "quadrants",
+        "rates",
+        "metrics",
+        "denominators",
+        "overall",
+    ):
+        section = audit.get(section_name)
+        if isinstance(section, dict):
+            sections.append(section)
+    for key in keys:
+        for section in sections:
+            if key in section:
+                return section[key]
+    raise AssertionError(f"audit does not report any of {keys!r}")
+
+
+def _audit_count(audit: dict[str, object], *keys: str) -> int:
+    value = _audit_value(audit, *keys)
+    assert isinstance(value, (int, float)) and not isinstance(value, bool)
+    return int(value)
+
+
+def _relation_count(relation: dict[str, object], *keys: str) -> int:
+    for key in keys:
+        value = relation.get(key)
+        if isinstance(value, (int, float)) and not isinstance(value, bool):
+            return int(value)
+    raise AssertionError(f"relation does not report any of {keys!r}")
+
+
+def test_teacher_signal_audit_classifies_lexical_tokens_and_denominators() -> None:
+    results, audit_rows = _teacher_signal_fixture()
+
+    audit = probe._build_teacher_signal_audit(
+        results,
+        audit_rows,
+        selected_threshold=0.05,
+    )
+
+    assert _audit_value(audit, "selected_threshold") == pytest.approx(0.05)
+    assert _audit_count(audit, "total_tokens", "total_rows") == 7
+    assert _audit_count(audit, "evaluable_tokens", "lexical_tokens") == 6
+    assert _audit_count(audit, "correct_tokens", "correct_token_count") == 3
+    assert _audit_count(audit, "incorrect_tokens", "incorrect_token_count") == 3
+    assert _audit_count(audit, "excluded_tokens", "excluded_token_count") == 1
+
+    assert _audit_count(audit, "correct_reinforced") == 1
+    assert _audit_count(audit, "harmful_correct_suppressed") == 1
+    assert _audit_count(audit, "harmful_wrong_promoted") == 2
+    assert _audit_count(audit, "wrong_suppressed") == 1
+    assert _audit_count(audit, "neutral", "neutral_tokens") == 1
+
+    assert _audit_value(audit, "harmful_signal_rate") == pytest.approx(3 / 5)
+    assert _audit_value(audit, "correct_suppression_rate") == pytest.approx(1 / 3)
+    assert _audit_value(audit, "wrong_promotion_rate") == pytest.approx(2 / 3)
+
+    threshold_sweep = _audit_value(audit, "threshold_sweep")
+    assert isinstance(threshold_sweep, list)
+    assert len(threshold_sweep) >= 2
+    assert any(
+        isinstance(point, dict)
+        and math.isclose(float(point["threshold"]), 0.05)
+        for point in threshold_sweep
+    )
+
+    error_breakdown = _audit_value(
+        audit,
+        "error_label_breakdown",
+        "error_type_breakdown",
+    )
+    assert isinstance(error_breakdown, list)
+    errors_by_label = {
+        str(row["token_label"]): row for row in error_breakdown
+    }
+    assert errors_by_label["hallucinated_insertion"]["incorrect_tokens"] == 1
+    assert errors_by_label["mutation_opposite_variant"]["incorrect_tokens"] == 1
+    assert errors_by_label["hallucinated_substitution"]["incorrect_tokens"] == 1
+
+    top1_relation = _audit_value(
+        audit,
+        "harmful_wrong_teacher_top1_relation",
+        "harmful_wrong_top1_relation",
+        "wrong_promotion_teacher_top1_relation_counts",
+    )
+    assert isinstance(top1_relation, dict)
+    assert _relation_count(
+        top1_relation,
+        "response_token_top1",
+        "same_response_id",
+    ) == 1
+    assert _relation_count(
+        top1_relation,
+        "different_surface_top1",
+        "different_surface",
+    ) == 1
+
+
+def test_teacher_signal_audit_html_is_standalone_and_links_sample_tokens() -> None:
+    results, audit_rows = _teacher_signal_fixture()
+    audit = probe._build_teacher_signal_audit(
+        results,
+        audit_rows,
+        selected_threshold=0.05,
+    )
+
+    rendered = probe._render_teacher_signal_audit_html(audit, audit_rows)
+
+    assert rendered.lstrip().lower().startswith("<!doctype html>")
+    assert "<html" in rendered
+    assert "</html>" in rendered
+    assert "0.05" in rendered
+    for label in (
+        "正确强化",
+        "有害：正确被抑制",
+        "有害：错误被强化",
+        "错误被抑制",
+    ):
+        assert label in rendered
+    assert "Teacher Top-1" in rendered
+    assert "samples/001_pair-1/report.html#token-2" in rendered
+    assert "samples/001_pair-1/report.html#token-3" in rendered
+
+
+def test_rebuild_privileged_report_writes_teacher_signal_artifacts(
+    tmp_path: Path,
+) -> None:
+    results, _ = _teacher_signal_fixture()
+    output_dir = tmp_path / "report"
+    sample_dir = output_dir / "samples" / "001_pair-1"
+    sample_dir.mkdir(parents=True)
+    (sample_dir / "result.json").write_text(
+        json.dumps(results[0], ensure_ascii=False),
+        encoding="utf-8",
+    )
+
+    probe.rebuild_privileged_report(output_dir, teacher_signal_threshold=0.05)
+
+    expected_sample_row = {
+        "pair_id": "pair-1",
+        "report": "samples/001_pair-1/report.html",
+        "finish_reason": "stop",
+        **results[0]["summary"],
+    }
+    assert (output_dir / "report.html").read_text(encoding="utf-8") == probe._render_aggregate_html(
+        [expected_sample_row]
+    )
+    for filename in (
+        "teacher_signal_audit.html",
+        "teacher_signal_audit.json",
+        "teacher_signal_tokens.csv",
+        "teacher_signal_sample_summary.csv",
+    ):
+        assert (output_dir / filename).is_file()
+
+    audit = json.loads(
+        (output_dir / "teacher_signal_audit.json").read_text(encoding="utf-8")
+    )
+    assert _audit_value(audit, "selected_threshold") == pytest.approx(0.05)
+
+
+def test_cli_exposes_teacher_signal_threshold() -> None:
+    args = probe._build_parser().parse_args(
+        [
+            "--output-dir",
+            "outputs/test",
+            "--rebuild-report-only",
+            "--teacher-signal-threshold",
+            "0.125",
+        ]
+    )
+
+    assert args.teacher_signal_threshold == pytest.approx(0.125)

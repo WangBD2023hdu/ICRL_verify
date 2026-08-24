@@ -55,6 +55,22 @@ directly. It contains no aggregate statistics or filtered token analysis. Each
 sample report keeps the complete Ground Truth and model Response visible side by
 side, followed by every generated response token in its original ID order.
 
+Teacher-signal quality statistics are written to a separate page so the existing
+sample browser and per-token visualization remain unchanged:
+
+- `teacher_signal_audit.html`: four-quadrant audit of correct/wrong response
+  tokens versus increasing/decreasing privileged log-probability;
+- `teacher_signal_audit.json`: aggregate counts, rates, threshold sweep, error
+  types, Teacher Top-1 relations, and per-sample summaries;
+- `teacher_signal_tokens.csv`: every response token with its GT-alignment label
+  and selected-threshold signal class;
+- `teacher_signal_sample_summary.csv`: one audit row per sample.
+
+The default active-signal rule is `abs(delta_logp) > 0.05`. Formatting-only
+tokens are excluded. Response omissions are reported separately because a fixed
+response-ID forward has no token at a deleted GT position to score. A token that
+contains any aligned substitution or insertion is treated as incorrect.
+
 For each response token, the table shows its probability and rank under the
 original image+prompt context, the probability and rank of that exact same token
 under GT teacher forcing, both conditions' Top-1/Top-2 decoded candidates, and
@@ -72,5 +88,6 @@ and the aligned tokens' original/teacher probabilities and deltas. The same
 ```bash
 qwen-mm-privileged-probe \
   --output-dir outputs/arxiv_confusable_privileged_probe_v1 \
+  --teacher-signal-threshold 0.05 \
   --rebuild-report-only
 ```
