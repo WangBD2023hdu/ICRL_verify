@@ -125,6 +125,7 @@ def load_release_samples(
 def run_privileged_probe(
     *,
     model_id: str | Path,
+    teacher_model_id: str | Path | None = None,
     dataset_root: str | Path,
     output_dir: str | Path,
     prompt: str = DEFAULT_PROMPT,
@@ -145,10 +146,12 @@ def run_privileged_probe(
     heartbeat_seconds: float = 30.0,
     teacher_signal_threshold: float = DEFAULT_TEACHER_SIGNAL_THRESHOLD,
 ) -> PrivilegedProbeSummary:
-    """Generate once and score the exact generated IDs in two offline contexts."""
+    """Generate once with the student and score its IDs in two contexts."""
 
     if not str(model_id).strip():
         raise ValueError("model_id must not be empty")
+    if teacher_model_id is not None and not str(teacher_model_id).strip():
+        raise ValueError("teacher_model_id must not be empty when provided")
     if not prompt.strip():
         raise ValueError("prompt must not be empty")
     if not privileged_instruction.strip():
@@ -165,6 +168,11 @@ def run_privileged_probe(
         raise ValueError("image_patch_size must be positive")
     _validate_teacher_signal_threshold(teacher_signal_threshold)
 
+    student_model_id = str(model_id)
+    resolved_teacher_model_id = (
+        student_model_id if teacher_model_id is None else str(teacher_model_id)
+    )
+    teacher_model_is_student = resolved_teacher_model_id == student_model_id
     dataset_path = Path(dataset_root).expanduser().resolve()
     output_root = Path(output_dir).expanduser().resolve()
     samples_root = output_root / "samples"
@@ -174,7 +182,10 @@ def run_privileged_probe(
         "schema_version": SCHEMA_VERSION,
         "created_at": _utc_now(),
         "backend": "huggingface-transformers-offline",
-        "model_id": str(model_id),
+        "model_id": student_model_id,
+        "student_model_id": student_model_id,
+        "teacher_model_id": resolved_teacher_model_id,
+        "teacher_model_is_student": teacher_model_is_student,
         "dataset_root": str(dataset_path),
         "output_dir": str(output_root),
         "prompt": prompt,
@@ -210,14 +221,32 @@ def run_privileged_probe(
         heartbeat_seconds=heartbeat_seconds,
     )
     tracker.start()
-    tracker.set_current(index=0, name=str(model_id), phase="loading-local-model")
+    tracker.set_current(
+        index=0,
+        name=student_model_id,
+        phase="loading-student-local-model",
+    )
     try:
-        model_bundle = load_model_bundle(
-            str(model_id),
+        student_model_bundle = load_model_bundle(
+            student_model_id,
             device_map=device_map,
             dtype=dtype,
             trust_remote_code=trust_remote_code,
         )
+        if teacher_model_is_student:
+            teacher_model_bundle = student_model_bundle
+        else:
+            tracker.set_current(
+                index=0,
+                name=resolved_teacher_model_id,
+                phase="loading-teacher-local-model",
+            )
+            teacher_model_bundle = load_model_bundle(
+                resolved_teacher_model_id,
+                device_map=device_map,
+                dtype=dtype,
+                trust_remote_code=trust_remote_code,
+            )
     except Exception as exc:
         tracker.note_error(
             phase="model-load-error",
@@ -252,7 +281,8 @@ def run_privileged_probe(
                     sample=sample,
                     sample_dir=sample_dir,
                     fingerprint=fingerprint,
-                    model_bundle=model_bundle,
+                    student_model_bundle=student_model_bundle,
+                    teacher_model_bundle=teacher_model_bundle,
                     prompt=prompt,
                     privileged_instruction=privileged_instruction,
                     max_new_tokens=max_new_tokens,
@@ -351,7 +381,8 @@ def _run_sample(
     sample: PrivilegedProbeSample,
     sample_dir: Path,
     fingerprint: str,
-    model_bundle: ModelBundle,
+    student_model_bundle: ModelBundle,
+    teacher_model_bundle: ModelBundle,
     prompt: str,
     privileged_instruction: str,
     max_new_tokens: int,
@@ -382,10 +413,10 @@ def _run_sample(
         phase="preparing-original-multimodal-prompt",
     )
     original_inputs = prepare_prompt_inputs(
-        processor=model_bundle.processor,
+        processor=student_model_bundle.processor,
         image_path=image_copy,
         prompt=prompt,
-        device=model_bundle.device,
+        device=student_model_bundle.device,
         min_pixels=min_pixels,
         max_pixels=max_pixels,
         image_patch_size=image_patch_size,
@@ -397,7 +428,7 @@ def _run_sample(
         phase="preparing-privileged-text-prompt",
     )
     teacher_inputs = _prepare_text_prompt_inputs(
-        model_bundle=model_bundle,
+        model_bundle=teacher_model_bundle,
         prompt=privileged_prompt,
     )
 
@@ -411,8 +442,8 @@ def _run_sample(
         )
         _seed_everything(seed)
         response_ids, _ = generate_from_prompt(
-            model=model_bundle.model,
-            tokenizer=model_bundle.tokenizer,
+            model=student_model_bundle.model,
+            tokenizer=student_model_bundle.tokenizer,
             prompt_inputs=original_inputs,
             max_new_tokens=max_new_tokens,
             do_sample=False,
@@ -421,7 +452,10 @@ def _run_sample(
         )
         if not response_ids:
             raise RuntimeError("model generated no scoreable response token IDs")
-        response_text = decode_generated_tokens(model_bundle.tokenizer, response_ids)
+        response_text = decode_generated_tokens(
+            student_model_bundle.tokenizer,
+            response_ids,
+        )
         finish_reason = "length" if len(response_ids) >= max_new_tokens else "stop"
         generation_performed = True
         partial = {
@@ -441,20 +475,37 @@ def _run_sample(
         response_text = str(partial["response_text"])
         finish_reason = str(partial.get("finish_reason", "unknown"))
 
+    _validate_response_id_compatibility(
+        student_model_bundle=student_model_bundle,
+        teacher_model_bundle=teacher_model_bundle,
+        response_ids=response_ids,
+        response_text=response_text,
+    )
+
     _write_text_atomic(sample_dir / "response.md", response_text)
     _write_json_atomic(sample_dir / "response_ids.json", response_ids)
 
     forwards = dict(partial.get("forwards", {}))
     scoring_contexts = (
-        ("original", original_inputs, "scoring-original-exact-response-ids"),
-        ("teacher", teacher_inputs, "scoring-privileged-exact-response-ids"),
+        (
+            "original",
+            student_model_bundle,
+            original_inputs,
+            "scoring-original-exact-response-ids",
+        ),
+        (
+            "teacher",
+            teacher_model_bundle,
+            teacher_inputs,
+            "scoring-privileged-exact-response-ids",
+        ),
     )
-    for context_name, context_inputs, phase in scoring_contexts:
+    for context_name, scoring_bundle, context_inputs, phase in scoring_contexts:
         if context_name in forwards:
             continue
         tracker.set_current(index=sample.ordinal, name=sample.pair_id, phase=phase)
         forwards[context_name] = _score_fixed_response_ids(
-            model_bundle=model_bundle,
+            model_bundle=scoring_bundle,
             prompt_inputs=context_inputs,
             response_ids=response_ids,
             top_k=top_k,
@@ -462,7 +513,7 @@ def _run_sample(
         )
         partial["forwards"] = forwards
         _write_json_atomic(partial_path, partial)
-        _empty_device_cache(model_bundle.device)
+        _empty_device_cache(scoring_bundle.device)
 
     original_scores = list(forwards["original"])
     teacher_scores = list(forwards["teacher"])
@@ -491,6 +542,12 @@ def _run_sample(
         },
         "protocol": {
             "backend": "huggingface-transformers-offline",
+            "student_model_id": student_model_bundle.model_id,
+            "teacher_model_id": teacher_model_bundle.model_id,
+            "teacher_model_is_student": (teacher_model_bundle is student_model_bundle),
+            "generation_model_id": student_model_bundle.model_id,
+            "original_scoring_model_id": student_model_bundle.model_id,
+            "privileged_scoring_model_id": teacher_model_bundle.model_id,
             "generation_count": 1,
             "generation_performed_this_run": generation_performed,
             "teacher_forced_forward_count": 2,
@@ -577,6 +634,63 @@ def _prepare_text_prompt_inputs(
             "attention_mask": _ones_like(encoded),
         }
     return move_inputs_to_device(dict(encoded), model_bundle.device)
+
+
+def _validate_response_id_compatibility(
+    *,
+    student_model_bundle: ModelBundle,
+    teacher_model_bundle: ModelBundle,
+    response_ids: Sequence[int],
+    response_text: str,
+) -> None:
+    """Ensure student IDs have identical token semantics for the teacher."""
+
+    if teacher_model_bundle is student_model_bundle:
+        return
+
+    seen: set[int] = set()
+    for index, token_id in enumerate(response_ids):
+        normalized_id = int(token_id)
+        if normalized_id in seen:
+            continue
+        seen.add(normalized_id)
+        try:
+            student_piece = decode_token_piece(
+                student_model_bundle.tokenizer,
+                normalized_id,
+            )
+            teacher_piece = decode_token_piece(
+                teacher_model_bundle.tokenizer,
+                normalized_id,
+            )
+        except Exception as exc:
+            raise RuntimeError(
+                "teacher tokenizer cannot decode a student response token ID: "
+                f"index={index} token_id={normalized_id}"
+            ) from exc
+        if student_piece != teacher_piece:
+            raise RuntimeError(
+                "student and teacher tokenizers assign different text to the same "
+                "response token ID; exact-ID teacher forcing is invalid: "
+                f"index={index} token_id={normalized_id} "
+                f"student={student_piece!r} teacher={teacher_piece!r}"
+            )
+
+    try:
+        teacher_response_text = decode_generated_tokens(
+            teacher_model_bundle.tokenizer,
+            [int(token_id) for token_id in response_ids],
+        )
+    except Exception as exc:
+        raise RuntimeError(
+            "teacher tokenizer cannot decode the complete student response ID sequence"
+        ) from exc
+    if teacher_response_text != response_text:
+        raise RuntimeError(
+            "student and teacher tokenizers decode the complete response ID sequence "
+            "differently; exact-ID teacher forcing is invalid: "
+            f"student={response_text!r} teacher={teacher_response_text!r}"
+        )
 
 
 def _score_fixed_response_ids(
@@ -2965,7 +3079,9 @@ def _sample_fingerprint(
             sample.ground_truth_path.read_text(encoding="utf-8")
         ),
         "changes": list(sample.changes),
-        "model_id": config["model_id"],
+        "student_model_id": config["student_model_id"],
+        "teacher_model_id": config["teacher_model_id"],
+        "teacher_model_is_student": config["teacher_model_is_student"],
         "prompt": config["prompt"],
         "privileged_instruction": config["privileged_instruction"],
         "privileged_prompt_template": config["privileged_prompt_template"],
@@ -3061,11 +3177,25 @@ def _build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="qwen-mm-privileged-probe",
         description=(
-            "Offline Transformers probe: generate OCR once, then directly append "
-            "the identical response ID tensor under original-image and GT prompts."
+            "Offline Transformers probe: generate OCR once with a student model, "
+            "then directly append the identical response ID tensor under the "
+            "student original-image context and a teacher GT context."
         ),
     )
-    parser.add_argument("--model-id", default=DEFAULT_MODEL_ID)
+    parser.add_argument(
+        "--model-id",
+        "--student-model-id",
+        dest="model_id",
+        default=DEFAULT_MODEL_ID,
+        help="Student model used for the only generation and original-context scoring.",
+    )
+    parser.add_argument(
+        "--teacher-model-id",
+        help=(
+            "Optional teacher model used only for GT privileged-context scoring. "
+            "By default the student model is reused without loading a second model."
+        ),
+    )
     parser.add_argument("--dataset-root")
     parser.add_argument("--output-dir", required=True)
     parser.add_argument("--prompt", default=DEFAULT_PROMPT)
@@ -3131,6 +3261,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     device_map = None if args.device_map.lower() == "none" else args.device_map
     summary = run_privileged_probe(
         model_id=args.model_id,
+        teacher_model_id=args.teacher_model_id,
         dataset_root=args.dataset_root,
         output_dir=args.output_dir,
         prompt=prompt,

@@ -3,14 +3,15 @@
 `qwen-mm-privileged-probe` is a local Hugging Face Transformers experiment. It
 does not call an API, create a train/validation split, or fit a threshold.
 
-For every page it performs exactly:
+By default the student is also the teacher, so only one model is loaded. For
+every page it performs exactly:
 
-1. one `model.generate` call with `image + original prompt`, preserving the
-   generated response ID sequence;
-2. one teacher-forced forward after directly concatenating that ID tensor to
-   the same multimodal prompt;
-3. one teacher-forced forward after directly concatenating the identical ID
-   tensor to this text-only prompt:
+1. one student `model.generate` call with `image + original prompt`, preserving
+   the generated response ID sequence;
+2. one student forward after directly concatenating that ID tensor to the same
+   multimodal prompt;
+3. one teacher forward after directly concatenating the identical ID tensor to
+   this text-only prompt:
 
 ```text
 请逐字逐符号转写下面边界标记之间的文档。转写不是翻译；不要改变任何字符。边界标记本身不要输出。
@@ -26,6 +27,35 @@ one newline is added only to place `<<<DOCUMENT_END>>>` on its own line.
 The response is never decoded and re-tokenized for either forward. Every
 `result.json` records `response_ids_directly_concatenated=true` and
 `response_text_retokenized=false`.
+
+To use a separate teacher, pass `--teacher-model-id`. The existing `--model-id`
+is the student; `--student-model-id` is an equivalent, more explicit spelling.
+Both models inherit the same `--dtype`, `--device-map`, and
+`--trust-remote-code` settings. Before the teacher forward, the probe verifies
+that every generated student token ID and the complete ID sequence decode
+identically with the teacher tokenizer. It stops with an error instead of
+silently comparing incompatible vocabularies.
+
+```bash
+qwen-mm-privileged-probe \
+  --student-model-id /path/to/student-model \
+  --teacher-model-id /path/to/teacher-model \
+  --dataset-root "$DATA_BASE/arxiv_confusable_v10_36_server" \
+  --output-dir outputs/arxiv_confusable_two_model_probe \
+  --max-new-tokens 4096 \
+  --top-k 5 \
+  --dtype bfloat16 \
+  --device-map auto \
+  --trust-remote-code
+```
+
+In two-model mode both model instances stay loaded during the run. Ensure that
+the selected device map has enough GPU/CPU memory. `config.json` and every
+sample `result.json` record the student model ID, teacher model ID, and whether
+the same model instance was reused. With different student and teacher models,
+`delta_logp = teacher - original` contains both a model-parameter difference
+and a context difference. Only the default same-model mode isolates the effect
+of adding the privileged GT context while holding model parameters fixed.
 
 ```bash
 DATA_BASE=/home/ma-user/work/wangbaode/03_innovate/ICRL_verify/exp_v2/data

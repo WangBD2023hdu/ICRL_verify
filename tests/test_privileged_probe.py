@@ -34,13 +34,13 @@ def _expected_privileged_prompt(ground_truth: str) -> str:
 class FakeTokenizer:
     all_special_ids: ClassVar[list[int]] = []
 
-    def __init__(self) -> None:
+    def __init__(self, pieces: dict[int, str] | None = None) -> None:
+        self.pieces = pieces if pieces is not None else {7: "A", 8: "B", 9: "X"}
         self.messages: list[dict[str, object]] | None = None
 
     def decode(self, token_ids: list[int], **_: object) -> str:
-        pieces = {7: "A", 8: "B", 9: "X"}
         return "".join(
-            pieces.get(int(token_id), f"<{token_id}>") for token_id in token_ids
+            self.pieces.get(int(token_id), f"<{token_id}>") for token_id in token_ids
         )
 
     def apply_chat_template(
@@ -80,7 +80,22 @@ class RecordingModel(torch.nn.Module):
 
 
 class TrackerStub:
+    def __init__(self, **_: object) -> None:
+        return None
+
+    def start(self) -> None:
+        return None
+
     def set_current(self, **_: object) -> None:
+        return None
+
+    def note_error(self, **_: object) -> None:
+        return None
+
+    def complete_unit(self, **_: object) -> None:
+        return None
+
+    def finish(self, **_: object) -> None:
         return None
 
 
@@ -172,13 +187,17 @@ class SampleReportParser(HTMLParser):
             self._token_row_attributes = None
 
 
-def _bundle(model: torch.nn.Module | None = None) -> ModelBundle:
-    tokenizer = FakeTokenizer()
+def _bundle(
+    model: torch.nn.Module | None = None,
+    *,
+    model_id: str = "fake-qwen",
+    tokenizer: FakeTokenizer | None = None,
+) -> ModelBundle:
     return ModelBundle(
-        model_id="fake-qwen",
-        model=model or RecordingModel(),
+        model_id=model_id,
+        model=model if model is not None else RecordingModel(),
         processor=SimpleNamespace(),
-        tokenizer=tokenizer,
+        tokenizer=tokenizer if tokenizer is not None else FakeTokenizer(),
         device=torch.device("cpu"),
     )
 
@@ -305,7 +324,7 @@ def test_sample_generates_once_then_forwards_same_ids_twice(
         changes=(),
     )
     model = RecordingModel()
-    bundle = _bundle(model)
+    bundle = _bundle(model, model_id="student")
     generation_calls: list[list[int]] = []
 
     def fake_prepare_prompt_inputs(**_: object) -> dict[str, torch.Tensor]:
@@ -325,7 +344,8 @@ def test_sample_generates_once_then_forwards_same_ids_twice(
         sample=sample,
         sample_dir=tmp_path / "sample",
         fingerprint="fingerprint",
-        model_bundle=bundle,
+        student_model_bundle=bundle,
+        teacher_model_bundle=bundle,
         prompt="OCR",
         privileged_instruction=_PRIVILEGED_PROMPT_INSTRUCTION,
         max_new_tokens=16,
@@ -345,6 +365,9 @@ def test_sample_generates_once_then_forwards_same_ids_twice(
     assert result["response"]["token_ids"] == [7, 8]
     assert result["protocol"]["generation_count"] == 1
     assert result["protocol"]["teacher_forced_forward_count"] == 2
+    assert result["protocol"]["student_model_id"] == "student"
+    assert result["protocol"]["teacher_model_id"] == "student"
+    assert result["protocol"]["teacher_model_is_student"] is True
     assert result["protocol"]["response_ids_directly_concatenated"] is True
     assert result["protocol"]["response_text_retokenized"] is False
     assert result["ground_truth"] == ground_truth
@@ -368,6 +391,223 @@ def test_sample_generates_once_then_forwards_same_ids_twice(
     assert result["response"]["text"] == "AB"
     assert "<<<DOCUMENT_START>>>" not in result["response"]["text"]
     assert "<<<DOCUMENT_END>>>" not in result["response"]["text"]
+
+
+def test_sample_routes_distinct_student_and_teacher_bundles(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    image_path = tmp_path / "page.png"
+    Image.new("RGB", (32, 32), "white").save(image_path)
+    gt_path = tmp_path / "page.md"
+    ground_truth = "AB\n"
+    gt_path.write_text(ground_truth, encoding="utf-8")
+    sample = probe.PrivilegedProbeSample(
+        ordinal=1,
+        pair_id="p1",
+        image_path=image_path,
+        ground_truth_path=gt_path,
+        changes=(),
+    )
+    student_model = RecordingModel()
+    teacher_model = RecordingModel()
+    student_bundle = _bundle(student_model, model_id="student")
+    teacher_bundle = _bundle(teacher_model, model_id="teacher")
+    generation_calls: list[dict[str, object]] = []
+    original_prompt_processors: list[object] = []
+
+    def fake_prepare_prompt_inputs(**kwargs: object) -> dict[str, torch.Tensor]:
+        original_prompt_processors.append(kwargs["processor"])
+        return {
+            "input_ids": torch.tensor([[1, 2, 3]], dtype=torch.long),
+            "attention_mask": torch.ones((1, 3), dtype=torch.long),
+        }
+
+    def fake_generate(**kwargs: object) -> tuple[list[int], str]:
+        generation_calls.append(kwargs)
+        return [7, 8], "ignored"
+
+    monkeypatch.setattr(probe, "prepare_prompt_inputs", fake_prepare_prompt_inputs)
+    monkeypatch.setattr(probe, "generate_from_prompt", fake_generate)
+
+    result = probe._run_sample(
+        sample=sample,
+        sample_dir=tmp_path / "sample",
+        fingerprint="fingerprint",
+        student_model_bundle=student_bundle,
+        teacher_model_bundle=teacher_bundle,
+        prompt="OCR",
+        privileged_instruction=_PRIVILEGED_PROMPT_INSTRUCTION,
+        max_new_tokens=16,
+        top_k=3,
+        forward_chunk_size=2,
+        min_pixels=2048,
+        max_pixels=16777216,
+        image_patch_size=16,
+        seed=7,
+        tracker=TrackerStub(),
+    )
+
+    assert len(generation_calls) == 1
+    assert generation_calls[0]["model"] is student_model
+    assert generation_calls[0]["tokenizer"] is student_bundle.tokenizer
+    assert original_prompt_processors == [student_bundle.processor]
+    assert len(student_model.calls) == 1
+    assert student_model.calls[0].tolist() == [[1, 2, 3, 7, 8]]
+    assert len(teacher_model.calls) == 1
+    assert teacher_model.calls[0].tolist() == [[4, 5, 6, 7, 8]]
+    assert student_bundle.tokenizer.messages is None
+    assert teacher_bundle.tokenizer.messages == [
+        {"role": "user", "content": _expected_privileged_prompt(ground_truth)}
+    ]
+    assert result["response"]["token_ids"] == [7, 8]
+    assert result["protocol"]["student_model_id"] == "student"
+    assert result["protocol"]["teacher_model_id"] == "teacher"
+    assert result["protocol"]["teacher_model_is_student"] is False
+    assert result["protocol"]["response_ids_directly_concatenated"] is True
+    assert result["protocol"]["response_text_retokenized"] is False
+
+
+def test_sample_rejects_incompatible_teacher_tokenizer_before_teacher_forward(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    image_path = tmp_path / "page.png"
+    Image.new("RGB", (32, 32), "white").save(image_path)
+    gt_path = tmp_path / "page.md"
+    gt_path.write_text("AB\n", encoding="utf-8")
+    sample = probe.PrivilegedProbeSample(
+        ordinal=1,
+        pair_id="p1",
+        image_path=image_path,
+        ground_truth_path=gt_path,
+        changes=(),
+    )
+    student_model = RecordingModel()
+    teacher_model = RecordingModel()
+    student_bundle = _bundle(student_model, model_id="student")
+    teacher_bundle = _bundle(
+        teacher_model,
+        model_id="teacher",
+        tokenizer=FakeTokenizer({7: "X", 8: "B", 9: "X"}),
+    )
+
+    def fake_prepare_prompt_inputs(**_: object) -> dict[str, torch.Tensor]:
+        return {
+            "input_ids": torch.tensor([[1, 2, 3]], dtype=torch.long),
+            "attention_mask": torch.ones((1, 3), dtype=torch.long),
+        }
+
+    def fake_generate(**_: object) -> tuple[list[int], str]:
+        return [7, 8], "ignored"
+
+    monkeypatch.setattr(probe, "prepare_prompt_inputs", fake_prepare_prompt_inputs)
+    monkeypatch.setattr(probe, "generate_from_prompt", fake_generate)
+
+    with pytest.raises((ValueError, RuntimeError)):
+        probe._run_sample(
+            sample=sample,
+            sample_dir=tmp_path / "sample",
+            fingerprint="fingerprint",
+            student_model_bundle=student_bundle,
+            teacher_model_bundle=teacher_bundle,
+            prompt="OCR",
+            privileged_instruction=_PRIVILEGED_PROMPT_INSTRUCTION,
+            max_new_tokens=16,
+            top_k=3,
+            forward_chunk_size=2,
+            min_pixels=2048,
+            max_pixels=16777216,
+            image_patch_size=16,
+            seed=7,
+            tracker=TrackerStub(),
+        )
+
+    assert teacher_model.calls == []
+
+
+@pytest.mark.parametrize(
+    ("teacher_model_id", "expected_load_ids", "teacher_is_student"),
+    [
+        (None, ["student"], True),
+        ("teacher", ["student", "teacher"], False),
+    ],
+)
+def test_run_loads_or_reuses_teacher_bundle(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    teacher_model_id: str | None,
+    expected_load_ids: list[str],
+    teacher_is_student: bool,
+) -> None:
+    dataset_root = tmp_path / "dataset"
+    dataset_root.mkdir()
+    (dataset_root / "page.png").write_bytes(b"image")
+    (dataset_root / "page.md").write_text("GT", encoding="utf-8")
+    (dataset_root / "pairs.jsonl").write_text(
+        json.dumps(
+            {
+                "pair_id": "p1",
+                "edited_image": "page.png",
+                "edited_markdown": "page.md",
+                "changes": [],
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    student_bundle = _bundle(model_id="student")
+    teacher_bundle = _bundle(model_id="teacher")
+    loaded_ids: list[str] = []
+    routed_bundles: list[tuple[ModelBundle, ModelBundle]] = []
+
+    def fake_load_model_bundle(model_id: str, **_: object) -> ModelBundle:
+        loaded_ids.append(model_id)
+        return student_bundle if model_id == "student" else teacher_bundle
+
+    def fake_run_sample(**kwargs: object) -> dict[str, object]:
+        routed_bundles.append(
+            (
+                kwargs["student_model_bundle"],
+                kwargs["teacher_model_bundle"],
+            )
+        )
+        return {"tokens": []}
+
+    monkeypatch.setattr(probe, "ProgressTracker", TrackerStub)
+    monkeypatch.setattr(probe, "load_model_bundle", fake_load_model_bundle)
+    monkeypatch.setattr(probe, "_run_sample", fake_run_sample)
+    monkeypatch.setattr(probe, "_write_sample_outputs", lambda *_: None)
+    monkeypatch.setattr(
+        probe,
+        "rebuild_privileged_report",
+        lambda *_args, **_kwargs: {"completed_samples": 1},
+    )
+
+    probe.run_privileged_probe(
+        model_id="student",
+        teacher_model_id=teacher_model_id,
+        dataset_root=dataset_root,
+        output_dir=tmp_path / "output",
+        device_map=None,
+        dtype="float32",
+        resume=False,
+    )
+
+    assert loaded_ids == expected_load_ids
+    assert len(routed_bundles) == 1
+    assert routed_bundles[0][0] is student_bundle
+    assert routed_bundles[0][1] is (
+        student_bundle if teacher_is_student else teacher_bundle
+    )
+    config = json.loads(
+        (tmp_path / "output" / "config.json").read_text(encoding="utf-8")
+    )
+    assert config["student_model_id"] == "student"
+    assert config["teacher_model_id"] == (
+        "student" if teacher_is_student else "teacher"
+    )
+    assert config["teacher_model_is_student"] is teacher_is_student
 
 
 def test_combine_scores_reports_teacher_alternative() -> None:
@@ -758,9 +998,32 @@ def test_cli_contains_no_api_transport_arguments() -> None:
     }
 
     assert "--model-id" in option_strings
+    assert "--student-model-id" in option_strings
+    assert "--teacher-model-id" in option_strings
     assert "--base-url" not in option_strings
     assert "--api-key" not in option_strings
     assert "--max-new-tokens" in option_strings
+
+    legacy_args = parser.parse_args(
+        ["--model-id", "student-legacy", "--output-dir", "outputs/test"]
+    )
+    alias_args = parser.parse_args(
+        ["--student-model-id", "student-alias", "--output-dir", "outputs/test"]
+    )
+    dual_args = parser.parse_args(
+        [
+            "--student-model-id",
+            "student-alias",
+            "--teacher-model-id",
+            "teacher",
+            "--output-dir",
+            "outputs/test",
+        ]
+    )
+    assert legacy_args.model_id == "student-legacy"
+    assert alias_args.model_id == "student-alias"
+    assert dual_args.model_id == "student-alias"
+    assert dual_args.teacher_model_id == "teacher"
 
 
 def _teacher_signal_fixture() -> tuple[
