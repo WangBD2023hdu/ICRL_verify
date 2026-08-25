@@ -16,8 +16,10 @@ from qwen_mm_token_probe import privileged_probe as probe
 from qwen_mm_token_probe.hf_qwen import ModelBundle
 
 _PRIVILEGED_PROMPT_INSTRUCTION = (
-    "请逐字逐符号转写下面边界标记之间的文档。转写不是翻译；不要改变任何字符。"
-    "边界标记本身不要输出。"
+    "Please transcribe the document enclosed by the boundary markers verbatim, "
+    "character by character and symbol by symbol. This is a transcription task, "
+    "not a translation task. Do not change, correct, add, or omit any character. "
+    "Output only the document content; do not include the boundary markers."
 )
 
 
@@ -1003,6 +1005,9 @@ def test_cli_contains_no_api_transport_arguments() -> None:
     assert "--base-url" not in option_strings
     assert "--api-key" not in option_strings
     assert "--max-new-tokens" in option_strings
+    assert (
+        parser.get_default("privileged_instruction") == _PRIVILEGED_PROMPT_INSTRUCTION
+    )
 
     legacy_args = parser.parse_args(
         ["--model-id", "student-legacy", "--output-dir", "outputs/test"]

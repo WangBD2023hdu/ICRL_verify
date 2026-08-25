@@ -14,10 +14,10 @@ every page it performs exactly:
    this text-only prompt:
 
 ```text
-请逐字逐符号转写下面边界标记之间的文档。转写不是翻译；不要改变任何字符。边界标记本身不要输出。
+Please transcribe the document enclosed by the boundary markers verbatim, character by character and symbol by symbol. This is a transcription task, not a translation task. Do not change, correct, add, or omit any character. Output only the document content; do not include the boundary markers.
 
 <<<DOCUMENT_START>>>
-{完整 Markdown GT}
+{privileged_text}
 <<<DOCUMENT_END>>>
 ```
 

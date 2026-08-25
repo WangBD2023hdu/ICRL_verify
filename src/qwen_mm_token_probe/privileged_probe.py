@@ -41,11 +41,13 @@ SCHEMA_VERSION = 2
 DEFAULT_MODEL_ID = "Qwen/Qwen3.5-4B"
 DEFAULT_PROMPT = DEFAULT_PDF_OCR_PROMPT
 DEFAULT_PRIVILEGED_INSTRUCTION = (
-    "请逐字逐符号转写下面边界标记之间的文档。"
-    "转写不是翻译；不要改变任何字符。边界标记本身不要输出。"
+    "Please transcribe the document enclosed by the boundary markers verbatim, "
+    "character by character and symbol by symbol. This is a transcription task, "
+    "not a translation task. Do not change, correct, add, or omit any character. "
+    "Output only the document content; do not include the boundary markers."
 )
 PRIVILEGED_PROMPT_TEMPLATE = (
-    "{instruction}\n\n<<<DOCUMENT_START>>>\n{ground_truth}\n<<<DOCUMENT_END>>>"
+    "{instruction}\n\n<<<DOCUMENT_START>>>\n{privileged_text}\n<<<DOCUMENT_END>>>"
 )
 DEFAULT_TEACHER_SIGNAL_THRESHOLD = 0.05
 TEACHER_SIGNAL_THRESHOLDS = (0.0, 0.01, 0.05, 0.1, 0.2, 0.5)
