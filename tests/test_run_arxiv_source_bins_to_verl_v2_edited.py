@@ -93,8 +93,6 @@ class RunV2EditedTests(unittest.TestCase):
                 str(work_root),
                 "--output-dir",
                 str(output),
-                "--server-root",
-                "/server/v2-edited",
                 "--workers",
                 "8",
                 "--mutation-workers",
@@ -130,9 +128,11 @@ class RunV2EditedTests(unittest.TestCase):
             self.assertIn("--drop-references", commands[0])
             self.assertEqual(commands[1][commands[1].index("--workers") + 1], "3")
             self.assertEqual(commands[1][commands[1].index("--seed") + 1], "83")
-            self.assertEqual(commands[1][commands[1].index("--server-root") + 1], "/server/v2-edited")
+            self.assertNotIn("--server-root", commands[1])
             report = json.loads((output / "pipeline_report.json").read_text())
             self.assertEqual(report["status"], "passed")
+            self.assertEqual(report["output_dir"], str(output.resolve()))
+            self.assertEqual(report["image_path_policy"], "absolute_output_dir_v1")
             self.assertEqual(report["source_first_verified_pages"], 7)
             self.assertEqual(report["edit_pairs"], 5)
             self.assertEqual(report["mutation_count_distribution"], {"3": 2, "4": 3})

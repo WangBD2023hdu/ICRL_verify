@@ -9,7 +9,7 @@ import hashlib
 import json
 import math
 import os
-from pathlib import Path, PurePosixPath
+from pathlib import Path
 import re
 import time
 from typing import Any
@@ -571,16 +571,39 @@ def verify_pair(
 
 def verify_exports(root: Path, pairs: list[dict[str, Any]], report: dict[str, Any]) -> list[str]:
     errors: list[str] = []
+    root = root.expanduser().resolve()
     by_pair = {row["pair_id"]: row for row in pairs}
+    expected_images: dict[str, str] = {}
+    for pair in pairs:
+        pair_id = str(pair["pair_id"])
+        image_path = (root / str(pair["edited_image"])).resolve()
+        try:
+            image_path.relative_to(root)
+        except ValueError:
+            errors.append(f"edited_image_escapes_dataset_root:{pair_id}")
+            continue
+        if not image_path.is_file() or image_path.stat().st_size == 0:
+            errors.append(f"edited_image_missing:{pair_id}")
+            continue
+        expected_images[pair_id] = str(image_path)
+
     sft_path = root / report["exports"]["sft"]
     sft_rows = read_jsonl(sft_path)
     if len(sft_rows) != len(pairs):
         errors.append("sft_count_mismatch")
+    observed_sft_images: list[str] = []
     for row in sft_rows:
         if set(row) != {"images", "conversations"}:
             errors.append("sft_top_level_shape")
         if "changes" in row:
             errors.append("sft_contains_changes")
+        images = row.get("images")
+        if not isinstance(images, list) or len(images) != 1 or not isinstance(images[0], str):
+            errors.append("sft_image_path_shape")
+        else:
+            observed_sft_images.append(images[0])
+    if collections.Counter(observed_sft_images) != collections.Counter(expected_images.values()):
+        errors.append("sft_image_path_mismatch")
 
     verl_rows = read_jsonl(root / "verl_grpo" / "train.jsonl") + read_jsonl(
         root / "verl_grpo" / "val.jsonl"
@@ -607,7 +630,7 @@ def verify_exports(root: Path, pairs: list[dict[str, Any]], report: dict[str, An
         for change in row["extra_info"].get("changes", []):
             if set(change) != {"ocr_ans", "origin_ans", "bbox"}:
                 errors.append("verl_change_shape")
-        expected_image = str(PurePosixPath(report["server_root"]) / pair["edited_image"])
+        expected_image = expected_images.get(str(pair_id))
         if row["images"] != [expected_image]:
             errors.append("verl_image_path_mismatch")
 
@@ -617,10 +640,17 @@ def verify_exports(root: Path, pairs: list[dict[str, Any]], report: dict[str, An
         errors.append("pyarrow_missing")
     else:
         for split in ("train", "val"):
-            parquet_rows = pq.read_table(root / "verl_grpo" / f"{split}.parquet").num_rows
-            jsonl_rows = len(read_jsonl(root / "verl_grpo" / f"{split}.jsonl"))
-            if parquet_rows != jsonl_rows:
+            parquet_rows = pq.read_table(
+                root / "verl_grpo" / f"{split}.parquet"
+            ).to_pylist()
+            jsonl_rows = read_jsonl(root / "verl_grpo" / f"{split}.jsonl")
+            if len(parquet_rows) != len(jsonl_rows):
                 errors.append(f"parquet_count_mismatch:{split}")
+                continue
+            if [row.get("images") for row in parquet_rows] != [
+                row.get("images") for row in jsonl_rows
+            ]:
+                errors.append(f"parquet_image_path_mismatch:{split}")
     return errors
 
 
@@ -658,6 +688,14 @@ def main() -> int:
     errors: list[dict[str, str]] = []
     if report.get("output_mode") != "edited_only" or report.get("clean_assets_copied") is not False:
         errors.append({"pair_id": "dataset", "error": "dataset_not_edited_only"})
+    dataset_root = report.get("dataset_root")
+    if (
+        not isinstance(dataset_root, str)
+        or Path(dataset_root).expanduser().resolve() != root
+    ):
+        errors.append({"pair_id": "dataset", "error": "dataset_root_mismatch"})
+    if report.get("image_path_policy") != "absolute_output_dir_v1":
+        errors.append({"pair_id": "dataset", "error": "dataset_image_path_policy_mismatch"})
     if report.get("mutation_policy_version") != MUTATION_POLICY_VERSION:
         errors.append({"pair_id": "dataset", "error": "dataset_mutation_policy_mismatch"})
     if report.get("selection_policy_version") != SELECTION_POLICY_VERSION:

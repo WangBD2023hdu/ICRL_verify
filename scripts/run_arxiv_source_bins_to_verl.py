@@ -696,7 +696,6 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--input-root", type=Path, required=True)
     parser.add_argument("--work-root", type=Path, required=True)
     parser.add_argument("--output-dir", type=Path, required=True)
-    parser.add_argument("--server-root", required=True)
     parser.add_argument("--workers", type=int, default=max(1, min(8, (os.cpu_count() or 2) // 2)))
     parser.add_argument("--max-papers", type=int, default=0, help="0 means every eligible downloaded paper")
     parser.add_argument("--paper-ids", nargs="*", default=[])
@@ -914,8 +913,6 @@ def main() -> int:
         str(manifest_path),
         "--output-dir",
         str(output_dir),
-        "--server-root",
-        args.server_root,
         "--max-papers",
         str(accepted),
         "--workers",
@@ -961,7 +958,7 @@ def main() -> int:
         "input_root": str(input_root),
         "work_root": str(work_root),
         "output_dir": str(output_dir),
-        "server_root": args.server_root,
+        "image_path_policy": "absolute_output_dir_v1",
         "papers_selected": len(selected),
         "papers_source_first_success": accepted,
         "source_first_verified_pages": len(cases),

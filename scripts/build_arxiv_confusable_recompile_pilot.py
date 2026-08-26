@@ -17,7 +17,7 @@ import hashlib
 import json
 import math
 import os
-from pathlib import Path, PurePosixPath
+from pathlib import Path
 import random
 import re
 import shutil
@@ -40,10 +40,6 @@ from qwen_mm_token_probe.prompts import DEFAULT_PDF_OCR_PROMPT  # noqa: E402
 DEFAULT_RECOMPILE_ROOT = Path("outputs/arxiv_latex_recompile_10")
 DEFAULT_CLEAN_GT_ROOT = Path("outputs/arxiv_page_markdown_gt_10_caption_separate")
 DEFAULT_OUTPUT = Path("outputs/arxiv_confusable_recompile_10")
-DEFAULT_SERVER_ROOT = (
-    "/inspire/sfs/project/inf-multimodal/public/wangbaode/03_innovate/"
-    "01_datasets/CHAOS-Bench/arxiv_confusable_recompile_10"
-)
 LATEXMK = Path(shutil.which("latexmk") or "/Library/TeX/texbin/latexmk")
 PDFTOPPM = Path(shutil.which("pdftoppm") or "/opt/homebrew/bin/pdftoppm")
 SCHEMA_VERSION = 2
@@ -791,8 +787,18 @@ def markdown_diff_count(clean: str, edited: str) -> int:
     return sum(left != right for left, right in zip(clean, edited))
 
 
-def server_path(server_root: str, relative: str) -> str:
-    return str(PurePosixPath(server_root) / PurePosixPath(relative))
+def output_artifact_path(output_dir: Path, relative: str) -> str:
+    """Return the absolute path of a materialized artifact inside output_dir."""
+
+    root = output_dir.expanduser().resolve()
+    target = (root / relative).resolve()
+    try:
+        target.relative_to(root)
+    except ValueError as exc:
+        raise ValueError(f"output artifact escapes output directory: {relative}") from exc
+    if not target.is_file():
+        raise FileNotFoundError(f"output artifact does not exist: {target}")
+    return str(target)
 
 
 def split_by_paper(
@@ -814,7 +820,6 @@ def export_training(
     *,
     output_dir: Path,
     pair_rows: list[dict[str, Any]],
-    server_root: str,
     split_seed: int,
     val_fraction: float,
 ) -> dict[str, Any]:
@@ -824,10 +829,10 @@ def export_training(
     sft_name = f"SFT_edited_{len(pair_rows)}.jsonl"
     for row in pair_rows:
         edited_markdown = (output_dir / row["edited_markdown"]).read_text(encoding="utf-8")
-        image_server = server_path(server_root, row["edited_image"])
+        image_path = output_artifact_path(output_dir, row["edited_image"])
         sft_rows.append(
             {
-                "images": [image_server],
+                "images": [image_path],
                 "conversations": [
                     {"from": "human", "value": DEFAULT_PDF_OCR_PROMPT},
                     {"from": "gpt", "value": edited_markdown},
@@ -845,7 +850,7 @@ def export_training(
         verl_row = {
             "data_source": "chaos_document_ocr",
             "prompt": [{"role": "user", "content": VERL_PROMPT}],
-            "images": [image_server],
+            "images": [image_path],
             "reward_model": {"style": "rule", "ground_truth": edited_markdown},
             "extra_info": {
                 "arxiv_id": row["arxiv_id"],
@@ -2243,7 +2248,6 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--recompile-root", type=Path, default=DEFAULT_RECOMPILE_ROOT)
     parser.add_argument("--clean-gt-root", type=Path, default=DEFAULT_CLEAN_GT_ROOT)
     parser.add_argument("--output-dir", type=Path, default=DEFAULT_OUTPUT)
-    parser.add_argument("--server-root", default=DEFAULT_SERVER_ROOT)
     parser.add_argument("--max-papers", type=int, default=10)
     parser.add_argument("--paper-ids", nargs="*", default=[])
     parser.add_argument(
@@ -2532,7 +2536,6 @@ def main() -> int:
         exports = export_training(
             output_dir=output_dir,
             pair_rows=all_pairs,
-            server_root=args.server_root,
             split_seed=args.split_seed,
             val_fraction=args.val_fraction,
         )
@@ -2580,7 +2583,8 @@ def main() -> int:
         "length_changing_edits_allowed": False,
         "output_mode": "edited_only",
         "clean_assets_copied": False,
-        "server_root": args.server_root,
+        "dataset_root": str(output_dir),
+        "image_path_policy": "absolute_output_dir_v1",
         "exports": exports,
         "paper_results": paper_results,
     }

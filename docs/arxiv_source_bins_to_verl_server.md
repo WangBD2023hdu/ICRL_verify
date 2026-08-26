@@ -50,7 +50,6 @@ PYTHONUNBUFFERED=1 python scripts/run_arxiv_source_bins_to_verl.py \
   --input-root /data/arxiv_sources_2000 \
   --work-root /data/arxiv_source_first_work \
   --output-dir /data/arxiv_confusable_verl_s83 \
-  --server-root /inspire/sfs/project/inf-multimodal/public/wangbaode/03_innovate/01_datasets/CHAOS-Bench/arxiv_confusable_verl_s83 \
   --workers 8 \
   --seed 83 \
   --split-seed 42 \
@@ -69,7 +68,6 @@ python scripts/run_arxiv_source_bins_to_verl.py \
   --input-root /data/arxiv_sources_2000 \
   --work-root /data/arxiv_source_first_smoke_work \
   --output-dir /data/arxiv_confusable_smoke \
-  --server-root /server/path/arxiv_confusable_smoke \
   --max-papers 20 \
   --workers 4
 ```
@@ -136,10 +134,11 @@ output_dir/
 
 只有 `validation_report.json` 和 `independent_verifier_report.json` 均为 `passed` 时，`pipeline_report.json` 才会写入 `status: passed`。
 
-VERL 图片路径不是本地输出路径，而是：
+SFT 和 VERL 中的图片路径就是实际生成文件的绝对路径：
 
 ```text
-<server-root>/data/<pair-id>_edited.png
+<output-dir>/data/<pair-id>_edited.png
 ```
 
-因此上传位置必须和 `--server-root` 一致。
+`--output-dir` 是唯一的数据集根目录，不再存在独立的 `--server-root` 路径重写。
+默认按服务器直接生成和训练处理；如果需要在本地生成后上传，应在上传完成后显式重写并重新校验训练清单。

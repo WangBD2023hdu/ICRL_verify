@@ -21,7 +21,7 @@ import threading
 import time
 from collections.abc import Iterable, Mapping, Sequence
 from itertools import pairwise
-from pathlib import Path, PurePosixPath
+from pathlib import Path
 from types import ModuleType
 from typing import Any
 
@@ -47,14 +47,30 @@ from arxiv_source_first_v2.contracts import (
     validate_page_ledger,
 )
 
-VERIFIER_VERSION = "source_first_v2_edited_independent_verifier_v1"
-V2_MUTATION_INPUT_POLICY_VERSION = "source_first_v2_anchor_lattice_mutation_input_v1"
+VERIFIER_VERSION = "source_first_v2_edited_independent_verifier_v2_single_output_root"
+V2_MUTATION_INPUT_POLICY_VERSION = (
+    "source_first_v2_anchor_lattice_mutation_input_v2_single_output_root"
+)
 V2_PAGE_PROVENANCE = "compiled_source_metadata_span_graph"
 V2_VERIFIER_CONTRACT_VERSION = 4
 HEARTBEAT_SECONDS = 30.0
 
 STABLE_VERIFIER_PATH = REPO_ROOT / "scripts" / "verify_arxiv_confusable_recompile_pilot.py"
 STABLE_MUTATION_PATH = REPO_ROOT / "scripts" / "build_arxiv_confusable_recompile_pilot.py"
+LEGACY_SOURCE_FIRST_STABLE_FILE_SHA256 = {
+    "scripts/run_arxiv_source_bins_to_verl.py": (
+        "f754446ae6f7400d656db2bc6e79dac8d7ab9897cfb356984947528978131728"
+    ),
+    "scripts/build_source_first_color_page_gt.py": (
+        "fcb8dd7a0e1b2da0c656f7d8f7fabbb9576ec85f1f17041c7c6bc0bc19276c69"
+    ),
+    "scripts/build_arxiv_confusable_recompile_pilot.py": (
+        "2a0cb793732343e540c9a0c497ed501cb773ee0ecf5cb220cfed398d023af30e"
+    ),
+    "scripts/verify_arxiv_confusable_recompile_pilot.py": (
+        "db7f29eda56578758c4dfe462e6f78bc0495151651b3cca48d671ee27af462d5"
+    ),
+}
 
 
 class VerificationError(ValueError):
@@ -214,7 +230,13 @@ class Heartbeat:
             self.thread.join(timeout=1.0)
 
 
-def validate_stable_guard(guard: Any, label: str, *, require_final: bool) -> None:
+def validate_stable_guard(
+    guard: Any,
+    label: str,
+    *,
+    require_final: bool,
+    expected_hashes: Mapping[str, str] = STABLE_FILE_SHA256,
+) -> None:
     require(isinstance(guard, Mapping), f"{label}_missing")
     assert isinstance(guard, Mapping)
     require(guard.get("status") == "passed" and guard.get("ok") is True, f"{label}_failed")
@@ -225,8 +247,8 @@ def validate_stable_guard(guard: Any, label: str, *, require_final: bool) -> Non
     files = guard.get("files")
     require(isinstance(files, Mapping), f"{label}_files_missing")
     assert isinstance(files, Mapping)
-    require(set(files) == set(STABLE_FILE_SHA256), f"{label}_file_set_mismatch")
-    for relative, expected in STABLE_FILE_SHA256.items():
+    require(set(files) == set(expected_hashes), f"{label}_file_set_mismatch")
+    for relative, expected in expected_hashes.items():
         evidence = files.get(relative)
         require(isinstance(evidence, Mapping), f"{label}_file_evidence_missing:{relative}")
         assert isinstance(evidence, Mapping)
@@ -238,7 +260,12 @@ def validate_stable_guard(guard: Any, label: str, *, require_final: bool) -> Non
         )
     require(guard.get("mismatches") == [], f"{label}_mismatches_not_empty")
     if require_final:
-        validate_stable_guard(guard.get("final"), f"{label}_final", require_final=False)
+        validate_stable_guard(
+            guard.get("final"),
+            f"{label}_final",
+            require_final=False,
+            expected_hashes=expected_hashes,
+        )
 
 
 def validate_reference_and_figure_provenance(report: Mapping[str, Any], paper_id: str) -> None:
@@ -429,10 +456,15 @@ def validate_source_first_root(
         "contract": EXPERIMENTAL_CONTRACT,
         "pipeline_version": PIPELINE_VERSION,
         "stable_v10_pipeline_version": STABLE_V10_PIPELINE_VERSION,
-        "stable_file_sha256": STABLE_FILE_SHA256,
     }
     for key, expected in expected_marker.items():
         require(marker.get(key) == expected, f"experimental_marker_mismatch:{key}")
+    marker_hashes = marker.get("stable_file_sha256")
+    require(
+        marker_hashes in (STABLE_FILE_SHA256, LEGACY_SOURCE_FIRST_STABLE_FILE_SHA256),
+        "experimental_marker_mismatch:stable_file_sha256",
+    )
+    assert isinstance(marker_hashes, Mapping)
 
     report = read_json(source_root / "validation_report_v2.json")
     required_report = {
@@ -446,7 +478,12 @@ def validate_source_first_root(
     }
     report_failures = sorted(name for name, passed in required_report.items() if not passed)
     require(not report_failures, f"aggregate_report_failed:{','.join(report_failures)}")
-    validate_stable_guard(report.get("stable_guard"), "aggregate_stable_guard", require_final=True)
+    validate_stable_guard(
+        report.get("stable_guard"),
+        "aggregate_stable_guard",
+        require_final=True,
+        expected_hashes=marker_hashes,
+    )
 
     ledger_path = source_root / "page_ledger_v2.jsonl"
     result_path = source_root / "paper_results_v2.jsonl"
@@ -511,7 +548,12 @@ def validate_source_first_root(
         }
         per_failures = sorted(name for name, passed in per_required.items() if not passed)
         require(not per_failures, f"paper_report_failed:{paper_id}:{','.join(per_failures)}")
-        validate_stable_guard(paper_report.get("stable_guard"), f"paper_stable_guard:{paper_id}", require_final=False)
+        validate_stable_guard(
+            paper_report.get("stable_guard"),
+            f"paper_stable_guard:{paper_id}",
+            require_final=False,
+            expected_hashes=marker_hashes,
+        )
         validate_reference_and_figure_provenance(paper_report, paper_id)
         source_clean = paper_root / "source_clean"
         require(source_clean.is_dir(), f"source_clean_missing:{paper_id}")
@@ -599,7 +641,9 @@ def validate_dataset_header(
     root: Path,
     pairs: Sequence[Mapping[str, Any]],
 ) -> tuple[dict[str, Any], dict[str, Any]]:
+    root = root.expanduser().resolve()
     report = read_json(root / "validation_report.json")
+    dataset_root = report.get("dataset_root")
     required = {
         "schema": report.get("schema_version") == 2,
         "status": report.get("status") == "passed",
@@ -615,8 +659,10 @@ def validate_dataset_header(
         == "exclude_bibliography_tail_v1",
         "digits_disallowed": report.get("digits_allowed") is False,
         "length_changes_disallowed": report.get("length_changing_edits_allowed") is False,
-        "server_root": isinstance(report.get("server_root"), str)
-        and PurePosixPath(str(report.get("server_root"))).is_absolute(),
+        "dataset_root": isinstance(dataset_root, str)
+        and Path(dataset_root).expanduser().resolve() == root,
+        "image_path_policy": report.get("image_path_policy")
+        == "absolute_output_dir_v1",
     }
     failures = sorted(name for name, passed in required.items() if not passed)
     require(not failures, f"edited_dataset_header_failed:{','.join(failures)}")
@@ -683,6 +729,7 @@ def validate_final_provenance(
         "target_mutations_per_page": [3, 4],
         "four_mutation_target_probability": 0.6,
         "training_schema_source": "frozen_v1_export_training",
+        "image_path_policy": "absolute_output_dir_v1",
         "pdf_used_for_ground_truth": False,
         "pdf_used_for_verification": True,
     }
@@ -1003,10 +1050,16 @@ def verify_exports(
             errors.append(code)
 
     pair_by_id = {str(pair["pair_id"]): pair for pair in pairs}
-    expected_image_to_pair = {
-        str(PurePosixPath(str(report["server_root"])) / str(pair["edited_image"])): pair
-        for pair in pairs
-    }
+    expected_image_to_pair: dict[str, Mapping[str, Any]] = {}
+    for pair in pairs:
+        try:
+            image_path = safe_relative(
+                root, pair.get("edited_image"), f"edited_image:{pair.get('pair_id')}"
+            )
+        except VerificationError as exc:
+            errors.append(str(exc))
+            continue
+        expected_image_to_pair[str(image_path)] = pair
     exports = report.get("exports")
     if not isinstance(exports, Mapping):
         return ["exports_missing"]
@@ -1070,7 +1123,13 @@ def verify_exports(
             check(pair_id not in seen_verl, f"verl_duplicate_pair:{pair_id}")
             seen_verl.add(pair_id)
             edited_markdown = (root / str(pair["edited_markdown"])).read_text(encoding="utf-8")
-            expected_image = str(PurePosixPath(str(report["server_root"])) / str(pair["edited_image"]))
+            try:
+                expected_image = str(
+                    safe_relative(root, pair.get("edited_image"), f"edited_image:{pair_id}")
+                )
+            except VerificationError as exc:
+                errors.append(str(exc))
+                continue
             check(row.get("images") == [expected_image], f"verl_image_path_mismatch:{pair_id}")
             check(
                 row.get("reward_model") == {"style": "rule", "ground_truth": edited_markdown},

@@ -52,16 +52,16 @@ COMPLEX_LAYOUT_BUCKETS = frozenset(
 # change, not an implicit update through this experimental package.
 STABLE_FILE_SHA256: dict[str, str] = {
     "scripts/run_arxiv_source_bins_to_verl.py": (
-        "f754446ae6f7400d656db2bc6e79dac8d7ab9897cfb356984947528978131728"
+        "9c86831fa22cfa88a968103b37dfff5ae00dce97b4ce7741540a7b7e6dcea906"
     ),
     "scripts/build_source_first_color_page_gt.py": (
         "fcb8dd7a0e1b2da0c656f7d8f7fabbb9576ec85f1f17041c7c6bc0bc19276c69"
     ),
     "scripts/build_arxiv_confusable_recompile_pilot.py": (
-        "2a0cb793732343e540c9a0c497ed501cb773ee0ecf5cb220cfed398d023af30e"
+        "95cb07d72e5d5ee8a08c70a53c98c5e6c4f08d451b99995e8628a6d6a5115784"
     ),
     "scripts/verify_arxiv_confusable_recompile_pilot.py": (
-        "db7f29eda56578758c4dfe462e6f78bc0495151651b3cca48d671ee27af462d5"
+        "63b84cf86b70e75901fd0a8d3da330697351e5a4c86180c9eaf8e6ec830bfdb2"
     ),
 }
 

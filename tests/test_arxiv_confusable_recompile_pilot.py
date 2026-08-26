@@ -690,6 +690,60 @@ class ConfusableRecompilePilotTests(unittest.TestCase):
         }
         self.assertEqual(set(projected), {"ocr_ans", "origin_ans", "bbox"})
 
+    def test_training_exports_use_actual_output_image_path(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory).resolve()
+            image = root / "data/pair_edited.png"
+            markdown = root / "ground_truths/pair_edited.md"
+            image.parent.mkdir(parents=True)
+            markdown.parent.mkdir(parents=True)
+            image.write_bytes(b"png")
+            markdown.write_text("mutatcd text\n", encoding="utf-8")
+            pair = {
+                "paper_id": "paper-v1",
+                "arxiv_id": "paper",
+                "pair_id": "pair",
+                "edited_image": "data/pair_edited.png",
+                "edited_markdown": "ground_truths/pair_edited.md",
+                "changes": [
+                    {
+                        "ocr_ans": "mutatcd",
+                        "origin_ans": "mutated",
+                        "bbox": [1, 2, 3, 4],
+                    }
+                ],
+            }
+            exports = MODULE.export_training(
+                output_dir=root,
+                pair_rows=[pair],
+                split_seed=42,
+                val_fraction=0.05,
+            )
+            sft = json.loads(
+                (root / exports["sft"]).read_text(encoding="utf-8").splitlines()[0]
+            )
+            verl = json.loads(
+                (root / "verl_grpo/train.jsonl")
+                .read_text(encoding="utf-8")
+                .splitlines()[0]
+            )
+            self.assertEqual(sft["images"], [str(image.resolve())])
+            self.assertEqual(verl["images"], [str(image.resolve())])
+            self.assertTrue(Path(sft["images"][0]).is_file())
+
+    def test_output_artifact_path_rejects_missing_or_escaping_file(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory).resolve()
+            with self.assertRaises(FileNotFoundError):
+                MODULE.output_artifact_path(root, "data/missing.png")
+            outside = root.parent / f"{root.name}-outside.png"
+            outside.write_bytes(b"png")
+            try:
+                with self.assertRaisesRegex(ValueError, "escapes output directory"):
+                    MODULE.output_artifact_path(root, f"../{outside.name}")
+            finally:
+                outside.unlink()
+
     def test_atomic_write_json_has_no_partial_file(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "result.json"

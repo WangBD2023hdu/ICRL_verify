@@ -346,7 +346,6 @@ class SourceFirstV2MutationAdapterTests(unittest.TestCase):
             MutationRunConfig(
                 source_first_root=source,
                 output_dir=output,
-                server_root="/server/edited",
                 workers=1,
                 latexmk=Path(sys.executable),
                 pdftoppm=Path(sys.executable),
@@ -362,6 +361,10 @@ class SourceFirstV2MutationAdapterTests(unittest.TestCase):
         sft_path = output / report["exports"]["sft"]
         sft = json.loads(sft_path.read_text(encoding="utf-8").splitlines()[0])
         self.assertEqual(set(sft), {"images", "conversations"})
+        pair = json.loads((output / "pairs.jsonl").read_text(encoding="utf-8"))
+        expected_image = str((output / pair["edited_image"]).resolve())
+        self.assertEqual(sft["images"], [expected_image])
+        self.assertTrue(Path(sft["images"][0]).is_file())
         self.assertEqual(set(sft["conversations"][0]), {"from", "value"})
         self.assertEqual(sft["conversations"][0]["from"], "human")
         self.assertEqual(sft["conversations"][1]["from"], "gpt")
@@ -373,6 +376,7 @@ class SourceFirstV2MutationAdapterTests(unittest.TestCase):
         ]
         self.assertEqual(len(train), 1)
         verl = train[0]
+        self.assertEqual(verl["images"], [expected_image])
         self.assertEqual(
             set(verl),
             {
@@ -398,7 +402,6 @@ class SourceFirstV2MutationAdapterTests(unittest.TestCase):
                 MutationRunConfig(
                     source_first_root=source,
                     output_dir=output,
-                    server_root="/server/edited",
                     workers=1,
                     seed=84,
                     latexmk=Path(sys.executable),

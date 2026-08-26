@@ -43,6 +43,7 @@ from .contracts import (
     EXPERIMENTAL_MARKER_FILENAME,
     EXPERIMENTAL_SCHEMA_VERSION,
     PIPELINE_VERSION,
+    STABLE_FILE_SHA256,
     STABLE_V10_PIPELINE_VERSION,
     ContractError,
     assert_stable_files,
@@ -58,7 +59,9 @@ PER_PAPER_PASSED = "pages_passed.jsonl"
 SOURCE_UNITS = "source_units.jsonl"
 SOURCE_CLEAN = "source_clean"
 RUN_CONFIG_FILENAME = "mutation_adapter_run_config.json"
-ADAPTER_POLICY_VERSION = "source_first_v2_anchor_lattice_mutation_input_v1"
+ADAPTER_POLICY_VERSION = (
+    "source_first_v2_anchor_lattice_mutation_input_v2_single_output_root"
+)
 V1_FOUR_MUTATION_TARGET_PROBABILITY = 0.6
 HEARTBEAT_SECONDS = 30.0
 SAFE_PAPER_ID = re.compile(r"^[A-Za-z0-9._-]+$")
@@ -82,7 +85,6 @@ class V2MutationInputs:
 class MutationRunConfig:
     source_first_root: Path
     output_dir: Path
-    server_root: str
     max_papers: int = 0
     paper_ids: tuple[str, ...] = ()
     workers: int = 1
@@ -268,6 +270,17 @@ def prepare_output_directory(output_dir: Path, *, resume: bool) -> dict[str, Any
             "marker_payload": read_json(marker_path),
         }
     payload = validate_v2_marker(output)
+    if payload.get("stable_file_sha256") != STABLE_FILE_SHA256:
+        raise ContractError(
+            "edit output was created under a different stable execution chain; "
+            "choose a new --output-dir"
+        )
+    if (payload.get("metadata") or {}).get(
+        "adapter_policy_version"
+    ) != ADAPTER_POLICY_VERSION:
+        raise ContractError(
+            "edit output uses an older adapter path policy; choose a new --output-dir"
+        )
     return {
         "status": "passed",
         "root": str(output),
@@ -899,7 +912,8 @@ def run_mutation_export(
         ),
         "source_first_page_ledger_sha256": sha256_file(source_root / AGGREGATE_LEDGER),
         "selected_papers": selected_papers,
-        "server_root": config.server_root,
+        "dataset_root": str(output_dir),
+        "image_path_policy": "absolute_output_dir_v1",
         "seed": config.seed,
         "split_seed": config.split_seed,
         "val_fraction": config.val_fraction,
@@ -1071,7 +1085,6 @@ def run_mutation_export(
         exports = exporter(
             output_dir=output_dir,
             pair_rows=pair_rows,
-            server_root=config.server_root,
             split_seed=config.split_seed,
             val_fraction=config.val_fraction,
         )
@@ -1102,6 +1115,7 @@ def run_mutation_export(
         "target_mutations_per_page": [3, 4],
         "four_mutation_target_probability": V1_FOUR_MUTATION_TARGET_PROBABILITY,
         "training_schema_source": "frozen_v1_export_training",
+        "image_path_policy": "absolute_output_dir_v1",
         "pdf_used_for_ground_truth": False,
         "pdf_used_for_verification": True,
     }
@@ -1143,7 +1157,8 @@ def run_mutation_export(
         "length_changing_edits_allowed": False,
         "output_mode": "edited_only",
         "clean_assets_copied": False,
-        "server_root": config.server_root,
+        "dataset_root": str(output_dir),
+        "image_path_policy": "absolute_output_dir_v1",
         "exports": exports,
         "paper_results": paper_results,
         "source_first_v2_provenance": provenance,
@@ -1171,7 +1186,6 @@ def build_arg_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--source-first-root", type=Path, required=True)
     parser.add_argument("--output-dir", type=Path, required=True)
-    parser.add_argument("--server-root", required=True)
     parser.add_argument("--max-papers", type=int, default=0, help="0 means all")
     parser.add_argument("--paper-ids", nargs="*", default=[])
     parser.add_argument(
@@ -1204,7 +1218,6 @@ def main(argv: Sequence[str] | None = None) -> int:
     config = MutationRunConfig(
         source_first_root=args.source_first_root,
         output_dir=args.output_dir,
-        server_root=args.server_root,
         max_papers=args.max_papers,
         paper_ids=tuple(args.paper_ids),
         workers=args.workers,

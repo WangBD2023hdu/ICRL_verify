@@ -44,7 +44,8 @@ def write_jsonl(path: Path, rows: list[dict]) -> None:
     )
 
 
-def stable_guard(*, final: bool = False) -> dict:
+def stable_guard(*, final: bool = False, hashes: dict[str, str] | None = None) -> dict:
+    hashes = MODULE.STABLE_FILE_SHA256 if hashes is None else hashes
     guard = {
         "status": "passed",
         "ok": True,
@@ -56,18 +57,21 @@ def stable_guard(*, final: bool = False) -> dict:
                 "expected_sha256": digest,
                 "observed_sha256": digest,
             }
-            for path, digest in MODULE.STABLE_FILE_SHA256.items()
+            for path, digest in hashes.items()
         },
         "mismatches": [],
     }
     if final:
-        guard["final"] = stable_guard(final=False)
+        guard["final"] = stable_guard(final=False, hashes=hashes)
     return guard
 
 
 class SourceFirstEvidenceFixture:
-    def __init__(self, root: Path) -> None:
+    def __init__(self, root: Path, *, stable_hashes: dict[str, str] | None = None) -> None:
         self.root = root
+        self.stable_hashes = (
+            MODULE.STABLE_FILE_SHA256 if stable_hashes is None else stable_hashes
+        )
         self.paper_id = "fixture.v1"
         self.data_id = f"{self.paper_id}_page_0001_sfspanv2"
         self.paper_root = root / "papers" / self.paper_id
@@ -98,7 +102,7 @@ class SourceFirstEvidenceFixture:
             "contract": MODULE.EXPERIMENTAL_CONTRACT,
             "pipeline_version": MODULE.PIPELINE_VERSION,
             "stable_v10_pipeline_version": MODULE.STABLE_V10_PIPELINE_VERSION,
-            "stable_file_sha256": MODULE.STABLE_FILE_SHA256,
+            "stable_file_sha256": self.stable_hashes,
             "purpose": "fixture",
         }
         write_json(self.root / MODULE.EXPERIMENTAL_MARKER_FILENAME, marker)
@@ -125,7 +129,7 @@ class SourceFirstEvidenceFixture:
             "accepted_exact_verifier_rate": 1.0,
             "page_ledger": str((self.root / "page_ledger_v2.jsonl").resolve()),
             "paper_results": str((self.root / "paper_results_v2.jsonl").resolve()),
-            "stable_guard": stable_guard(final=True),
+            "stable_guard": stable_guard(final=True, hashes=self.stable_hashes),
             "pdf_used_for_generation": False,
             "pdf_used_for_verification": True,
         }
@@ -245,7 +249,7 @@ class SourceFirstEvidenceFixture:
                 "status": "passed",
                 "files": [{"source_file": "main.tex", "status": "passed"}],
             },
-            "stable_guard": stable_guard(),
+            "stable_guard": stable_guard(hashes=self.stable_hashes),
             "pdf_used_for_generation": False,
             "pdf_used_for_verification": True,
         }
@@ -279,6 +283,14 @@ class SourceFirstV2EditedVerifierTest(unittest.TestCase):
         index = MODULE.validate_source_first_root(fixture.root)
         self.assertEqual(set(index), {fixture.data_id})
         self.assertEqual(index[fixture.data_id]["markdown_sha256"], fixture.markdown_hash)
+
+    def test_accepts_legacy_clean_source_first_hashes(self) -> None:
+        fixture = SourceFirstEvidenceFixture(
+            self.base / "legacy_source_first",
+            stable_hashes=MODULE.LEGACY_SOURCE_FIRST_STABLE_FILE_SHA256,
+        )
+        index = MODULE.validate_source_first_root(fixture.root)
+        self.assertEqual(set(index), {fixture.data_id})
 
     def test_rejects_marker_stable_hash_tampering(self) -> None:
         fixture = self.make_source()
@@ -347,7 +359,8 @@ class SourceFirstV2EditedVerifierTest(unittest.TestCase):
             "bibliography_policy_version": "exclude_bibliography_tail_v1",
             "digits_allowed": False,
             "length_changing_edits_allowed": False,
-            "server_root": "/server/data",
+            "dataset_root": str(root.resolve()),
+            "image_path_policy": "absolute_output_dir_v1",
             "strict_input_filter_audit": "strict_input_filter_audit.json",
             "strict_input_pages_scanned": 2,
             "strict_input_pages_accepted": 1,
@@ -357,6 +370,11 @@ class SourceFirstV2EditedVerifierTest(unittest.TestCase):
         pair = {"pair_id": "p1"}
         loaded, _ = MODULE.validate_dataset_header(root, [pair])
         self.assertEqual(loaded["accepted_pairs"], 1)
+        report["dataset_root"] = str((self.base / "elsewhere").resolve())
+        write_json(root / "validation_report.json", report)
+        with self.assertRaisesRegex(MODULE.VerificationError, "dataset_root"):
+            MODULE.validate_dataset_header(root, [pair])
+        report["dataset_root"] = str(root.resolve())
         report["strict_input_filter_policy_version"] = "v1-policy"
         write_json(root / "validation_report.json", report)
         with self.assertRaisesRegex(MODULE.VerificationError, "input_policy"):
@@ -515,6 +533,7 @@ class SourceFirstV2EditedVerifierTest(unittest.TestCase):
             self.skipTest("pyarrow is unavailable")
         root = self.base / "exports"
         (root / "ground_truths").mkdir(parents=True)
+        (root / "data").mkdir()
         (root / "verl_grpo").mkdir()
         markdown = "stcne nceds urgc\n"
         (root / "ground_truths" / "pair.md").write_text(markdown, encoding="utf-8")
@@ -531,9 +550,10 @@ class SourceFirstV2EditedVerifierTest(unittest.TestCase):
             "edited_markdown": "ground_truths/pair.md",
             "changes": changes,
         }
-        server_image = "/server/data/data/pair.png"
+        (root / pair["edited_image"]).write_bytes(b"png")
+        image_path = str((root / pair["edited_image"]).resolve())
         sft = {
-            "images": [server_image],
+            "images": [image_path],
             "conversations": [
                 {"from": "human", "value": "PROMPT"},
                 {"from": "gpt", "value": markdown},
@@ -542,7 +562,7 @@ class SourceFirstV2EditedVerifierTest(unittest.TestCase):
         verl = {
             "data_source": "chaos_document_ocr",
             "prompt": [{"role": "user", "content": "VERL"}],
-            "images": [server_image],
+            "images": [image_path],
             "reward_model": {"style": "rule", "ground_truth": markdown},
             "extra_info": {
                 "arxiv_id": "fixture",
@@ -557,7 +577,8 @@ class SourceFirstV2EditedVerifierTest(unittest.TestCase):
         pq.write_table(pa.Table.from_pylist([verl]), root / "verl_grpo" / "train.parquet")
         pq.write_table(pa.Table.from_pylist([]), root / "verl_grpo" / "val.parquet")
         report = {
-            "server_root": "/server/data",
+            "dataset_root": str(root.resolve()),
+            "image_path_policy": "absolute_output_dir_v1",
             "exports": {"sft": "SFT_edited_1.jsonl", "train": 1, "val": 0},
         }
         errors = MODULE.verify_exports(
@@ -568,6 +589,18 @@ class SourceFirstV2EditedVerifierTest(unittest.TestCase):
             verl_prompt="VERL",
         )
         self.assertEqual(errors, [])
+
+        sft["images"] = ["/server/data/data/pair.png"]
+        write_jsonl(root / "SFT_edited_1.jsonl", [sft])
+        errors = MODULE.verify_exports(
+            root=root,
+            pairs=[pair],
+            report=report,
+            default_prompt="PROMPT",
+            verl_prompt="VERL",
+        )
+        self.assertIn("sft_image_path_mismatch", errors)
+        sft["images"] = [image_path]
 
         sft["conversations"][1]["value"] = "tampered"
         write_jsonl(root / "SFT_edited_1.jsonl", [sft])

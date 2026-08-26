@@ -41,7 +41,7 @@ from arxiv_source_first_v2.contracts import (
     PIPELINE_VERSION as SOURCE_FIRST_PIPELINE_VERSION,
 )
 
-PIPELINE_VERSION = "source_bins_to_confusable_verl_v2_edited_v1"
+PIPELINE_VERSION = "source_bins_to_confusable_verl_v2_edited_v2_single_output_root"
 HEARTBEAT_SECONDS = 30.0
 SOURCE_FIRST_SCRIPT = SCRIPT_DIR / "run_arxiv_source_bins_to_verl_v2.py"
 MUTATION_SCRIPT = SCRIPT_DIR / "build_arxiv_confusable_from_source_first_v2.py"
@@ -233,7 +233,6 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--input-root", type=Path, required=True)
     parser.add_argument("--work-root", type=Path, required=True)
     parser.add_argument("--output-dir", type=Path, required=True)
-    parser.add_argument("--server-root", required=True)
     parser.add_argument("--stable-output-root", action="append", type=Path, default=[])
     parser.add_argument("--workers", type=int, default=max(1, min(32, os.cpu_count() or 1)))
     parser.add_argument(
@@ -444,8 +443,6 @@ def main(argv: Sequence[str] | None = None) -> int:
         str(source_first_root),
         "--output-dir",
         str(output_dir),
-        "--server-root",
-        args.server_root,
         "--max-papers",
         str(args.max_papers),
         "--workers",
@@ -502,7 +499,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         "work_root": str(work_root),
         "source_first_root": str(source_first_root),
         "output_dir": str(output_dir),
-        "server_root": args.server_root,
+        "image_path_policy": "absolute_output_dir_v1",
         "papers_selected": int(source_report.get("papers_selected", 0)),
         "papers_source_first_success": int(source_report.get("papers_success", 0)),
         "source_first_verified_pages": int(source_report.get("pages_passed", 0)),
