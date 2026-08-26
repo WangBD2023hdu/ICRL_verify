@@ -100,6 +100,23 @@ sample browser and per-token visualization remain unchanged:
   mutation spans; ordinary response tokens are not included;
 - `teacher_signal_sample_summary.csv`: one audit row per sample.
 
+Correct student response tokens have a second, independent teacher-rejection
+audit. It includes `token_label=correct` and, by request, formatting tokens:
+
+- `correct_token_teacher_rejection.html`: standalone token-level inspection;
+- `correct_token_teacher_rejection.json`: aggregate, group, sample, and
+  threshold-sweep metrics;
+- `correct_token_teacher_rejection.csv`: every included response token in its
+  original order;
+- `correct_token_teacher_rejection_sample_summary.csv`: one row per sample.
+
+The audit reports four separate notions rather than one ambiguous rejection
+rate: any `delta_logp < 0`, suppression beyond
+`delta_logp < -teacher_signal_threshold`, Teacher Top-1 using a different token
+ID, and Teacher Top-1 decoding to a different surface. Formatting tokens are
+included in a separate group, but their correctness is not character-alignment
+verified because OCR normalization removes formatting syntax and whitespace.
+
 Only annotated mutation words are included; ordinary response words never enter
 the audit denominator. Each mutation is counted once even when its readback has
 multiple tokenizer tokens. `relation=expected` is correct, while

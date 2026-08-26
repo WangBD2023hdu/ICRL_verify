@@ -1369,3 +1369,372 @@ def test_cli_exposes_teacher_signal_threshold() -> None:
     )
 
     assert args.teacher_signal_threshold == pytest.approx(0.125)
+
+
+def _correct_token_teacher_result(
+    pair_id: str,
+    sample_report: str,
+    ground_truth: str,
+    token_specs: list[dict[str, object]],
+) -> dict[str, object]:
+    response_ids = [int(spec["token_id"]) for spec in token_specs]
+    original_scores: list[dict[str, object]] = []
+    teacher_scores: list[dict[str, object]] = []
+    for spec in token_specs:
+        token_id = int(spec["token_id"])
+        raw_token = str(spec["raw_token"])
+        p_original = float(spec["p_original"])
+        delta_logp = float(spec["delta_logp"])
+        p_teacher = p_original * math.exp(delta_logp)
+        original_scores.append(
+            _score_record(
+                token_id,
+                raw_token,
+                p_original,
+                top_token_id=token_id,
+                top_raw_token=raw_token,
+                top_probability=p_original,
+                target_rank=1,
+            )
+        )
+        teacher_scores.append(
+            _score_record(
+                token_id,
+                raw_token,
+                p_teacher,
+                top_token_id=int(spec["teacher_top_token_id"]),
+                top_raw_token=str(spec["teacher_top_raw_token"]),
+                top_probability=float(spec["teacher_top_probability"]),
+                target_rank=int(spec["teacher_rank"]),
+            )
+        )
+
+    rows = probe._combine_scores(response_ids, original_scores, teacher_scores)
+    source_offset = 0
+    for row, spec in zip(rows, token_specs):
+        raw_token = str(spec["raw_token"])
+        row.update(
+            {
+                "pair_id": pair_id,
+                "sample_report": sample_report,
+                "raw_source_start": source_offset,
+                "raw_source_end": source_offset + len(raw_token),
+                "token_label": str(spec["token_label"]),
+                "mutation_ids": "",
+            }
+        )
+        # Keep the boundary value exact so the strict < -threshold rule is tested.
+        row["delta_logp_teacher_minus_original"] = float(spec["delta_logp"])
+        source_offset += len(raw_token)
+
+    return {
+        "pair_id": pair_id,
+        "sample": {"image_copy": "input.png", "changes": []},
+        "ground_truth": ground_truth,
+        "response": {
+            "text": "".join(str(spec["raw_token"]) for spec in token_specs),
+            "token_ids": response_ids,
+            "finish_reason": "stop",
+        },
+        "summary": {"token_count": len(rows)},
+        "mutation_observations": [],
+        "protocol": {"teacher_model_is_student": True},
+        "tokens": rows,
+    }
+
+
+def _correct_token_teacher_fixture() -> tuple[
+    list[dict[str, object]], list[dict[str, object]]
+]:
+    results = [
+        _correct_token_teacher_result(
+            "pair-1",
+            "samples/001-pair-1/report.html",
+            "A",
+            [
+                {
+                    "token_id": 101,
+                    "raw_token": "A",
+                    "token_label": "correct",
+                    "p_original": 0.20,
+                    "delta_logp": -0.06,
+                    "teacher_top_token_id": 101,
+                    "teacher_top_raw_token": "A",
+                    "teacher_top_probability": 0.19,
+                    "teacher_rank": 1,
+                },
+                {
+                    "token_id": 102,
+                    "raw_token": "\n",
+                    "token_label": "formatting",
+                    "p_original": 0.40,
+                    "delta_logp": -0.05,
+                    "teacher_top_token_id": 9102,
+                    "teacher_top_raw_token": "X",
+                    "teacher_top_probability": 0.70,
+                    "teacher_rank": 2,
+                },
+                {
+                    "token_id": 103,
+                    "raw_token": "X",
+                    "token_label": "hallucination",
+                    "p_original": 0.30,
+                    "delta_logp": -0.20,
+                    "teacher_top_token_id": 9103,
+                    "teacher_top_raw_token": "Y",
+                    "teacher_top_probability": 0.70,
+                    "teacher_rank": 2,
+                },
+            ],
+        ),
+        _correct_token_teacher_result(
+            "pair-2",
+            "samples/002-pair-2/report.html",
+            "B",
+            [
+                {
+                    "token_id": 201,
+                    "raw_token": "B",
+                    "token_label": "correct",
+                    "p_original": 0.30,
+                    "delta_logp": -0.01,
+                    "teacher_top_token_id": 9201,
+                    "teacher_top_raw_token": "B",
+                    "teacher_top_probability": 0.50,
+                    "teacher_rank": 2,
+                },
+                {
+                    "token_id": 202,
+                    "raw_token": "\t",
+                    "token_label": "formatting",
+                    "p_original": 0.25,
+                    "delta_logp": 0.02,
+                    "teacher_top_token_id": 202,
+                    "teacher_top_raw_token": "\t",
+                    "teacher_top_probability": 0.26,
+                    "teacher_rank": 1,
+                },
+            ],
+        ),
+    ]
+    rows = []
+    for result in results:
+        rows.extend(
+            probe._prepare_correct_token_teacher_rows(
+                result,
+                sample_report=(
+                    "samples/001-pair-1/report.html"
+                    if result["pair_id"] == "pair-1"
+                    else "samples/002-pair-2/report.html"
+                ),
+            )
+        )
+    return results, rows
+
+
+def test_correct_token_teacher_rows_include_formatting_and_exclude_wrong_tokens() -> (
+    None
+):
+    results, rows = _correct_token_teacher_fixture()
+
+    assert len(results[0]["tokens"]) == 3
+    assert [int(row["token_id"]) for row in rows] == [101, 102, 201, 202]
+    assert [str(row["token_label"]) for row in rows] == [
+        "correct",
+        "formatting",
+        "correct",
+        "formatting",
+    ]
+    assert [str(row["inclusion_group"]) for row in rows] == [
+        "verified_correct",
+        "formatting",
+        "verified_correct",
+        "formatting",
+    ]
+    assert [bool(row["correctness_verified_against_gt"]) for row in rows] == [
+        True,
+        False,
+        True,
+        False,
+    ]
+    assert 103 not in {int(row["token_id"]) for row in rows}
+
+
+def test_correct_token_teacher_audit_counts_groups_samples_threshold_and_top1() -> None:
+    results, rows = _correct_token_teacher_fixture()
+    audit = probe._build_correct_token_teacher_audit(
+        results,
+        rows,
+        selected_threshold=0.05,
+    )
+
+    assert audit["selected_threshold"] == pytest.approx(0.05)
+    assert audit["included_token_count"] == 4
+    assert audit["verified_correct_token_count"] == 2
+    assert audit["formatting_token_count"] == 2
+    assert audit["probability_decreased_count"] == 3
+    assert audit["probability_decreased_rate"] == pytest.approx(3 / 4)
+    assert audit["suppressed_beyond_threshold_count"] == 1
+    assert audit["suppressed_beyond_threshold_rate"] == pytest.approx(1 / 4)
+    assert audit["teacher_top1_exact_id_rejection_count"] == 2
+    assert audit["teacher_top1_exact_id_rejection_rate"] == pytest.approx(2 / 4)
+    assert audit["teacher_top1_surface_rejection_count"] == 1
+    assert audit["teacher_top1_surface_rejection_rate"] == pytest.approx(1 / 4)
+
+    groups = {str(row["inclusion_group"]): row for row in audit["group_breakdown"]}
+    assert groups["verified_correct"]["included_token_count"] == 2
+    assert groups["verified_correct"]["probability_decreased_count"] == 2
+    assert groups["verified_correct"]["suppressed_beyond_threshold_count"] == 1
+    assert groups["verified_correct"]["teacher_top1_exact_id_rejection_count"] == 1
+    assert groups["verified_correct"]["teacher_top1_surface_rejection_count"] == 0
+    assert groups["formatting"]["included_token_count"] == 2
+    assert groups["formatting"]["probability_decreased_count"] == 1
+    assert groups["formatting"]["suppressed_beyond_threshold_count"] == 0
+    assert groups["formatting"]["teacher_top1_exact_id_rejection_count"] == 1
+    assert groups["formatting"]["teacher_top1_surface_rejection_count"] == 1
+
+    samples = {str(row["pair_id"]): row for row in audit["sample_summary"]}
+    assert samples["pair-1"]["included_token_count"] == 2
+    assert samples["pair-1"]["probability_decreased_count"] == 2
+    assert samples["pair-1"]["suppressed_beyond_threshold_count"] == 1
+    assert samples["pair-1"]["teacher_top1_surface_rejection_count"] == 1
+    assert samples["pair-2"]["included_token_count"] == 2
+    assert samples["pair-2"]["probability_decreased_count"] == 1
+    assert samples["pair-2"]["suppressed_beyond_threshold_count"] == 0
+    assert samples["pair-2"]["teacher_top1_exact_id_rejection_count"] == 1
+
+    sweep = {float(row["threshold"]): row for row in audit["threshold_sweep"]}
+    assert {0.0, 0.01, 0.05, 0.1, 0.2, 0.5} <= set(sweep)
+    assert sweep[0.0]["suppressed_beyond_threshold_count"] == 3
+    assert sweep[0.05]["suppressed_beyond_threshold_count"] == 1
+    assert sweep[0.1]["suppressed_beyond_threshold_count"] == 0
+
+
+def test_correct_token_teacher_audit_html_is_standalone_and_shows_all_tokens() -> None:
+    results, rows = _correct_token_teacher_fixture()
+    audit = probe._build_correct_token_teacher_audit(
+        results,
+        rows,
+        selected_threshold=0.05,
+    )
+
+    rendered = probe._render_correct_token_teacher_audit_html(audit, rows)
+
+    assert rendered.lstrip().lower().startswith("<!doctype html>")
+    assert "<html" in rendered
+    assert "</html>" in rendered
+    assert "0.05" in rendered
+    assert "formatting" in rendered
+    for token_id in ("101", "102", "201", "202"):
+        assert token_id in rendered
+    assert "103" not in rendered
+    assert "<iframe" not in rendered
+
+
+def test_rebuild_privileged_report_writes_correct_token_teacher_artifacts(
+    tmp_path: Path,
+) -> None:
+    results, _ = _correct_token_teacher_fixture()
+    output_dir = tmp_path / "report"
+    for ordinal, result in enumerate(results, start=1):
+        sample_dir = output_dir / "samples" / f"{ordinal:03d}-{result['pair_id']}"
+        sample_dir.mkdir(parents=True)
+        (sample_dir / "result.json").write_text(
+            json.dumps(result, ensure_ascii=False),
+            encoding="utf-8",
+        )
+
+    probe.rebuild_privileged_report(output_dir, teacher_signal_threshold=0.05)
+
+    expected_files = {
+        "report.html",
+        "teacher_signal_audit.html",
+        "teacher_signal_audit.json",
+        "teacher_signal_mutations.csv",
+        "teacher_signal_tokens.csv",
+        "teacher_signal_sample_summary.csv",
+        "correct_token_teacher_rejection.html",
+        "correct_token_teacher_rejection.json",
+        "correct_token_teacher_rejection.csv",
+        "correct_token_teacher_rejection_sample_summary.csv",
+    }
+    assert expected_files <= {
+        path.name for path in output_dir.iterdir() if path.is_file()
+    }
+
+    expected_sample_rows = [
+        {
+            "pair_id": str(result["pair_id"]),
+            "report": (
+                "samples/001-pair-1/report.html"
+                if result["pair_id"] == "pair-1"
+                else "samples/002-pair-2/report.html"
+            ),
+            "finish_reason": "stop",
+            **result["summary"],
+        }
+        for result in results
+    ]
+    assert (output_dir / "report.html").read_text(
+        encoding="utf-8"
+    ) == probe._render_aggregate_html(expected_sample_rows)
+
+    existing_audit = json.loads(
+        (output_dir / "teacher_signal_audit.json").read_text(encoding="utf-8")
+    )
+    expected_existing_audit = probe._build_teacher_signal_audit(
+        results,
+        [],
+        selected_threshold=0.05,
+    )
+    assert {
+        key: value for key, value in existing_audit.items() if key != "created_at"
+    } == {
+        key: value
+        for key, value in expected_existing_audit.items()
+        if key != "created_at"
+    }
+    assert (output_dir / "teacher_signal_audit.html").read_text(
+        encoding="utf-8"
+    ) == probe._render_teacher_signal_audit_html(expected_existing_audit, [])
+
+    correct_audit = json.loads(
+        (output_dir / "correct_token_teacher_rejection.json").read_text(
+            encoding="utf-8"
+        )
+    )
+    assert correct_audit["included_token_count"] == 4
+    assert correct_audit["formatting_token_count"] == 2
+    assert correct_audit["suppressed_beyond_threshold_count"] == 1
+
+    with (output_dir / "correct_token_teacher_rejection.csv").open(
+        encoding="utf-8", newline=""
+    ) as handle:
+        rejection_rows = list(csv.DictReader(handle))
+    assert len(rejection_rows) == 4
+    assert {row["token_id"] for row in rejection_rows} == {
+        "101",
+        "102",
+        "201",
+        "202",
+    }
+    assert {row["inclusion_group"] for row in rejection_rows} == {
+        "verified_correct",
+        "formatting",
+    }
+    assert "103" not in {row["token_id"] for row in rejection_rows}
+
+    with (output_dir / "correct_token_teacher_rejection_sample_summary.csv").open(
+        encoding="utf-8-sig", newline=""
+    ) as handle:
+        sample_summary_rows = list(csv.DictReader(handle))
+    assert {
+        row["pair_id"]: row["included_token_count"] for row in sample_summary_rows
+    } == {"pair-1": "2", "pair-2": "2"}
+
+    rendered = (output_dir / "correct_token_teacher_rejection.html").read_text(
+        encoding="utf-8"
+    )
+    assert rendered.lstrip().lower().startswith("<!doctype html>")
+    for token_id in ("101", "102", "201", "202"):
+        assert token_id in rendered

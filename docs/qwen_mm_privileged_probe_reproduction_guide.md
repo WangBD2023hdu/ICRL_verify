@@ -376,7 +376,8 @@ qwen-mm-privileged-probe \
   --rebuild-report-only
 ```
 
-`--teacher-signal-threshold` 只影响变异词教师信号审计分类，不改变任何模型概率。
+`--teacher-signal-threshold` 影响变异词教师信号分类，以及正确 token 页面中的明显
+压低判定；它不改变任何模型概率。
 当前有效信号定义为：
 
 ```text
@@ -404,6 +405,10 @@ abs(decision_token_delta_logp) > teacher_signal_threshold
 | `teacher_signal_mutations.csv` | 每个变异词一行的主要审计表 |
 | `teacher_signal_tokens.csv` | 仅包含变异词关联 subtokens 的辅助表 |
 | `teacher_signal_sample_summary.csv` | 每个样本的变异词教师信号摘要 |
+| `correct_token_teacher_rejection.html` | 正确内容 token 与格式 token 的教师不认可审计 |
+| `correct_token_teacher_rejection.json` | 概率压低、Top-1 拒绝、分组与阈值扫描统计 |
+| `correct_token_teacher_rejection.csv` | 全部纳入 token 的逐行明细 |
+| `correct_token_teacher_rejection_sample_summary.csv` | 每个样本的正确 token 教师不认可摘要 |
 | `failures.jsonl` | 失败样本及异常信息，仅发生失败时出现 |
 
 每个 `samples/<ordinal>_<pair_id>/` 目录包含：
@@ -451,6 +456,12 @@ abs(decision_token_delta_logp) > teacher_signal_threshold
 | `relation=deleted` | 学生 response 中没有对应内容，无法对固定 response token 打分 |
 | `decision_delta_logp` | 该变异词第一个关联 response token 的 `delta_logp` |
 
+正确 token 教师不认可页面只纳入 `token_label=correct` 和
+`token_label=formatting`，并分别报告：任意概率下降、超过阈值的概率压低、Teacher
+Top-1 token ID 不同、Teacher Top-1 解码文本不同。格式 token 按要求纳入，但空格、
+换行和 Markdown 格式在 OCR 对齐标准化时会被移除，因此其“正确”状态没有经过与
+普通内容 token 相同的字符级 GT 验证。
+
 ## 14. 在本地查看服务器结果
 
 服务器没有浏览器时，可以将整个输出目录下载到本地后直接打开 `report.html` 和
@@ -474,6 +485,7 @@ ssh -L 8000:127.0.0.1:8000 <user>@<server>
 ```text
 http://127.0.0.1:8000/report.html
 http://127.0.0.1:8000/teacher_signal_audit.html
+http://127.0.0.1:8000/correct_token_teacher_rejection.html
 ```
 
 ## 15. 建议保存的复现信息

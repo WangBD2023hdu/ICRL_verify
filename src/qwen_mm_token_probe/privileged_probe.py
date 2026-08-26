@@ -1330,6 +1330,214 @@ def _prepare_teacher_signal_token_details(
     return prepared, int(alignment.deletions)
 
 
+def _prepare_correct_token_teacher_rows(
+    result: dict[str, Any],
+    *,
+    sample_report: str,
+) -> list[dict[str, Any]]:
+    """Select verified-correct and formatting response tokens for teacher audit."""
+
+    token_details, _ = _prepare_teacher_signal_token_details(
+        result,
+        sample_report=sample_report,
+    )
+    prepared: list[dict[str, Any]] = []
+    for row in token_details:
+        token_label = str(row.get("token_label", "unknown"))
+        if token_label == "correct":
+            inclusion_group = "verified_correct"
+            correctness_verified_against_gt = True
+        elif token_label == "formatting":
+            inclusion_group = "formatting"
+            correctness_verified_against_gt = False
+        else:
+            continue
+        prepared.append(
+            dict(row)
+            | {
+                "inclusion_group": inclusion_group,
+                "correctness_verified_against_gt": correctness_verified_against_gt,
+            }
+        )
+    return prepared
+
+
+def _classify_correct_token_teacher_row(
+    row: dict[str, Any],
+    *,
+    threshold: float,
+) -> dict[str, Any]:
+    _validate_teacher_signal_threshold(threshold)
+    classified = dict(row)
+    delta_logp = float(classified["delta_logp_teacher_minus_original"])
+    exact_top1_accepted = bool(classified.get("target_is_top_teacher", False))
+    same_surface_top1_accepted = exact_top1_accepted or bool(
+        classified.get("teacher_top_same_surface_different_id", False)
+    )
+    suppressed = delta_logp < -threshold
+    exact_top1_rejected = not exact_top1_accepted
+    surface_top1_rejected = not same_surface_top1_accepted
+    if suppressed and surface_top1_rejected:
+        rejection_class = "suppressed_and_surface_rejected"
+    elif suppressed and exact_top1_rejected:
+        rejection_class = "suppressed_and_exact_id_rejected"
+    elif suppressed:
+        rejection_class = "suppressed"
+    elif surface_top1_rejected:
+        rejection_class = "surface_rejected_without_suppression"
+    elif exact_top1_rejected:
+        rejection_class = "exact_id_rejected_without_suppression"
+    else:
+        rejection_class = "accepted"
+    classified.update(
+        {
+            "teacher_signal_threshold": threshold,
+            "probability_decreased": delta_logp < 0,
+            "suppressed_beyond_threshold": suppressed,
+            "teacher_top1_exact_response_id": exact_top1_accepted,
+            "teacher_top1_same_surface": same_surface_top1_accepted,
+            "teacher_top1_exact_id_rejected": exact_top1_rejected,
+            "teacher_top1_surface_rejected": surface_top1_rejected,
+            "suppressed_and_exact_top1_rejected": (suppressed and exact_top1_rejected),
+            "suppressed_and_surface_top1_rejected": (
+                suppressed and surface_top1_rejected
+            ),
+            "teacher_rejection_class": rejection_class,
+        }
+    )
+    return classified
+
+
+def _correct_token_teacher_metrics(
+    rows: Sequence[dict[str, Any]],
+    *,
+    threshold: float,
+) -> dict[str, Any]:
+    classified = [
+        _classify_correct_token_teacher_row(row, threshold=threshold) for row in rows
+    ]
+    total = len(classified)
+    deltas = [float(row["delta_logp_teacher_minus_original"]) for row in classified]
+
+    def count(key: str) -> int:
+        return sum(bool(row.get(key, False)) for row in classified)
+
+    probability_decreased = count("probability_decreased")
+    suppressed = count("suppressed_beyond_threshold")
+    exact_rejected = count("teacher_top1_exact_id_rejected")
+    surface_rejected = count("teacher_top1_surface_rejected")
+    suppressed_exact = count("suppressed_and_exact_top1_rejected")
+    suppressed_surface = count("suppressed_and_surface_top1_rejected")
+    return {
+        "threshold": threshold,
+        "included_token_count": total,
+        "verified_correct_token_count": sum(
+            str(row.get("inclusion_group", "")) == "verified_correct"
+            for row in classified
+        ),
+        "formatting_token_count": sum(
+            str(row.get("inclusion_group", "")) == "formatting" for row in classified
+        ),
+        "probability_decreased_count": probability_decreased,
+        "probability_decreased_rate": _ratio(probability_decreased, total),
+        "suppressed_beyond_threshold_count": suppressed,
+        "suppressed_beyond_threshold_rate": _ratio(suppressed, total),
+        "teacher_top1_exact_id_rejection_count": exact_rejected,
+        "teacher_top1_exact_id_rejection_rate": _ratio(exact_rejected, total),
+        "teacher_top1_surface_rejection_count": surface_rejected,
+        "teacher_top1_surface_rejection_rate": _ratio(surface_rejected, total),
+        "suppressed_and_exact_top1_rejected_count": suppressed_exact,
+        "suppressed_and_exact_top1_rejected_rate": _ratio(
+            suppressed_exact,
+            total,
+        ),
+        "suppressed_and_surface_top1_rejected_count": suppressed_surface,
+        "suppressed_and_surface_top1_rejected_rate": _ratio(
+            suppressed_surface,
+            total,
+        ),
+        "mean_delta_logp": _mean(deltas),
+        "median_delta_logp": statistics.median(deltas) if deltas else 0.0,
+        "mean_p_original": _mean(float(row["p_original"]) for row in classified),
+        "mean_p_teacher": _mean(float(row["p_teacher"]) for row in classified),
+    }
+
+
+def _build_correct_token_teacher_audit(
+    results: Sequence[dict[str, Any]],
+    rows: Sequence[dict[str, Any]],
+    *,
+    selected_threshold: float = DEFAULT_TEACHER_SIGNAL_THRESHOLD,
+) -> dict[str, Any]:
+    _validate_teacher_signal_threshold(selected_threshold)
+    thresholds = sorted({*TEACHER_SIGNAL_THRESHOLDS, selected_threshold})
+    rows_by_pair: dict[str, list[dict[str, Any]]] = {}
+    for row in rows:
+        rows_by_pair.setdefault(str(row.get("pair_id", "")), []).append(dict(row))
+    result_by_pair = {str(result.get("pair_id", "")): result for result in results}
+    pair_ids = list(result_by_pair)
+    pair_ids.extend(
+        pair_id for pair_id in rows_by_pair if pair_id not in result_by_pair
+    )
+    sample_summary = []
+    for pair_id in pair_ids:
+        pair_rows = rows_by_pair.get(pair_id, [])
+        sample_summary.append(
+            {
+                "pair_id": pair_id,
+                "sample_report": (
+                    str(pair_rows[0].get("sample_report", "")) if pair_rows else ""
+                ),
+                **_correct_token_teacher_metrics(
+                    pair_rows,
+                    threshold=selected_threshold,
+                ),
+            }
+        )
+    group_breakdown = []
+    for group in ("verified_correct", "formatting"):
+        group_rows = [
+            row for row in rows if str(row.get("inclusion_group", "")) == group
+        ]
+        group_breakdown.append(
+            {
+                "inclusion_group": group,
+                **_correct_token_teacher_metrics(
+                    group_rows,
+                    threshold=selected_threshold,
+                ),
+            }
+        )
+    return {
+        "schema_version": 1,
+        "created_at": _utc_now(),
+        "audit_unit": "student_response_token",
+        "selected_threshold": selected_threshold,
+        "included_token_labels": ["correct", "formatting"],
+        "verified_correct_rule": "token_label == correct",
+        "formatting_rule": "token_label == formatting",
+        "formatting_correctness_caveat": (
+            "Formatting tokens are included by request, but OCR normalization "
+            "removes them, so their correctness is not character-alignment verified."
+        ),
+        "probability_decrease_rule": "delta_logp < 0",
+        "suppression_rule": "delta_logp < -threshold",
+        "exact_top1_rejection_rule": "teacher_top1_token_id != response_token_id",
+        "surface_top1_rejection_rule": (
+            "teacher_top1_decoded_surface != response_token_surface"
+        ),
+        "teacher_model_is_student": _teacher_model_is_student_for_results(results),
+        "completed_samples": len(pair_ids),
+        **_correct_token_teacher_metrics(rows, threshold=selected_threshold),
+        "threshold_sweep": [
+            _correct_token_teacher_metrics(rows, threshold=threshold)
+            for threshold in thresholds
+        ],
+        "group_breakdown": group_breakdown,
+        "sample_summary": sample_summary,
+    }
+
+
 def _prepare_teacher_signal_mutation_rows(
     result: dict[str, Any],
     *,
@@ -1441,6 +1649,17 @@ def _prepare_teacher_signal_mutation_rows(
 
 def _ratio(numerator: int, denominator: int) -> float | None:
     return numerator / denominator if denominator else None
+
+
+def _teacher_model_is_student_for_results(
+    results: Sequence[dict[str, Any]],
+) -> bool | None:
+    values = [
+        bool(result.get("protocol", {}).get("teacher_model_is_student"))
+        for result in results
+        if "teacher_model_is_student" in result.get("protocol", {})
+    ]
+    return all(values) if values else None
 
 
 def _teacher_signal_summary(
@@ -1636,7 +1855,9 @@ def _build_teacher_signal_audit(
         "schema_version": 2,
         "created_at": _utc_now(),
         "selected_threshold": selected_threshold,
-        "teacher_is_same_model_under_privileged_context": True,
+        "teacher_is_same_model_under_privileged_context": (
+            _teacher_model_is_student_for_results(results)
+        ),
         "audit_unit": "synthetic_mutation_word",
         "only_mutations_included": True,
         "signal_delta": "decision_token_logp_teacher_minus_original",
@@ -1676,6 +1897,7 @@ def rebuild_privileged_report(
     all_tokens: list[dict[str, Any]] = []
     all_mutations: list[dict[str, Any]] = []
     teacher_signal_rows: list[dict[str, Any]] = []
+    correct_token_teacher_rows: list[dict[str, Any]] = []
     sample_rows: list[dict[str, Any]] = []
     for result_path, result in zip(result_paths, results):
         _write_sample_outputs(result_path.parent, result)
@@ -1697,6 +1919,12 @@ def rebuild_privileged_report(
             sample_report=relative_report.as_posix(),
         )
         teacher_signal_rows.extend(prepared_rows)
+        correct_token_teacher_rows.extend(
+            _prepare_correct_token_teacher_rows(
+                result,
+                sample_report=relative_report.as_posix(),
+            )
+        )
 
     _write_csv(output_root / "token_probabilities.csv", all_tokens)
     _write_csv(output_root / "mutation_probabilities.csv", all_mutations)
@@ -1749,6 +1977,37 @@ def rebuild_privileged_report(
         _render_teacher_signal_audit_html(
             teacher_signal_audit,
             teacher_signal_rows,
+        ),
+    )
+    classified_correct_token_rows = [
+        _classify_correct_token_teacher_row(
+            row,
+            threshold=teacher_signal_threshold,
+        )
+        for row in correct_token_teacher_rows
+    ]
+    correct_token_teacher_audit = _build_correct_token_teacher_audit(
+        results,
+        classified_correct_token_rows,
+        selected_threshold=teacher_signal_threshold,
+    )
+    _write_json_atomic(
+        output_root / "correct_token_teacher_rejection.json",
+        correct_token_teacher_audit,
+    )
+    _write_csv(
+        output_root / "correct_token_teacher_rejection.csv",
+        classified_correct_token_rows,
+    )
+    _write_csv(
+        output_root / "correct_token_teacher_rejection_sample_summary.csv",
+        correct_token_teacher_audit["sample_summary"],
+    )
+    _write_text_atomic(
+        output_root / "correct_token_teacher_rejection.html",
+        _render_correct_token_teacher_audit_html(
+            correct_token_teacher_audit,
+            classified_correct_token_rows,
         ),
     )
     return global_summary
@@ -2197,6 +2456,16 @@ def _render_teacher_signal_audit_html(
     )
     correct_count = int(audit["correct_mutations"])
     incorrect_count = int(audit["incorrect_mutations"])
+    teacher_mode = audit.get("teacher_is_same_model_under_privileged_context")
+    teacher_description = (
+        "Teacher 是同一模型在 GT 特权 prompt 下的条件分布。"
+        if teacher_mode is True
+        else (
+            "Teacher 是独立模型；概率变化同时包含模型参数和输入条件差异。"
+            if teacher_mode is False
+            else "结果未记录学生与 Teacher 是否为同一模型。"
+        )
+    )
     return f"""<!doctype html>
 <html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
 <title>变异词 GT Teacher 信号质量审计</title>{_teacher_signal_audit_css()}</head><body><main>
@@ -2216,7 +2485,215 @@ def _render_teacher_signal_audit_html(
 <section aria-labelledby="harmful-wrong"><div class="section-heading"><h2 id="harmful-wrong">有害案例：错误变异词被强化</h2><span>显示 {len(wrong_promoted)} / {wrong_promoted_total}</span></div>{_audit_examples_table(wrong_promoted, empty_message="当前阈值下没有错误变异词被强化")}</section>
 <section aria-labelledby="harmful-correct"><div class="section-heading"><h2 id="harmful-correct">有害案例：正确变异词被抑制</h2><span>显示 {len(correct_suppressed)} / {correct_suppressed_total}</span></div>{_audit_examples_table(correct_suppressed, empty_message="当前阈值下没有正确变异词被抑制")}</section>
 <section aria-labelledby="samples"><h2 id="samples">按样本统计</h2><div class="audit-table-scroll"><table><thead><tr><th>样本</th><th>人工变异词</th><th>可打分</th><th>读错</th><th>正确被抑制</th><th>错误被强化</th><th>有害信号</th><th>有害信号率</th><th>无法打分</th></tr></thead><tbody>{sample_rows}</tbody></table></div></section>
-<section class="method" aria-labelledby="scope"><h2 id="scope">统计边界</h2><p>只纳入数据集标注的人工变异词：模型读出图片 / GT 中的 <code>ocr_ans</code> 记为正确；读回变异前 <code>origin_ans</code> 或其他文本记为错误。每个变异词使用第一个关联 Response token 作为决策 token，后续子 token 仅展示，不参与阈值判定。Teacher 是同一模型在 GT 特权 prompt 下的条件分布，不是独立模型。</p><p>未读出的变异词没有对应 Response token，因此不进入四象限；本批次共有 <strong>{int(audit["unscored_deleted_mutations"])}</strong> 个此类变异词。</p></section>
+<section class="method" aria-labelledby="scope"><h2 id="scope">统计边界</h2><p>只纳入数据集标注的人工变异词：模型读出图片 / GT 中的 <code>ocr_ans</code> 记为正确；读回变异前 <code>origin_ans</code> 或其他文本记为错误。每个变异词使用第一个关联 Response token 作为决策 token，后续子 token 仅展示，不参与阈值判定。{html.escape(teacher_description)}</p><p>未读出的变异词没有对应 Response token，因此不进入四象限；本批次共有 <strong>{int(audit["unscored_deleted_mutations"])}</strong> 个此类变异词。</p></section>
+</main></body></html>"""
+
+
+def _correct_token_group_label(value: str) -> str:
+    return {
+        "verified_correct": "GT 对齐正确内容",
+        "formatting": "格式 token（未做字符正确性验证）",
+    }.get(value, value)
+
+
+def _correct_token_rejection_label(value: str) -> str:
+    return {
+        "suppressed_and_surface_rejected": "超过阈值压低 + Top-1 文本不同",
+        "suppressed_and_exact_id_rejected": "超过阈值压低 + Top-1 ID 不同",
+        "suppressed": "超过阈值压低",
+        "surface_rejected_without_suppression": "Top-1 文本不同，未超过压低阈值",
+        "exact_id_rejected_without_suppression": "Top-1 ID 不同，文本相同",
+        "accepted": "未拒绝",
+    }.get(value, value)
+
+
+def _correct_token_metric_value(count: Any, rate: Any) -> str:
+    return f"{int(count)} ({_audit_rate(rate)})"
+
+
+def _correct_token_breakdown_row(row: dict[str, Any]) -> str:
+    return (
+        "<tr>"
+        f"<td>{html.escape(_correct_token_group_label(str(row['inclusion_group'])))}</td>"
+        f"<td>{int(row['included_token_count'])}</td>"
+        f"<td>{int(row['probability_decreased_count'])}</td>"
+        f"<td>{_audit_rate(row['probability_decreased_rate'])}</td>"
+        f"<td>{int(row['suppressed_beyond_threshold_count'])}</td>"
+        f"<td>{_audit_rate(row['suppressed_beyond_threshold_rate'])}</td>"
+        f"<td>{int(row['teacher_top1_exact_id_rejection_count'])}</td>"
+        f"<td>{_audit_rate(row['teacher_top1_exact_id_rejection_rate'])}</td>"
+        f"<td>{int(row['teacher_top1_surface_rejection_count'])}</td>"
+        f"<td>{_audit_rate(row['teacher_top1_surface_rejection_rate'])}</td>"
+        f"<td class='{_delta_class(row['mean_delta_logp'])}'>"
+        f"{_optional_float(row['mean_delta_logp'], signed=True)}</td>"
+        "</tr>"
+    )
+
+
+def _correct_token_threshold_row(row: dict[str, Any]) -> str:
+    return (
+        "<tr>"
+        f"<td>{float(row['threshold']):.2f}</td>"
+        f"<td>{int(row['suppressed_beyond_threshold_count'])}</td>"
+        f"<td>{_audit_rate(row['suppressed_beyond_threshold_rate'])}</td>"
+        f"<td>{int(row['suppressed_and_exact_top1_rejected_count'])}</td>"
+        f"<td>{_audit_rate(row['suppressed_and_exact_top1_rejected_rate'])}</td>"
+        f"<td>{int(row['suppressed_and_surface_top1_rejected_count'])}</td>"
+        f"<td>{_audit_rate(row['suppressed_and_surface_top1_rejected_rate'])}</td>"
+        "</tr>"
+    )
+
+
+def _correct_token_sample_row(row: dict[str, Any]) -> str:
+    pair_id = html.escape(str(row.get("pair_id", "")))
+    report = html.escape(str(row.get("sample_report", "")), quote=True)
+    sample = f'<a href="{report}">{pair_id}</a>' if report else pair_id
+    return (
+        "<tr>"
+        f"<td>{sample}</td>"
+        f"<td>{int(row['included_token_count'])}</td>"
+        f"<td>{int(row['verified_correct_token_count'])}</td>"
+        f"<td>{int(row['formatting_token_count'])}</td>"
+        f"<td>{int(row['suppressed_beyond_threshold_count'])}</td>"
+        f"<td>{_audit_rate(row['suppressed_beyond_threshold_rate'])}</td>"
+        f"<td>{int(row['teacher_top1_exact_id_rejection_count'])}</td>"
+        f"<td>{_audit_rate(row['teacher_top1_exact_id_rejection_rate'])}</td>"
+        f"<td>{int(row['teacher_top1_surface_rejection_count'])}</td>"
+        f"<td>{_audit_rate(row['teacher_top1_surface_rejection_rate'])}</td>"
+        "</tr>"
+    )
+
+
+def _correct_token_detail_row(row: dict[str, Any]) -> str:
+    index = int(row["index"])
+    report = str(row.get("sample_report", ""))
+    location = (
+        f'<a href="{html.escape(report, quote=True)}#token-{index}">#{index}</a>'
+        if report
+        else f"#{index}"
+    )
+    token = html.escape(str(row.get("token", row.get("raw_token", ""))))
+    token_display = f"<code>{token or '&lt;empty&gt;'}</code>"
+    teacher_top = html.escape(str(row.get("top_token_teacher", "")))
+    exact_rejected = bool(row.get("teacher_top1_exact_id_rejected", False))
+    surface_rejected = bool(row.get("teacher_top1_surface_rejected", False))
+    suppressed = bool(row.get("suppressed_beyond_threshold", False))
+    row_class = "harmful-row" if suppressed or surface_rejected else ""
+    return (
+        f"<tr class='{row_class}'>"
+        f"<td>{html.escape(str(row.get('pair_id', '')))}</td>"
+        f"<td>{location}</td>"
+        f"<td>{html.escape(_correct_token_group_label(str(row['inclusion_group'])))}</td>"
+        f"<td>{token_display}<small>ID {int(row['token_id'])}</small></td>"
+        f"<td>{float(row['p_original']):.6f}</td>"
+        f"<td>{float(row['p_teacher']):.6f}</td>"
+        f"<td class='{_delta_class(row['delta_logp_teacher_minus_original'])}'>"
+        f"{float(row['delta_logp_teacher_minus_original']):+.6f}</td>"
+        f"<td>{int(row['rank_original'])}</td>"
+        f"<td>{int(row['rank_teacher'])}</td>"
+        f"<td><code>{teacher_top or '&lt;empty&gt;'}</code>"
+        f"<small>ID {int(row.get('top_token_id_teacher', -1))}</small></td>"
+        f"<td>{'是' if suppressed else '否'}</td>"
+        f"<td>{'是' if exact_rejected else '否'}</td>"
+        f"<td>{'是' if surface_rejected else '否'}</td>"
+        f"<td>{html.escape(_correct_token_rejection_label(str(row['teacher_rejection_class'])))}</td>"
+        "</tr>"
+    )
+
+
+def _render_correct_token_teacher_audit_html(
+    audit: dict[str, Any],
+    rows: Sequence[dict[str, Any]],
+) -> str:
+    threshold = float(audit["selected_threshold"])
+    classified_rows = [
+        _classify_correct_token_teacher_row(row, threshold=threshold) for row in rows
+    ]
+    ordered_rows = sorted(
+        classified_rows,
+        key=lambda row: (str(row.get("pair_id", "")), int(row.get("index", -1))),
+    )
+    metrics = "".join(
+        [
+            _audit_metric("纳入 token", audit["included_token_count"]),
+            _audit_metric("GT 对齐正确", audit["verified_correct_token_count"]),
+            _audit_metric("格式 token", audit["formatting_token_count"]),
+            _audit_metric(
+                "概率下降",
+                _correct_token_metric_value(
+                    audit["probability_decreased_count"],
+                    audit["probability_decreased_rate"],
+                ),
+                tone="warning",
+            ),
+            _audit_metric(
+                f"Δlogp < -{threshold:.2f}",
+                _correct_token_metric_value(
+                    audit["suppressed_beyond_threshold_count"],
+                    audit["suppressed_beyond_threshold_rate"],
+                ),
+                tone="harmful",
+            ),
+            _audit_metric(
+                "Teacher Top-1 ID 不同",
+                _correct_token_metric_value(
+                    audit["teacher_top1_exact_id_rejection_count"],
+                    audit["teacher_top1_exact_id_rejection_rate"],
+                ),
+                tone="harmful",
+            ),
+            _audit_metric(
+                "Teacher Top-1 文本不同",
+                _correct_token_metric_value(
+                    audit["teacher_top1_surface_rejection_count"],
+                    audit["teacher_top1_surface_rejection_rate"],
+                ),
+                tone="harmful",
+            ),
+            _audit_metric(
+                "压低且 Top-1 文本不同",
+                _correct_token_metric_value(
+                    audit["suppressed_and_surface_top1_rejected_count"],
+                    audit["suppressed_and_surface_top1_rejected_rate"],
+                ),
+                tone="harmful",
+            ),
+        ]
+    )
+    group_rows = "".join(
+        _correct_token_breakdown_row(row) for row in audit["group_breakdown"]
+    )
+    threshold_rows = "".join(
+        _correct_token_threshold_row(row) for row in audit["threshold_sweep"]
+    )
+    sample_rows = "".join(
+        _correct_token_sample_row(row)
+        for row in sorted(
+            audit["sample_summary"],
+            key=lambda row: int(row["suppressed_beyond_threshold_count"]),
+            reverse=True,
+        )
+    )
+    detail_rows = "".join(_correct_token_detail_row(row) for row in ordered_rows)
+    if not detail_rows:
+        detail_rows = "<tr><td colspan='14' class='empty'>没有符合条件的正确或格式 token</td></tr>"
+    teacher_mode = audit.get("teacher_model_is_student")
+    teacher_mode_text = (
+        "学生与教师为同一模型"
+        if teacher_mode is True
+        else ("学生与教师为不同模型" if teacher_mode is False else "模型关系未记录")
+    )
+    return f"""<!doctype html>
+<html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>正确 Response Token 的 Teacher 不认可审计</title>{_teacher_signal_audit_css()}</head><body><main>
+<nav><a href="report.html">逐 Token 原始可视化</a><a href="correct_token_teacher_rejection.csv">完整审计 CSV</a><a href="correct_token_teacher_rejection_sample_summary.csv">样本统计 CSV</a><a href="correct_token_teacher_rejection.json">审计 JSON</a><a href="teacher_signal_audit.html">变异词教师信号审计</a></nav>
+<header><h1>正确 Response Token 的 Teacher 不认可审计</h1><p>只纳入学生 Response 中 <code>token_label=correct</code> 的内容 token，并按要求纳入 <code>token_label=formatting</code>。概率压低阈值为 <code>Δlogp &lt; -{threshold:.2f}</code>；Top-1 ID 拒绝与 Top-1 文本拒绝分别统计。</p><p>{html.escape(teacher_mode_text)}。概率下降、超过阈值压低和 Top-1 改变是三个不同口径，不合并成单一“不认可率”。</p></header>
+<section><h2>总体结果</h2><div class="audit-metrics">{metrics}</div></section>
+<section><h2>内容与格式分组</h2><div class="audit-table-scroll"><table><thead><tr><th>纳入类型</th><th>token</th><th>概率下降</th><th>下降率</th><th>超过阈值压低</th><th>压低率</th><th>Top-1 ID 不同</th><th>ID 拒绝率</th><th>Top-1 文本不同</th><th>文本拒绝率</th><th>平均 Δlogp</th></tr></thead><tbody>{group_rows}</tbody></table></div></section>
+<section><h2>压低阈值敏感性</h2><div class="audit-table-scroll compact"><table><thead><tr><th>τ</th><th>Δlogp &lt; -τ</th><th>压低率</th><th>压低且 Top-1 ID 不同</th><th>比例</th><th>压低且 Top-1 文本不同</th><th>比例</th></tr></thead><tbody>{threshold_rows}</tbody></table></div></section>
+<section><div class="section-heading"><h2>全部纳入 Token</h2><span>{len(ordered_rows)} tokens</span></div><div class="audit-table-scroll"><table class="correct-token-table"><thead><tr><th>样本</th><th>索引</th><th>类型</th><th>Response token</th><th>p original</th><th>p teacher</th><th>Δlogp</th><th>rank original</th><th>rank teacher</th><th>Teacher Top-1</th><th>超过压低阈值</th><th>Top-1 ID 不同</th><th>Top-1 文本不同</th><th>分类</th></tr></thead><tbody>{detail_rows}</tbody></table></div></section>
+<section><h2>按样本统计</h2><div class="audit-table-scroll"><table><thead><tr><th>样本</th><th>纳入 token</th><th>GT 对齐正确</th><th>格式</th><th>超过阈值压低</th><th>压低率</th><th>Top-1 ID 不同</th><th>ID 拒绝率</th><th>Top-1 文本不同</th><th>文本拒绝率</th></tr></thead><tbody>{sample_rows}</tbody></table></div></section>
+<section class="method"><h2>统计边界</h2><p>内容 token 的正确性来自完整 GT 与学生 Response 的字符级对齐。格式 token 在 OCR 标准化阶段被移除，因此无法用同一字符对齐验证其格式是否真的与 GT 一致；本页仍按要求将其纳入，并单独分组展示。漏字没有学生 Response token，不进入本审计。</p></section>
 </main></body></html>"""
 
 
@@ -2261,6 +2738,8 @@ th:first-child, td:first-child { text-align: left; }
 .examples-table td:nth-child(1) { max-width: 260px; overflow: hidden; text-overflow: ellipsis; }
 .examples-table code { display: inline-block; max-width: 220px; overflow: hidden; text-overflow: ellipsis; }
 .examples-table small { color: #66777c; font-size: 10px; }
+.correct-token-table small { display: block; color: #66777c; font-size: 10px; }
+.correct-token-table .harmful-row { background: #fff6f6; }
 .gain { color: #08764a; font-weight: 700; }
 .drop { color: #b02b2b; font-weight: 700; }
 .empty { padding: 20px; color: #6b7b80; text-align: center !important; }
@@ -3226,8 +3705,8 @@ def _build_parser() -> argparse.ArgumentParser:
         type=float,
         default=DEFAULT_TEACHER_SIGNAL_THRESHOLD,
         help=(
-            "Absolute decision-token delta-logp threshold used only by the "
-            "mutation-level teacher_signal_audit.html report (default: 0.05)."
+            "Absolute delta-logp threshold used by the mutation-level and "
+            "correct-token teacher audit reports (default: 0.05)."
         ),
     )
     parser.add_argument("--no-resume", action="store_true")
@@ -3251,6 +3730,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         print(
             f"Rebuilt report: {Path(args.output_dir).expanduser().resolve() / 'report.html'} "
             f"audit={Path(args.output_dir).expanduser().resolve() / 'teacher_signal_audit.html'} "
+            f"correct_token_audit={Path(args.output_dir).expanduser().resolve() / 'correct_token_teacher_rejection.html'} "
             f"samples={summary['completed_samples']} tokens={summary['total_tokens']}",
             flush=True,
         )
