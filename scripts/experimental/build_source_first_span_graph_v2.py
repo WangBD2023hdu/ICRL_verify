@@ -4838,6 +4838,56 @@ def candidate_orders(
     return unique, graph_report
 
 
+def ordered_candidate_source_provenance(
+    fragments: Sequence[LocatedFragment],
+    *,
+    source_units_by_id: Mapping[str, stable.SourceUnit] | None = None,
+    leading_frontier: Mapping[str, Any] | None = None,
+) -> tuple[list[str], list[str]]:
+    """Return source IDs in the candidate's actual reading order.
+
+    The identifiers come exclusively from the already selected fragment
+    objects (and, when present, the source-derived leading-frontier mapping).
+    A supplied SourceUnit index is authoritative for paragraph ownership and
+    also makes missing/inconsistent fragment provenance fail closed.  No
+    fragment-id or Markdown-text parsing participates in this path.
+    """
+
+    source_unit_ids: list[str] = []
+    source_paragraph_ids: list[str] = []
+    seen_units: set[str] = set()
+    seen_paragraphs: set[str] = set()
+
+    def append(unit_id: str, paragraph_id: str) -> None:
+        if source_units_by_id is not None:
+            unit = source_units_by_id.get(unit_id)
+            if unit is None:
+                raise ValueError(f"candidate source unit is unavailable: {unit_id}")
+            if paragraph_id and paragraph_id != unit.paragraph_id:
+                raise ValueError(
+                    "candidate paragraph provenance disagrees with SourceUnit: "
+                    f"unit={unit_id} fragment={paragraph_id} unit={unit.paragraph_id}"
+                )
+            paragraph_id = unit.paragraph_id
+        if not unit_id or not paragraph_id:
+            raise ValueError("candidate source provenance contains an empty identifier")
+        if unit_id not in seen_units:
+            seen_units.add(unit_id)
+            source_unit_ids.append(unit_id)
+        if paragraph_id not in seen_paragraphs:
+            seen_paragraphs.add(paragraph_id)
+            source_paragraph_ids.append(paragraph_id)
+
+    if leading_frontier is not None:
+        frontier_unit_id = leading_frontier.get("unit_id")
+        frontier_paragraph_id = leading_frontier.get("paragraph_id")
+        if frontier_unit_id is not None or frontier_paragraph_id is not None:
+            append(str(frontier_unit_id or ""), str(frontier_paragraph_id or ""))
+    for fragment in fragments:
+        append(fragment.unit_id, fragment.paragraph_id)
+    return source_unit_ids, source_paragraph_ids
+
+
 def freeze_page_source_candidates(
     fragments: Sequence[LocatedFragment],
     *,
@@ -4845,6 +4895,7 @@ def freeze_page_source_candidates(
     page_height: float,
     frontier_variants: Sequence[Mapping[str, Any]] = (),
     frontier_report: Mapping[str, Any] | None = None,
+    source_units_by_id: Mapping[str, stable.SourceUnit] | None = None,
 ) -> dict[str, Any]:
     """Materialize the bounded source candidate set before PDF text is read."""
 
@@ -4926,6 +4977,23 @@ def freeze_page_source_candidates(
                     if variant is not None
                     else None
                 )
+                try:
+                    source_unit_ids, source_paragraph_ids = (
+                        ordered_candidate_source_provenance(
+                            ordered,
+                            source_units_by_id=source_units_by_id,
+                            leading_frontier=provenance,
+                        )
+                    )
+                except ValueError as error:
+                    return {
+                        "status": "failed",
+                        "reason": f"candidate_source_provenance_invalid:{error}",
+                        "candidates": [],
+                        "candidate_count": 0,
+                        "layout": layout,
+                        "frontier": report,
+                    }
                 frontier_identity = json.dumps(
                     provenance,
                     ensure_ascii=False,
@@ -4957,6 +5025,8 @@ def freeze_page_source_candidates(
                         "order_id": order_id,
                         "serialization_policy": serialization_policy,
                         "fragment_ids": fragment_ids,
+                        "source_unit_ids": source_unit_ids,
+                        "source_paragraph_ids": source_paragraph_ids,
                         "frontier": provenance,
                         "frontier_id": frontier_id,
                         "markdown": markdown,
@@ -5096,6 +5166,8 @@ def verify_frozen_page_candidates(
             "selected_serialization_policy": selected["serialization_policy"],
             "selected_frontier": selected["frontier"],
             "fragment_ids": selected["fragment_ids"],
+            "source_unit_ids": selected["source_unit_ids"],
+            "source_paragraph_ids": selected["source_paragraph_ids"],
             "verifier": selected["verifier"],
             "attempts": attempts,
             "candidate_provenance": {
@@ -7015,6 +7087,7 @@ def main() -> int:
         # text extraction.  PDF text below can only exact-select this bounded
         # immutable set; it cannot influence a carrier, cut, order, or policy.
         shadow_frozen_candidates: dict[str, dict[int, dict[str, Any]]] = {}
+        source_units_by_id = {unit.unit_id: unit for unit in units}
         for shadow in shadows:
             frozen_pages: dict[int, dict[str, Any]] = {}
             fragments_by_page = shadow_fragments[shadow.shadow_id]
@@ -7037,6 +7110,7 @@ def main() -> int:
                     page_height=page_heights[page_number],
                     frontier_variants=frontier_variants,
                     frontier_report=frontier_report,
+                    source_units_by_id=source_units_by_id,
                 )
             shadow_frozen_candidates[shadow.shadow_id] = frozen_pages
 
@@ -7186,6 +7260,8 @@ def main() -> int:
                             "selected_serialization_policy"
                         ],
                         "source_fragment_ids": selected["fragment_ids"],
+                        "source_unit_ids": selected["source_unit_ids"],
+                        "source_paragraph_ids": selected["source_paragraph_ids"],
                         "verifier": selected["verifier"],
                         "markdown": markdown_path.relative_to(output_dir).as_posix(),
                         "image": image_path.relative_to(output_dir).as_posix(),

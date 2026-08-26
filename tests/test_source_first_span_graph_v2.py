@@ -23,6 +23,94 @@ SPEC.loader.exec_module(MODULE)
 
 
 class SourceFirstSpanGraphV2Tests(unittest.TestCase):
+    def test_selected_candidate_records_ordered_deduplicated_source_provenance(
+        self,
+    ) -> None:
+        units = [
+            MODULE.stable.SourceUnit(
+                unit_id="u0",
+                kind="paragraph",
+                paragraph_id="p0",
+                source_file=Path("main.tex"),
+                source_lines=(1,),
+                raw_latex="Lead",
+                markdown="Lead",
+                rgb=(1, 2, 3),
+            ),
+            MODULE.stable.SourceUnit(
+                unit_id="u1",
+                kind="paragraph",
+                paragraph_id="p1",
+                source_file=Path("main.tex"),
+                source_lines=(2,),
+                raw_latex="Alpha again",
+                markdown="Alpha again",
+                rgb=(4, 5, 6),
+            ),
+            MODULE.stable.SourceUnit(
+                unit_id="u2",
+                kind="paragraph",
+                paragraph_id="p1",
+                source_file=Path("main.tex"),
+                source_lines=(3,),
+                raw_latex="Beta",
+                markdown="Beta",
+                rgb=(7, 8, 9),
+            ),
+        ]
+
+        def fragment(
+            fragment_id: str,
+            unit_id: str,
+            markdown: str,
+            source_ordinal: int,
+            top: float,
+        ) -> object:
+            return MODULE.LocatedFragment(
+                fragment_id=fragment_id,
+                unit_id=unit_id,
+                paragraph_id="p1",
+                kind="paragraph",
+                markdown=markdown,
+                probe_ids=(fragment_id,),
+                source_file=Path("main.tex"),
+                source_start_line=source_ordinal,
+                source_ordinal=source_ordinal,
+                page_number=2,
+                bbox=(40.0, top, 300.0, top + 12.0),
+                components=((40.0, top, 300.0, top + 12.0),),
+            )
+
+        fragments = [
+            fragment("u1-a", "u1", "Alpha", 1, 100.0),
+            fragment("u1-b", "u1", "again", 2, 120.0),
+            fragment("u2-a", "u2", "Beta", 3, 140.0),
+        ]
+        frozen = MODULE.freeze_page_source_candidates(
+            fragments,
+            page_width=600.0,
+            page_height=800.0,
+            frontier_variants=[
+                {
+                    "text": "Lead",
+                    "join": "new_paragraph",
+                    "provenance": {
+                        "kind": "whole_unit_suffix",
+                        "unit_id": "u0",
+                        "paragraph_id": "p0",
+                    },
+                }
+            ],
+            source_units_by_id={unit.unit_id: unit for unit in units},
+        )
+        result = MODULE.verify_frozen_page_candidates(
+            frozen, "Lead\n\nAlpha again Beta"
+        )
+
+        self.assertEqual(result["status"], "passed")
+        self.assertEqual(result["source_unit_ids"], ["u0", "u1", "u2"])
+        self.assertEqual(result["source_paragraph_ids"], ["p0", "p1"])
+
     def test_optional_environment_title_fragment_is_rejected_pre_admission(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             source_file = Path(directory).resolve() / "main.tex"
