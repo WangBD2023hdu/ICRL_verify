@@ -1002,6 +1002,8 @@ def test_cli_contains_no_api_transport_arguments() -> None:
     assert "--model-id" in option_strings
     assert "--student-model-id" in option_strings
     assert "--teacher-model-id" in option_strings
+    assert "--student-response-min-probability" in option_strings
+    assert "--student-top1-max-probability" not in option_strings
     assert "--base-url" not in option_strings
     assert "--api-key" not in option_strings
     assert "--max-new-tokens" in option_strings
@@ -1371,18 +1373,45 @@ def test_cli_exposes_teacher_signal_threshold() -> None:
     assert args.teacher_signal_threshold == pytest.approx(0.125)
 
 
-def test_cli_exposes_student_top1_max_probability() -> None:
+def test_cli_exposes_student_response_min_probability() -> None:
     args = probe._build_parser().parse_args(
         [
             "--output-dir",
             "outputs/test",
             "--rebuild-report-only",
-            "--student-top1-max-probability",
+            "--student-response-min-probability",
             "0.875",
         ]
     )
 
-    assert args.student_top1_max_probability == pytest.approx(0.875)
+    assert args.student_response_min_probability == pytest.approx(0.875)
+
+
+@pytest.mark.parametrize(
+    ("value", "valid"),
+    [
+        (None, True),
+        (0.0, True),
+        (1.0, True),
+        (-0.01, False),
+        (1.01, False),
+        (math.inf, False),
+        (-math.inf, False),
+        (math.nan, False),
+    ],
+)
+def test_student_response_min_probability_validation(
+    value: float | None,
+    valid: bool,
+) -> None:
+    if valid:
+        probe._validate_student_response_min_probability(value)
+    else:
+        with pytest.raises(
+            ValueError,
+            match="student_response_min_probability must be finite",
+        ):
+            probe._validate_student_response_min_probability(value)
 
 
 def _correct_token_teacher_result(
@@ -1400,15 +1429,18 @@ def _correct_token_teacher_result(
         p_original = float(spec["p_original"])
         delta_logp = float(spec["delta_logp"])
         p_teacher = p_original * math.exp(delta_logp)
+        original_top_token_id = int(spec.get("original_top_token_id", token_id))
+        original_top_raw_token = str(spec.get("original_top_raw_token", raw_token))
+        original_rank = int(spec.get("original_rank", 1))
         original_scores.append(
             _score_record(
                 token_id,
                 raw_token,
                 p_original,
-                top_token_id=token_id,
-                top_raw_token=raw_token,
-                top_probability=p_original,
-                target_rank=1,
+                top_token_id=original_top_token_id,
+                top_raw_token=original_top_raw_token,
+                top_probability=float(spec.get("top_p_original", p_original)),
+                target_rank=original_rank,
             )
         )
         teacher_scores.append(
@@ -1471,6 +1503,10 @@ def _correct_token_teacher_fixture() -> tuple[
                     "raw_token": "A",
                     "token_label": "correct",
                     "p_original": 0.20,
+                    "top_p_original": 0.95,
+                    "original_top_token_id": 9001,
+                    "original_top_raw_token": "Z",
+                    "original_rank": 2,
                     "delta_logp": -0.06,
                     "teacher_top_token_id": 101,
                     "teacher_top_raw_token": "A",
@@ -1482,6 +1518,10 @@ def _correct_token_teacher_fixture() -> tuple[
                     "raw_token": "\n",
                     "token_label": "formatting",
                     "p_original": 0.40,
+                    "top_p_original": 0.45,
+                    "original_top_token_id": 9002,
+                    "original_top_raw_token": "X",
+                    "original_rank": 2,
                     "delta_logp": -0.05,
                     "teacher_top_token_id": 9102,
                     "teacher_top_raw_token": "X",
@@ -1511,6 +1551,10 @@ def _correct_token_teacher_fixture() -> tuple[
                     "raw_token": "B",
                     "token_label": "correct",
                     "p_original": 0.30,
+                    "top_p_original": 0.90,
+                    "original_top_token_id": 9003,
+                    "original_top_raw_token": "C",
+                    "original_rank": 2,
                     "delta_logp": -0.01,
                     "teacher_top_token_id": 9201,
                     "teacher_top_raw_token": "B",
@@ -1522,6 +1566,10 @@ def _correct_token_teacher_fixture() -> tuple[
                     "raw_token": "\t",
                     "token_label": "formatting",
                     "p_original": 0.25,
+                    "top_p_original": 0.29,
+                    "original_top_token_id": 9004,
+                    "original_top_raw_token": " ",
+                    "original_rank": 2,
                     "delta_logp": 0.02,
                     "teacher_top_token_id": 202,
                     "teacher_top_raw_token": "\t",
@@ -1624,51 +1672,69 @@ def test_correct_token_teacher_audit_counts_groups_samples_threshold_and_top1() 
     assert sweep[0.1]["suppressed_beyond_threshold_count"] == 0
 
 
-def test_student_top1_gate_uses_strictly_less_than_original_top1_probability() -> None:
+def test_student_response_probability_gate_uses_p_original_and_includes_boundary() -> (
+    None
+):
     results, rows = _correct_token_teacher_fixture()
     audit = probe._build_correct_token_teacher_audit(
         results,
         rows,
         selected_threshold=0.05,
-        student_top1_max_probability=0.30,
+        student_response_min_probability=0.30,
     )
 
-    assert audit["student_top1_gate_enabled"] is True
-    assert audit["student_top1_max_probability"] == pytest.approx(0.30)
+    assert audit["student_response_probability_gate_enabled"] is True
+    assert audit["student_response_min_probability"] == pytest.approx(0.30)
+    assert all(
+        not math.isclose(float(row["p_original"]), float(row["top_p_original"]))
+        and int(row["top_token_id_original"]) != int(row["token_id"])
+        and int(row["rank_original"]) > 1
+        for row in rows
+    )
+    boundary_row = rows[2]
+    assert float(boundary_row["p_original"]) == pytest.approx(0.30)
+    assert float(boundary_row["top_p_original"]) == pytest.approx(0.90)
+    assert int(boundary_row["top_token_id_original"]) != int(boundary_row["token_id"])
+    assert str(boundary_row["top_raw_token_original"]) != str(boundary_row["raw_token"])
+    assert int(boundary_row["rank_original"]) > 1
     assert audit["eligible_token_count_before_gate"] == 4
     assert audit["included_token_count"] == 2
-    assert audit["excluded_by_student_top1_gate_count"] == 2
-    assert audit["student_top1_gate_coverage_rate"] == pytest.approx(0.5)
+    assert audit["excluded_by_student_response_probability_gate_count"] == 2
+    assert audit["student_response_probability_gate_coverage_rate"] == pytest.approx(
+        0.5
+    )
 
     classified = [
         probe._classify_correct_token_teacher_row(
             row,
             threshold=0.05,
-            student_top1_max_probability=0.30,
+            student_response_min_probability=0.30,
         )
         for row in rows
     ]
     assert {
-        int(row["token_id"]): bool(row["passes_student_top1_gate"])
+        int(row["token_id"]): bool(row["passes_student_response_probability_gate"])
         for row in classified
-    } == {101: True, 102: False, 201: False, 202: True}
+    } == {101: False, 102: True, 201: True, 202: False}
 
 
-def test_student_top1_gate_none_preserves_legacy_statistics() -> None:
+def test_student_response_probability_gate_none_preserves_legacy_statistics() -> None:
     results, rows = _correct_token_teacher_fixture()
     audit = probe._build_correct_token_teacher_audit(
         results,
         rows,
         selected_threshold=0.05,
-        student_top1_max_probability=None,
+        student_response_min_probability=None,
     )
 
-    assert audit["student_top1_gate_enabled"] is False
-    assert audit["student_top1_max_probability"] is None
+    assert audit["student_response_probability_gate_enabled"] is False
+    assert audit["student_response_min_probability"] is None
     assert audit["eligible_token_count_before_gate"] == 4
     assert audit["included_token_count"] == 4
-    assert audit["excluded_by_student_top1_gate_count"] == 0
-    assert audit["student_top1_gate_coverage_rate"] == pytest.approx(1.0)
+    assert audit["excluded_by_student_response_probability_gate_count"] == 0
+    assert audit["student_response_probability_gate_coverage_rate"] == pytest.approx(
+        1.0
+    )
     assert audit["verified_correct_token_count"] == 2
     assert audit["formatting_token_count"] == 2
     assert audit["probability_decreased_count"] == 3
@@ -1698,7 +1764,7 @@ def test_correct_token_teacher_audit_html_is_standalone_and_shows_all_tokens() -
     assert "<iframe" not in rendered
 
 
-def test_rebuild_report_only_writes_student_top1_gate_stats_and_marks_all_csv_rows(
+def test_rebuild_report_only_writes_student_response_gate_stats_and_marks_all_csv_rows(
     tmp_path: Path,
 ) -> None:
     results, _ = _correct_token_teacher_fixture()
@@ -1719,7 +1785,7 @@ def test_rebuild_report_only_writes_student_top1_gate_stats_and_marks_all_csv_ro
                 "--rebuild-report-only",
                 "--teacher-signal-threshold",
                 "0.05",
-                "--student-top1-max-probability",
+                "--student-response-min-probability",
                 "0.30",
             ]
         )
@@ -1731,24 +1797,41 @@ def test_rebuild_report_only_writes_student_top1_gate_stats_and_marks_all_csv_ro
             encoding="utf-8"
         )
     )
-    assert correct_audit["student_top1_gate_enabled"] is True
-    assert correct_audit["student_top1_max_probability"] == pytest.approx(0.30)
-    assert correct_audit["student_top1_gate_rule"] == (
-        "top_p_original < student_top1_max_probability"
+    assert correct_audit["student_response_probability_gate_enabled"] is True
+    assert correct_audit["student_response_min_probability"] == pytest.approx(0.30)
+    assert correct_audit["student_response_probability_gate_rule"] == (
+        "p_original >= student_response_min_probability"
     )
     assert correct_audit["eligible_token_count_before_gate"] == 4
     assert correct_audit["included_token_count"] == 2
-    assert correct_audit["excluded_by_student_top1_gate_count"] == 2
-    assert correct_audit["student_top1_gate_coverage_rate"] == pytest.approx(0.5)
+    assert correct_audit["excluded_by_student_response_probability_gate_count"] == 2
+    assert correct_audit[
+        "student_response_probability_gate_coverage_rate"
+    ] == pytest.approx(0.5)
+    assert (
+        correct_audit["teacher_harmful_signal_count"]
+        == correct_audit["suppressed_beyond_threshold_count"]
+    )
+    assert correct_audit["teacher_harmful_signal_rate"] == pytest.approx(
+        correct_audit["suppressed_beyond_threshold_rate"]
+    )
     assert correct_audit["ungated_metrics"]["included_token_count"] == 4
+
+    audit_html = (output_dir / "correct_token_teacher_rejection.html").read_text(
+        encoding="utf-8"
+    )
+    assert "p_original &gt;= 0.3" in audit_html
+    assert "Student Response p" in audit_html
+    assert "教师有害信号" in audit_html
+    assert "Student Top-1 p" not in audit_html
 
     sample_stats = {str(row["pair_id"]): row for row in correct_audit["sample_summary"]}
     assert {
         pair_id: (
             row["eligible_token_count_before_gate"],
             row["included_token_count"],
-            row["excluded_by_student_top1_gate_count"],
-            row["student_top1_gate_coverage_rate"],
+            row["excluded_by_student_response_probability_gate_count"],
+            row["student_response_probability_gate_coverage_rate"],
         )
         for pair_id, row in sample_stats.items()
     } == {
@@ -1768,12 +1851,13 @@ def test_rebuild_report_only_writes_student_top1_gate_stats_and_marks_all_csv_ro
         "202",
     }
     assert {
-        row["token_id"]: row["passes_student_top1_gate"] for row in rejection_rows
+        row["token_id"]: row["passes_student_response_probability_gate"]
+        for row in rejection_rows
     } == {
-        "101": "True",
-        "102": "False",
-        "201": "False",
-        "202": "True",
+        "101": "False",
+        "102": "True",
+        "201": "True",
+        "202": "False",
     }
     assert "103" not in {row["token_id"] for row in rejection_rows}
 
