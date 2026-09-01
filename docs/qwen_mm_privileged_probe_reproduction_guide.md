@@ -373,11 +373,19 @@ fingerprint，从而重新计算相应样本。
 qwen-mm-privileged-probe \
   --output-dir "$SINGLE_OUTPUT" \
   --teacher-signal-threshold 0.05 \
+  --student-top1-max-probability 0.95 \
   --rebuild-report-only
 ```
 
 `--teacher-signal-threshold` 影响变异词教师信号分类，以及正确 token 页面中的明显
 压低判定；它不改变任何模型概率。
+
+`--student-top1-max-probability 0.95` 只影响正确内容 token 与格式 token 的教师
+不认可统计。门控严格使用学生原图条件下的 `top_p_original < 0.95`；等于 0.95
+的 token 不参与统计。这里使用的是学生下一 token 分布的 Top-1 概率，而不是采样
+后 response token 自身的 `p_original`。HTML 和 JSON 同时保留门控前对照指标，
+CSV 保留全部候选并通过 `passes_student_top1_gate` 标记是否参与统计。该参数同样
+不需要重新推理。
 当前有效信号定义为：
 
 ```text
@@ -405,10 +413,10 @@ abs(decision_token_delta_logp) > teacher_signal_threshold
 | `teacher_signal_mutations.csv` | 每个变异词一行的主要审计表 |
 | `teacher_signal_tokens.csv` | 仅包含变异词关联 subtokens 的辅助表 |
 | `teacher_signal_sample_summary.csv` | 每个样本的变异词教师信号摘要 |
-| `correct_token_teacher_rejection.html` | 正确内容 token 与格式 token 的教师不认可审计 |
-| `correct_token_teacher_rejection.json` | 概率压低、Top-1 拒绝、分组与阈值扫描统计 |
-| `correct_token_teacher_rejection.csv` | 全部纳入 token 的逐行明细 |
-| `correct_token_teacher_rejection_sample_summary.csv` | 每个样本的正确 token 教师不认可摘要 |
+| `correct_token_teacher_rejection.html` | 正确内容/格式 token 的 Top-1 门控、门控前后对照与教师不认可审计 |
+| `correct_token_teacher_rejection.json` | 门控覆盖率、门控前对照、概率压低、Top-1 拒绝、分组与阈值扫描统计 |
+| `correct_token_teacher_rejection.csv` | 全部正确/格式候选的逐行明细及 `passes_student_top1_gate` 标记 |
+| `correct_token_teacher_rejection_sample_summary.csv` | 每个样本的门控覆盖率与正确 token 教师不认可摘要 |
 | `failures.jsonl` | 失败样本及异常信息，仅发生失败时出现 |
 
 每个 `samples/<ordinal>_<pair_id>/` 目录包含：

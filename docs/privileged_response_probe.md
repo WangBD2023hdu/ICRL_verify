@@ -106,8 +106,9 @@ audit. It includes `token_label=correct` and, by request, formatting tokens:
 - `correct_token_teacher_rejection.html`: standalone token-level inspection;
 - `correct_token_teacher_rejection.json`: aggregate, group, sample, and
   threshold-sweep metrics;
-- `correct_token_teacher_rejection.csv`: every included response token in its
-  original order;
+- `correct_token_teacher_rejection.csv`: every correct/formatting candidate in
+  its original order, including whether it passes the optional student Top-1
+  probability gate;
 - `correct_token_teacher_rejection_sample_summary.csv`: one row per sample.
 
 The audit reports four separate notions rather than one ambiguous rejection
@@ -116,6 +117,11 @@ rate: any `delta_logp < 0`, suppression beyond
 ID, and Teacher Top-1 decoding to a different surface. Formatting tokens are
 included in a separate group, but their correctness is not character-alignment
 verified because OCR normalization removes formatting syntax and whitespace.
+Use `--student-top1-max-probability 0.95` to make only candidates with
+`top_p_original < 0.95` enter these harmful-signal statistics. The comparison
+page retains ungated metrics, and the CSV retains excluded high-confidence
+candidates for auditability. This is a report-only filter and can be changed
+with `--rebuild-report-only` without another model forward.
 
 Only annotated mutation words are included; ordinary response words never enter
 the audit denominator. Each mutation is counted once even when its readback has
@@ -144,5 +150,6 @@ and the aligned tokens' original/teacher probabilities and deltas. The same
 qwen-mm-privileged-probe \
   --output-dir outputs/arxiv_confusable_privileged_probe_v1 \
   --teacher-signal-threshold 0.05 \
+  --student-top1-max-probability 0.95 \
   --rebuild-report-only
 ```

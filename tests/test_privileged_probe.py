@@ -1371,6 +1371,20 @@ def test_cli_exposes_teacher_signal_threshold() -> None:
     assert args.teacher_signal_threshold == pytest.approx(0.125)
 
 
+def test_cli_exposes_student_top1_max_probability() -> None:
+    args = probe._build_parser().parse_args(
+        [
+            "--output-dir",
+            "outputs/test",
+            "--rebuild-report-only",
+            "--student-top1-max-probability",
+            "0.875",
+        ]
+    )
+
+    assert args.student_top1_max_probability == pytest.approx(0.875)
+
+
 def _correct_token_teacher_result(
     pair_id: str,
     sample_report: str,
@@ -1610,6 +1624,59 @@ def test_correct_token_teacher_audit_counts_groups_samples_threshold_and_top1() 
     assert sweep[0.1]["suppressed_beyond_threshold_count"] == 0
 
 
+def test_student_top1_gate_uses_strictly_less_than_original_top1_probability() -> None:
+    results, rows = _correct_token_teacher_fixture()
+    audit = probe._build_correct_token_teacher_audit(
+        results,
+        rows,
+        selected_threshold=0.05,
+        student_top1_max_probability=0.30,
+    )
+
+    assert audit["student_top1_gate_enabled"] is True
+    assert audit["student_top1_max_probability"] == pytest.approx(0.30)
+    assert audit["eligible_token_count_before_gate"] == 4
+    assert audit["included_token_count"] == 2
+    assert audit["excluded_by_student_top1_gate_count"] == 2
+    assert audit["student_top1_gate_coverage_rate"] == pytest.approx(0.5)
+
+    classified = [
+        probe._classify_correct_token_teacher_row(
+            row,
+            threshold=0.05,
+            student_top1_max_probability=0.30,
+        )
+        for row in rows
+    ]
+    assert {
+        int(row["token_id"]): bool(row["passes_student_top1_gate"])
+        for row in classified
+    } == {101: True, 102: False, 201: False, 202: True}
+
+
+def test_student_top1_gate_none_preserves_legacy_statistics() -> None:
+    results, rows = _correct_token_teacher_fixture()
+    audit = probe._build_correct_token_teacher_audit(
+        results,
+        rows,
+        selected_threshold=0.05,
+        student_top1_max_probability=None,
+    )
+
+    assert audit["student_top1_gate_enabled"] is False
+    assert audit["student_top1_max_probability"] is None
+    assert audit["eligible_token_count_before_gate"] == 4
+    assert audit["included_token_count"] == 4
+    assert audit["excluded_by_student_top1_gate_count"] == 0
+    assert audit["student_top1_gate_coverage_rate"] == pytest.approx(1.0)
+    assert audit["verified_correct_token_count"] == 2
+    assert audit["formatting_token_count"] == 2
+    assert audit["probability_decreased_count"] == 3
+    assert audit["suppressed_beyond_threshold_count"] == 1
+    assert audit["teacher_top1_exact_id_rejection_count"] == 2
+    assert audit["teacher_top1_surface_rejection_count"] == 1
+
+
 def test_correct_token_teacher_audit_html_is_standalone_and_shows_all_tokens() -> None:
     results, rows = _correct_token_teacher_fixture()
     audit = probe._build_correct_token_teacher_audit(
@@ -1629,6 +1696,86 @@ def test_correct_token_teacher_audit_html_is_standalone_and_shows_all_tokens() -
         assert token_id in rendered
     assert "103" not in rendered
     assert "<iframe" not in rendered
+
+
+def test_rebuild_report_only_writes_student_top1_gate_stats_and_marks_all_csv_rows(
+    tmp_path: Path,
+) -> None:
+    results, _ = _correct_token_teacher_fixture()
+    output_dir = tmp_path / "report"
+    for ordinal, result in enumerate(results, start=1):
+        sample_dir = output_dir / "samples" / f"{ordinal:03d}-{result['pair_id']}"
+        sample_dir.mkdir(parents=True)
+        (sample_dir / "result.json").write_text(
+            json.dumps(result, ensure_ascii=False),
+            encoding="utf-8",
+        )
+
+    assert (
+        probe.main(
+            [
+                "--output-dir",
+                str(output_dir),
+                "--rebuild-report-only",
+                "--teacher-signal-threshold",
+                "0.05",
+                "--student-top1-max-probability",
+                "0.30",
+            ]
+        )
+        == 0
+    )
+
+    correct_audit = json.loads(
+        (output_dir / "correct_token_teacher_rejection.json").read_text(
+            encoding="utf-8"
+        )
+    )
+    assert correct_audit["student_top1_gate_enabled"] is True
+    assert correct_audit["student_top1_max_probability"] == pytest.approx(0.30)
+    assert correct_audit["student_top1_gate_rule"] == (
+        "top_p_original < student_top1_max_probability"
+    )
+    assert correct_audit["eligible_token_count_before_gate"] == 4
+    assert correct_audit["included_token_count"] == 2
+    assert correct_audit["excluded_by_student_top1_gate_count"] == 2
+    assert correct_audit["student_top1_gate_coverage_rate"] == pytest.approx(0.5)
+    assert correct_audit["ungated_metrics"]["included_token_count"] == 4
+
+    sample_stats = {str(row["pair_id"]): row for row in correct_audit["sample_summary"]}
+    assert {
+        pair_id: (
+            row["eligible_token_count_before_gate"],
+            row["included_token_count"],
+            row["excluded_by_student_top1_gate_count"],
+            row["student_top1_gate_coverage_rate"],
+        )
+        for pair_id, row in sample_stats.items()
+    } == {
+        "pair-1": (2, 1, 1, 0.5),
+        "pair-2": (2, 1, 1, 0.5),
+    }
+
+    with (output_dir / "correct_token_teacher_rejection.csv").open(
+        encoding="utf-8-sig", newline=""
+    ) as handle:
+        rejection_rows = list(csv.DictReader(handle))
+    assert len(rejection_rows) == 4
+    assert {row["token_id"] for row in rejection_rows} == {
+        "101",
+        "102",
+        "201",
+        "202",
+    }
+    assert {
+        row["token_id"]: row["passes_student_top1_gate"] for row in rejection_rows
+    } == {
+        "101": "True",
+        "102": "False",
+        "201": "False",
+        "202": "True",
+    }
+    assert "103" not in {row["token_id"] for row in rejection_rows}
 
 
 def test_rebuild_privileged_report_writes_correct_token_teacher_artifacts(

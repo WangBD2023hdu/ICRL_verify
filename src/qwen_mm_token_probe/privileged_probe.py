@@ -147,6 +147,7 @@ def run_privileged_probe(
     limit: int | None = None,
     heartbeat_seconds: float = 30.0,
     teacher_signal_threshold: float = DEFAULT_TEACHER_SIGNAL_THRESHOLD,
+    student_top1_max_probability: float | None = None,
 ) -> PrivilegedProbeSummary:
     """Generate once with the student and score its IDs in two contexts."""
 
@@ -169,6 +170,7 @@ def run_privileged_probe(
     if image_patch_size <= 0:
         raise ValueError("image_patch_size must be positive")
     _validate_teacher_signal_threshold(teacher_signal_threshold)
+    _validate_student_top1_max_probability(student_top1_max_probability)
 
     student_model_id = str(model_id)
     resolved_teacher_model_id = (
@@ -212,6 +214,7 @@ def run_privileged_probe(
         "resume": resume,
         "limit": limit,
         "teacher_signal_threshold": teacher_signal_threshold,
+        "student_top1_max_probability": student_top1_max_probability,
     }
     _write_json_atomic(output_root / "config.json", config)
 
@@ -347,6 +350,7 @@ def run_privileged_probe(
         report_summary = rebuild_privileged_report(
             output_root,
             teacher_signal_threshold=teacher_signal_threshold,
+            student_top1_max_probability=student_top1_max_probability,
         )
         completed_total = int(report_summary["completed_samples"])
     except Exception as exc:  # noqa: BLE001 - report errors must not hide run status
@@ -1130,6 +1134,15 @@ def _validate_teacher_signal_threshold(value: float) -> None:
         raise ValueError("teacher_signal_threshold must be finite and non-negative")
 
 
+def _validate_student_top1_max_probability(value: float | None) -> None:
+    if value is None:
+        return
+    if not math.isfinite(value) or not 0 < value <= 1:
+        raise ValueError(
+            "student_top1_max_probability must be finite and in the interval (0, 1]"
+        )
+
+
 def _teacher_signal_correctness(row: dict[str, Any]) -> str:
     existing = str(row.get("correctness", ""))
     if existing in {"correct", "incorrect", "excluded"}:
@@ -1263,6 +1276,13 @@ def _prepare_teacher_signal_token_details(
             for position in gt_positions
             if position < len(normalized_gt.text)
         )
+        original_top = _candidate_at(row, "original", 1)
+        original_top_id = int(original_top["token_id"]) if original_top else -1
+        original_top_raw = (
+            str(original_top.get("raw_token", original_top.get("token", "")))
+            if original_top
+            else ""
+        )
         teacher_top = _candidate_at(row, "teacher", 1)
         teacher_top_id = int(teacher_top["token_id"]) if teacher_top else -1
         teacher_top_raw = (
@@ -1311,6 +1331,14 @@ def _prepare_teacher_signal_token_details(
                 ),
                 "rank_original": int(row["rank_original"]),
                 "rank_teacher": int(row["rank_teacher"]),
+                "top_token_id_original": original_top_id,
+                "top_token_original": str(
+                    original_top.get("token", original_top_raw) if original_top else ""
+                ),
+                "top_raw_token_original": original_top_raw,
+                "top_p_original": float(original_top.get("probability", 0.0))
+                if original_top
+                else 0.0,
                 "top_token_id_teacher": teacher_top_id,
                 "top_token_teacher": str(
                     teacher_top.get("token", teacher_top_raw) if teacher_top else ""
@@ -1366,10 +1394,17 @@ def _classify_correct_token_teacher_row(
     row: dict[str, Any],
     *,
     threshold: float,
+    student_top1_max_probability: float | None = None,
 ) -> dict[str, Any]:
     _validate_teacher_signal_threshold(threshold)
+    _validate_student_top1_max_probability(student_top1_max_probability)
     classified = dict(row)
     delta_logp = float(classified["delta_logp_teacher_minus_original"])
+    student_top1_probability = float(classified["top_p_original"])
+    passes_student_top1_gate = (
+        student_top1_max_probability is None
+        or student_top1_probability < student_top1_max_probability
+    )
     exact_top1_accepted = bool(classified.get("target_is_top_teacher", False))
     same_surface_top1_accepted = exact_top1_accepted or bool(
         classified.get("teacher_top_same_surface_different_id", False)
@@ -1392,6 +1427,8 @@ def _classify_correct_token_teacher_row(
     classified.update(
         {
             "teacher_signal_threshold": threshold,
+            "student_top1_max_probability": student_top1_max_probability,
+            "passes_student_top1_gate": passes_student_top1_gate,
             "probability_decreased": delta_logp < 0,
             "suppressed_beyond_threshold": suppressed,
             "teacher_top1_exact_response_id": exact_top1_accepted,
@@ -1412,10 +1449,20 @@ def _correct_token_teacher_metrics(
     rows: Sequence[dict[str, Any]],
     *,
     threshold: float,
+    student_top1_max_probability: float | None = None,
 ) -> dict[str, Any]:
-    classified = [
-        _classify_correct_token_teacher_row(row, threshold=threshold) for row in rows
+    candidate_rows = [
+        _classify_correct_token_teacher_row(
+            row,
+            threshold=threshold,
+            student_top1_max_probability=student_top1_max_probability,
+        )
+        for row in rows
     ]
+    classified = [
+        row for row in candidate_rows if bool(row["passes_student_top1_gate"])
+    ]
+    eligible_before_gate = len(candidate_rows)
     total = len(classified)
     deltas = [float(row["delta_logp_teacher_minus_original"]) for row in classified]
 
@@ -1430,7 +1477,12 @@ def _correct_token_teacher_metrics(
     suppressed_surface = count("suppressed_and_surface_top1_rejected")
     return {
         "threshold": threshold,
+        "student_top1_gate_enabled": student_top1_max_probability is not None,
+        "student_top1_max_probability": student_top1_max_probability,
+        "eligible_token_count_before_gate": eligible_before_gate,
         "included_token_count": total,
+        "excluded_by_student_top1_gate_count": eligible_before_gate - total,
+        "student_top1_gate_coverage_rate": _ratio(total, eligible_before_gate),
         "verified_correct_token_count": sum(
             str(row.get("inclusion_group", "")) == "verified_correct"
             for row in classified
@@ -1468,8 +1520,10 @@ def _build_correct_token_teacher_audit(
     rows: Sequence[dict[str, Any]],
     *,
     selected_threshold: float = DEFAULT_TEACHER_SIGNAL_THRESHOLD,
+    student_top1_max_probability: float | None = None,
 ) -> dict[str, Any]:
     _validate_teacher_signal_threshold(selected_threshold)
+    _validate_student_top1_max_probability(student_top1_max_probability)
     thresholds = sorted({*TEACHER_SIGNAL_THRESHOLDS, selected_threshold})
     rows_by_pair: dict[str, list[dict[str, Any]]] = {}
     for row in rows:
@@ -1491,6 +1545,7 @@ def _build_correct_token_teacher_audit(
                 **_correct_token_teacher_metrics(
                     pair_rows,
                     threshold=selected_threshold,
+                    student_top1_max_probability=student_top1_max_probability,
                 ),
             }
         )
@@ -1505,6 +1560,7 @@ def _build_correct_token_teacher_audit(
                 **_correct_token_teacher_metrics(
                     group_rows,
                     threshold=selected_threshold,
+                    student_top1_max_probability=student_top1_max_probability,
                 ),
             }
         )
@@ -1513,6 +1569,13 @@ def _build_correct_token_teacher_audit(
         "created_at": _utc_now(),
         "audit_unit": "student_response_token",
         "selected_threshold": selected_threshold,
+        "student_top1_gate_enabled": student_top1_max_probability is not None,
+        "student_top1_max_probability": student_top1_max_probability,
+        "student_top1_gate_rule": (
+            "top_p_original < student_top1_max_probability"
+            if student_top1_max_probability is not None
+            else "disabled"
+        ),
         "included_token_labels": ["correct", "formatting"],
         "verified_correct_rule": "token_label == correct",
         "formatting_rule": "token_label == formatting",
@@ -1528,9 +1591,21 @@ def _build_correct_token_teacher_audit(
         ),
         "teacher_model_is_student": _teacher_model_is_student_for_results(results),
         "completed_samples": len(pair_ids),
-        **_correct_token_teacher_metrics(rows, threshold=selected_threshold),
+        **_correct_token_teacher_metrics(
+            rows,
+            threshold=selected_threshold,
+            student_top1_max_probability=student_top1_max_probability,
+        ),
+        "ungated_metrics": _correct_token_teacher_metrics(
+            rows,
+            threshold=selected_threshold,
+        ),
         "threshold_sweep": [
-            _correct_token_teacher_metrics(rows, threshold=threshold)
+            _correct_token_teacher_metrics(
+                rows,
+                threshold=threshold,
+                student_top1_max_probability=student_top1_max_probability,
+            )
             for threshold in thresholds
         ],
         "group_breakdown": group_breakdown,
@@ -1885,8 +1960,10 @@ def rebuild_privileged_report(
     output_dir: str | Path,
     *,
     teacher_signal_threshold: float = DEFAULT_TEACHER_SIGNAL_THRESHOLD,
+    student_top1_max_probability: float | None = None,
 ) -> dict[str, Any]:
     _validate_teacher_signal_threshold(teacher_signal_threshold)
+    _validate_student_top1_max_probability(student_top1_max_probability)
     output_root = Path(output_dir).expanduser().resolve()
     result_paths = sorted((output_root / "samples").glob("*/result.json"))
     if not result_paths:
@@ -1983,6 +2060,7 @@ def rebuild_privileged_report(
         _classify_correct_token_teacher_row(
             row,
             threshold=teacher_signal_threshold,
+            student_top1_max_probability=student_top1_max_probability,
         )
         for row in correct_token_teacher_rows
     ]
@@ -1990,6 +2068,7 @@ def rebuild_privileged_report(
         results,
         classified_correct_token_rows,
         selected_threshold=teacher_signal_threshold,
+        student_top1_max_probability=student_top1_max_probability,
     )
     _write_json_atomic(
         output_root / "correct_token_teacher_rejection.json",
@@ -2515,7 +2594,9 @@ def _correct_token_breakdown_row(row: dict[str, Any]) -> str:
     return (
         "<tr>"
         f"<td>{html.escape(_correct_token_group_label(str(row['inclusion_group'])))}</td>"
+        f"<td>{int(row['eligible_token_count_before_gate'])}</td>"
         f"<td>{int(row['included_token_count'])}</td>"
+        f"<td>{_audit_rate(row['student_top1_gate_coverage_rate'])}</td>"
         f"<td>{int(row['probability_decreased_count'])}</td>"
         f"<td>{_audit_rate(row['probability_decreased_rate'])}</td>"
         f"<td>{int(row['suppressed_beyond_threshold_count'])}</td>"
@@ -2551,7 +2632,9 @@ def _correct_token_sample_row(row: dict[str, Any]) -> str:
     return (
         "<tr>"
         f"<td>{sample}</td>"
+        f"<td>{int(row['eligible_token_count_before_gate'])}</td>"
         f"<td>{int(row['included_token_count'])}</td>"
+        f"<td>{_audit_rate(row['student_top1_gate_coverage_rate'])}</td>"
         f"<td>{int(row['verified_correct_token_count'])}</td>"
         f"<td>{int(row['formatting_token_count'])}</td>"
         f"<td>{int(row['suppressed_beyond_threshold_count'])}</td>"
@@ -2578,13 +2661,20 @@ def _correct_token_detail_row(row: dict[str, Any]) -> str:
     exact_rejected = bool(row.get("teacher_top1_exact_id_rejected", False))
     surface_rejected = bool(row.get("teacher_top1_surface_rejected", False))
     suppressed = bool(row.get("suppressed_beyond_threshold", False))
-    row_class = "harmful-row" if suppressed or surface_rejected else ""
+    passes_gate = bool(row.get("passes_student_top1_gate", True))
+    row_class = (
+        "gate-excluded-row"
+        if not passes_gate
+        else ("harmful-row" if suppressed or surface_rejected else "")
+    )
     return (
         f"<tr class='{row_class}'>"
         f"<td>{html.escape(str(row.get('pair_id', '')))}</td>"
         f"<td>{location}</td>"
         f"<td>{html.escape(_correct_token_group_label(str(row['inclusion_group'])))}</td>"
         f"<td>{token_display}<small>ID {int(row['token_id'])}</small></td>"
+        f"<td>{float(row['top_p_original']):.6f}</td>"
+        f"<td>{'是' if passes_gate else '否'}</td>"
         f"<td>{float(row['p_original']):.6f}</td>"
         f"<td>{float(row['p_teacher']):.6f}</td>"
         f"<td class='{_delta_class(row['delta_logp_teacher_minus_original'])}'>"
@@ -2601,13 +2691,37 @@ def _correct_token_detail_row(row: dict[str, Any]) -> str:
     )
 
 
+def _correct_token_gate_comparison_row(
+    label: str,
+    metrics: dict[str, Any],
+) -> str:
+    return (
+        "<tr>"
+        f"<td>{html.escape(label)}</td>"
+        f"<td>{int(metrics['included_token_count'])}</td>"
+        f"<td>{_correct_token_metric_value(metrics['probability_decreased_count'], metrics['probability_decreased_rate'])}</td>"
+        f"<td>{_correct_token_metric_value(metrics['suppressed_beyond_threshold_count'], metrics['suppressed_beyond_threshold_rate'])}</td>"
+        f"<td>{_correct_token_metric_value(metrics['teacher_top1_surface_rejection_count'], metrics['teacher_top1_surface_rejection_rate'])}</td>"
+        f"<td>{_correct_token_metric_value(metrics['suppressed_and_surface_top1_rejected_count'], metrics['suppressed_and_surface_top1_rejected_rate'])}</td>"
+        f"<td class='{_delta_class(metrics['mean_delta_logp'])}'>{_optional_float(metrics['mean_delta_logp'], signed=True)}</td>"
+        "</tr>"
+    )
+
+
 def _render_correct_token_teacher_audit_html(
     audit: dict[str, Any],
     rows: Sequence[dict[str, Any]],
 ) -> str:
     threshold = float(audit["selected_threshold"])
+    gate_value = audit.get("student_top1_max_probability")
+    student_top1_max_probability = float(gate_value) if gate_value is not None else None
     classified_rows = [
-        _classify_correct_token_teacher_row(row, threshold=threshold) for row in rows
+        _classify_correct_token_teacher_row(
+            row,
+            threshold=threshold,
+            student_top1_max_probability=student_top1_max_probability,
+        )
+        for row in rows
     ]
     ordered_rows = sorted(
         classified_rows,
@@ -2615,7 +2729,18 @@ def _render_correct_token_teacher_audit_html(
     )
     metrics = "".join(
         [
-            _audit_metric("纳入 token", audit["included_token_count"]),
+            _audit_metric("门控前候选", audit["eligible_token_count_before_gate"]),
+            _audit_metric("门控后参与", audit["included_token_count"]),
+            _audit_metric(
+                "门控覆盖率",
+                _audit_rate(audit["student_top1_gate_coverage_rate"]),
+                tone="neutral",
+            ),
+            _audit_metric(
+                "门控排除",
+                audit["excluded_by_student_top1_gate_count"],
+                tone="neutral",
+            ),
             _audit_metric("GT 对齐正确", audit["verified_correct_token_count"]),
             _audit_metric("格式 token", audit["formatting_token_count"]),
             _audit_metric(
@@ -2676,7 +2801,28 @@ def _render_correct_token_teacher_audit_html(
     )
     detail_rows = "".join(_correct_token_detail_row(row) for row in ordered_rows)
     if not detail_rows:
-        detail_rows = "<tr><td colspan='14' class='empty'>没有符合条件的正确或格式 token</td></tr>"
+        detail_rows = "<tr><td colspan='16' class='empty'>没有符合条件的正确或格式 token</td></tr>"
+    gate_description = (
+        "未启用学生 Top-1 概率门控，全部候选 token 参与统计。"
+        if student_top1_max_probability is None
+        else (
+            "仅学生原图分布满足 "
+            f"<code>top_p_original &lt; {student_top1_max_probability:.6g}</code> "
+            "的 token 参与教师信号有害统计；等于阈值时不参与。"
+        )
+    )
+    gate_comparison = ""
+    if student_top1_max_probability is not None:
+        comparison_rows = "".join(
+            [
+                _correct_token_gate_comparison_row(
+                    "门控前全部候选",
+                    dict(audit["ungated_metrics"]),
+                ),
+                _correct_token_gate_comparison_row("门控后参与统计", audit),
+            ]
+        )
+        gate_comparison = f"""<section><h2>门控前后对照</h2><div class="audit-table-scroll"><table><thead><tr><th>口径</th><th>token</th><th>概率下降</th><th>超过阈值压低</th><th>Top-1 文本不同</th><th>压低且 Top-1 文本不同</th><th>平均 Δlogp</th></tr></thead><tbody>{comparison_rows}</tbody></table></div></section>"""
     teacher_mode = audit.get("teacher_model_is_student")
     teacher_mode_text = (
         "学生与教师为同一模型"
@@ -2687,13 +2833,14 @@ def _render_correct_token_teacher_audit_html(
 <html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
 <title>正确 Response Token 的 Teacher 不认可审计</title>{_teacher_signal_audit_css()}</head><body><main>
 <nav><a href="report.html">逐 Token 原始可视化</a><a href="correct_token_teacher_rejection.csv">完整审计 CSV</a><a href="correct_token_teacher_rejection_sample_summary.csv">样本统计 CSV</a><a href="correct_token_teacher_rejection.json">审计 JSON</a><a href="teacher_signal_audit.html">变异词教师信号审计</a></nav>
-<header><h1>正确 Response Token 的 Teacher 不认可审计</h1><p>只纳入学生 Response 中 <code>token_label=correct</code> 的内容 token，并按要求纳入 <code>token_label=formatting</code>。概率压低阈值为 <code>Δlogp &lt; -{threshold:.2f}</code>；Top-1 ID 拒绝与 Top-1 文本拒绝分别统计。</p><p>{html.escape(teacher_mode_text)}。概率下降、超过阈值压低和 Top-1 改变是三个不同口径，不合并成单一“不认可率”。</p></header>
+<header><h1>正确 Response Token 的 Teacher 不认可审计</h1><p>候选集合为学生 Response 中 <code>token_label=correct</code> 的内容 token，并按要求纳入 <code>token_label=formatting</code>。{gate_description}</p><p>概率压低阈值为 <code>Δlogp &lt; -{threshold:.2f}</code>；Top-1 ID 拒绝与 Top-1 文本拒绝分别统计。{html.escape(teacher_mode_text)}。概率下降、超过阈值压低和 Top-1 改变是三个不同口径，不合并成单一“不认可率”。</p></header>
 <section><h2>总体结果</h2><div class="audit-metrics">{metrics}</div></section>
-<section><h2>内容与格式分组</h2><div class="audit-table-scroll"><table><thead><tr><th>纳入类型</th><th>token</th><th>概率下降</th><th>下降率</th><th>超过阈值压低</th><th>压低率</th><th>Top-1 ID 不同</th><th>ID 拒绝率</th><th>Top-1 文本不同</th><th>文本拒绝率</th><th>平均 Δlogp</th></tr></thead><tbody>{group_rows}</tbody></table></div></section>
+{gate_comparison}
+<section><h2>内容与格式分组</h2><div class="audit-table-scroll"><table><thead><tr><th>候选类型</th><th>门控前</th><th>参与统计</th><th>覆盖率</th><th>概率下降</th><th>下降率</th><th>超过阈值压低</th><th>压低率</th><th>Top-1 ID 不同</th><th>ID 拒绝率</th><th>Top-1 文本不同</th><th>文本拒绝率</th><th>平均 Δlogp</th></tr></thead><tbody>{group_rows}</tbody></table></div></section>
 <section><h2>压低阈值敏感性</h2><div class="audit-table-scroll compact"><table><thead><tr><th>τ</th><th>Δlogp &lt; -τ</th><th>压低率</th><th>压低且 Top-1 ID 不同</th><th>比例</th><th>压低且 Top-1 文本不同</th><th>比例</th></tr></thead><tbody>{threshold_rows}</tbody></table></div></section>
-<section><div class="section-heading"><h2>全部纳入 Token</h2><span>{len(ordered_rows)} tokens</span></div><div class="audit-table-scroll"><table class="correct-token-table"><thead><tr><th>样本</th><th>索引</th><th>类型</th><th>Response token</th><th>p original</th><th>p teacher</th><th>Δlogp</th><th>rank original</th><th>rank teacher</th><th>Teacher Top-1</th><th>超过压低阈值</th><th>Top-1 ID 不同</th><th>Top-1 文本不同</th><th>分类</th></tr></thead><tbody>{detail_rows}</tbody></table></div></section>
-<section><h2>按样本统计</h2><div class="audit-table-scroll"><table><thead><tr><th>样本</th><th>纳入 token</th><th>GT 对齐正确</th><th>格式</th><th>超过阈值压低</th><th>压低率</th><th>Top-1 ID 不同</th><th>ID 拒绝率</th><th>Top-1 文本不同</th><th>文本拒绝率</th></tr></thead><tbody>{sample_rows}</tbody></table></div></section>
-<section class="method"><h2>统计边界</h2><p>内容 token 的正确性来自完整 GT 与学生 Response 的字符级对齐。格式 token 在 OCR 标准化阶段被移除，因此无法用同一字符对齐验证其格式是否真的与 GT 一致；本页仍按要求将其纳入，并单独分组展示。漏字没有学生 Response token，不进入本审计。</p></section>
+<section><div class="section-heading"><h2>全部候选 Token 与门控状态</h2><span>{len(ordered_rows)} tokens</span></div><div class="audit-table-scroll"><table class="correct-token-table"><thead><tr><th>样本</th><th>索引</th><th>类型</th><th>Response token</th><th>Student Top-1 p</th><th>参与统计</th><th>p original</th><th>p teacher</th><th>Δlogp</th><th>rank original</th><th>rank teacher</th><th>Teacher Top-1</th><th>超过压低阈值</th><th>Top-1 ID 不同</th><th>Top-1 文本不同</th><th>分类</th></tr></thead><tbody>{detail_rows}</tbody></table></div></section>
+<section><h2>按样本统计</h2><div class="audit-table-scroll"><table><thead><tr><th>样本</th><th>门控前</th><th>参与统计</th><th>覆盖率</th><th>GT 对齐正确</th><th>格式</th><th>超过阈值压低</th><th>压低率</th><th>Top-1 ID 不同</th><th>ID 拒绝率</th><th>Top-1 文本不同</th><th>文本拒绝率</th></tr></thead><tbody>{sample_rows}</tbody></table></div></section>
+<section class="method"><h2>统计边界</h2><p>内容 token 的正确性来自完整 GT 与学生 Response 的字符级对齐。格式 token 在 OCR 标准化阶段被移除，因此无法用同一字符对齐验证其格式是否真的与 GT 一致；本页仍按要求将其纳入，并单独分组展示。Student Top-1 门控使用原图条件下完整下一 token 分布的 <code>top_p_original</code>，不是采样后 Response token 自身的 <code>p_original</code>。漏字没有学生 Response token，不进入本审计。</p></section>
 </main></body></html>"""
 
 
@@ -2740,6 +2887,7 @@ th:first-child, td:first-child { text-align: left; }
 .examples-table small { color: #66777c; font-size: 10px; }
 .correct-token-table small { display: block; color: #66777c; font-size: 10px; }
 .correct-token-table .harmful-row { background: #fff6f6; }
+.correct-token-table .gate-excluded-row { color: #738187; background: #f1f3f2; opacity: 0.72; }
 .gain { color: #08764a; font-weight: 700; }
 .drop { color: #b02b2b; font-weight: 700; }
 .empty { padding: 20px; color: #6b7b80; text-align: center !important; }
@@ -3709,6 +3857,15 @@ def _build_parser() -> argparse.ArgumentParser:
             "correct-token teacher audit reports (default: 0.05)."
         ),
     )
+    parser.add_argument(
+        "--student-top1-max-probability",
+        type=float,
+        help=(
+            "Optional correct-token audit gate. Only tokens with the student "
+            "original-context top_p_original strictly below this value enter "
+            "teacher-harm statistics. The saved token CSV keeps every candidate."
+        ),
+    )
     parser.add_argument("--no-resume", action="store_true")
     parser.add_argument("--fail-fast", action="store_true")
     parser.add_argument(
@@ -3726,6 +3883,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         summary = rebuild_privileged_report(
             args.output_dir,
             teacher_signal_threshold=args.teacher_signal_threshold,
+            student_top1_max_probability=args.student_top1_max_probability,
         )
         print(
             f"Rebuilt report: {Path(args.output_dir).expanduser().resolve() / 'report.html'} "
@@ -3763,6 +3921,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         limit=args.limit,
         heartbeat_seconds=args.heartbeat_seconds,
         teacher_signal_threshold=args.teacher_signal_threshold,
+        student_top1_max_probability=args.student_top1_max_probability,
     )
     print(
         f"Privileged probe complete: output={summary.output_dir} "
