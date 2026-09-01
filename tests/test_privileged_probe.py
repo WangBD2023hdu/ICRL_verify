@@ -1906,6 +1906,500 @@ def test_correct_token_teacher_audit_html_is_standalone_and_shows_all_tokens() -
     assert "formatting" in rendered
     for token_id in ("101", "102", "201", "202"):
         assert token_id in rendered
+
+
+def _token_teacher_signal_fixture() -> tuple[
+    list[dict[str, object]], list[dict[str, object]], dict[str, int]
+]:
+    token_specs = [
+        {
+            "token_id": 301,
+            "raw_token": "A",
+            "token_label": "correct",
+            "p_original": 0.20,
+            "top_p_original": 0.95,
+            "delta_logp": 0.20,
+            "teacher_top_token_id": 301,
+            "teacher_top_raw_token": "A",
+            "teacher_top_probability": 0.75,
+            "teacher_rank": 1,
+        },
+        {
+            "token_id": 302,
+            "raw_token": "B",
+            "token_label": "correct",
+            "p_original": 0.40,
+            "top_p_original": 0.95,
+            "delta_logp": -0.20,
+            "teacher_top_token_id": 9302,
+            "teacher_top_raw_token": "X",
+            "teacher_top_probability": 0.60,
+            "teacher_rank": 2,
+        },
+        {
+            "token_id": 303,
+            "raw_token": "C",
+            "token_label": "hallucinated_substitution",
+            "p_original": 0.30,
+            "top_p_original": 0.95,
+            "delta_logp": 0.20,
+            "teacher_top_token_id": 9303,
+            "teacher_top_raw_token": "Y",
+            "teacher_top_probability": 0.60,
+            "teacher_rank": 2,
+        },
+        {
+            "token_id": 304,
+            "raw_token": "D",
+            "token_label": "hallucinated_insertion",
+            "p_original": 0.10,
+            "top_p_original": 0.95,
+            "delta_logp": -0.20,
+            "teacher_top_token_id": 9304,
+            "teacher_top_raw_token": "Y",
+            "teacher_top_probability": 0.60,
+            "teacher_rank": 2,
+        },
+        {
+            "token_id": 305,
+            "raw_token": "E",
+            "token_label": "mutation_opposite_variant",
+            "p_original": 0.50,
+            "top_p_original": 0.95,
+            "delta_logp": 0.05,
+            "teacher_top_token_id": 9305,
+            "teacher_top_raw_token": "Y",
+            "teacher_top_probability": 0.60,
+            "teacher_rank": 2,
+        },
+        {
+            "token_id": 306,
+            "raw_token": "F",
+            "token_label": "mutation_other",
+            "p_original": 0.25,
+            "top_p_original": 0.95,
+            "delta_logp": -0.05,
+            "teacher_top_token_id": 9306,
+            "teacher_top_raw_token": "Y",
+            "teacher_top_probability": 0.60,
+            "teacher_rank": 2,
+        },
+        {
+            "token_id": 307,
+            "raw_token": "G",
+            "token_label": "correct",
+            "p_original": 0.35,
+            "top_p_original": 0.95,
+            "delta_logp": 0.0,
+            "teacher_top_token_id": 9307,
+            "teacher_top_raw_token": "Y",
+            "teacher_top_probability": 0.60,
+            "teacher_rank": 2,
+        },
+        {
+            "token_id": 308,
+            "raw_token": "\n",
+            "token_label": "formatting",
+            "p_original": 0.40,
+            "top_p_original": 0.95,
+            "delta_logp": -0.50,
+            "teacher_top_token_id": 9308,
+            "teacher_top_raw_token": "Y",
+            "teacher_top_probability": 0.60,
+            "teacher_rank": 2,
+        },
+        {
+            "token_id": 309,
+            "raw_token": "",
+            "token_label": "unknown",
+            "p_original": 0.15,
+            "top_p_original": 0.95,
+            "delta_logp": 0.50,
+            "teacher_top_token_id": 9309,
+            "teacher_top_raw_token": "Y",
+            "teacher_top_probability": 0.60,
+            "teacher_rank": 2,
+        },
+    ]
+    result = _correct_token_teacher_result(
+        "pair-token",
+        "samples/001-pair-token/report.html",
+        "ABCDEFGH",
+        token_specs,
+    )
+    token_details, missing_count = probe._prepare_teacher_signal_token_details(
+        result,
+        sample_report="samples/001-pair-token/report.html",
+    )
+    return [result], token_details, {"pair-token": missing_count}
+
+
+def test_token_teacher_signal_classification_uses_labels_and_threshold() -> None:
+    _, rows, missing_by_pair = _token_teacher_signal_fixture()
+
+    assert missing_by_pair == {"pair-token": 1}
+    assert {
+        str(row["token_label"]): probe._token_teacher_signal_correctness(row)
+        for row in rows
+    } == {
+        "correct": "correct",
+        "hallucinated_substitution": "incorrect",
+        "hallucinated_insertion": "incorrect",
+        "mutation_opposite_variant": "incorrect",
+        "mutation_other": "incorrect",
+        "formatting": "excluded",
+        "unknown": "excluded",
+    }
+
+    classified = {
+        int(row["token_id"]): probe._classify_token_teacher_signal_row(
+            row,
+            threshold=0.05,
+        )
+        for row in rows
+    }
+    assert {
+        token_id: (
+            str(row["token_correctness"]),
+            str(row["signal_direction"]),
+            str(row["teacher_signal_class"]),
+            str(row["teacher_signal_quadrant"]),
+        )
+        for token_id, row in classified.items()
+    } == {
+        301: ("correct", "increase", "correct_reinforced", "correct_reinforced"),
+        302: (
+            "correct",
+            "decrease",
+            "harmful_correct_suppressed",
+            "harmful_correct_suppressed",
+        ),
+        303: (
+            "incorrect",
+            "increase",
+            "harmful_wrong_promoted",
+            "harmful_wrong_promoted",
+        ),
+        304: ("incorrect", "decrease", "wrong_suppressed", "wrong_suppressed"),
+        305: ("incorrect", "neutral", "neutral", "neutral_incorrect"),
+        306: ("incorrect", "neutral", "neutral", "neutral_incorrect"),
+        307: ("correct", "neutral", "neutral", "neutral_correct"),
+        308: ("excluded", "decrease", "excluded", "excluded_formatting"),
+        309: (
+            "excluded",
+            "increase",
+            "excluded",
+            "excluded_unknown_token_label",
+        ),
+    }
+    assert classified[308]["token_exclusion_reason"] == "formatting"
+    assert classified[309]["token_exclusion_reason"] == "unknown_token_label"
+
+
+def test_token_teacher_signal_audit_counts_quadrants_rates_neutral_and_missing_chars() -> (
+    None
+):
+    results, rows, missing_by_pair = _token_teacher_signal_fixture()
+    audit = probe._build_token_teacher_signal_audit(
+        results,
+        rows,
+        missing_gt_characters_by_pair=missing_by_pair,
+        selected_threshold=0.05,
+    )
+
+    assert audit["selected_threshold"] == pytest.approx(0.05)
+    assert audit["total_response_tokens"] == 9
+    assert audit["eligible_token_count_before_gate"] == 7
+    assert audit["included_token_count"] == 7
+    assert audit["excluded_non_content_token_count"] == 2
+    assert audit["formatting_token_count"] == 1
+    assert audit["unknown_token_count"] == 1
+    assert audit["correct_tokens"] == 3
+    assert audit["incorrect_tokens"] == 4
+    assert audit["active_signal_tokens"] == 4
+    assert audit["neutral_tokens"] == 3
+    assert audit["neutral_correct_tokens"] == 1
+    assert audit["neutral_incorrect_tokens"] == 2
+
+    assert audit["correct_reinforced"] == 1
+    assert audit["harmful_correct_suppressed"] == 1
+    assert audit["harmful_wrong_promoted"] == 1
+    assert audit["wrong_suppressed"] == 1
+    assert audit["helpful_signal_count"] == 2
+    assert audit["harmful_signal_count"] == 2
+    assert audit["harmful_signal_rate"] == pytest.approx(2 / 4)
+    assert audit["harmful_evaluable_token_rate"] == pytest.approx(2 / 7)
+    assert audit["correct_token_reinforcement_rate"] == pytest.approx(1 / 3)
+    assert audit["correct_token_suppression_rate"] == pytest.approx(1 / 3)
+    assert audit["wrong_token_promotion_rate"] == pytest.approx(1 / 4)
+    assert audit["wrong_token_suppression_rate"] == pytest.approx(1 / 4)
+
+    breakdown = {
+        str(row["token_label"]): row for row in audit["error_type_breakdown"]
+    }
+    assert set(breakdown) == {
+        "hallucinated_insertion",
+        "hallucinated_substitution",
+        "mutation_opposite_variant",
+        "mutation_other",
+    }
+    assert all(row["incorrect_tokens"] == 1 for row in breakdown.values())
+
+    sample = audit["sample_summary"][0]
+    assert sample["pair_id"] == "pair-token"
+    assert sample["missing_gt_character_count"] == 1
+    assert sample["included_token_count"] == 7
+    assert sample["neutral_tokens"] == 3
+
+
+def test_token_teacher_signal_probability_gates_use_response_probability_boundaries() -> (
+    None
+):
+    results, rows, missing_by_pair = _token_teacher_signal_fixture()
+
+    high_probability_audit = probe._build_token_teacher_signal_audit(
+        results,
+        rows,
+        missing_gt_characters_by_pair=missing_by_pair,
+        selected_threshold=0.05,
+        student_response_min_probability=0.30,
+        student_response_max_probability=None,
+    )
+    assert high_probability_audit["student_response_probability_gate_enabled"] is True
+    assert high_probability_audit["student_response_min_probability"] == pytest.approx(
+        0.30
+    )
+    assert high_probability_audit["student_response_max_probability"] is None
+    assert high_probability_audit["eligible_token_count_before_gate"] == 7
+    assert high_probability_audit["included_token_count"] == 4
+    assert (
+        high_probability_audit[
+            "excluded_by_student_response_probability_gate_count"
+        ]
+        == 3
+    )
+    assert high_probability_audit["correct_reinforced"] == 0
+    assert high_probability_audit["harmful_correct_suppressed"] == 1
+    assert high_probability_audit["harmful_wrong_promoted"] == 1
+    assert high_probability_audit["wrong_suppressed"] == 0
+    assert high_probability_audit["neutral_tokens"] == 2
+
+    low_probability_audit = probe._build_token_teacher_signal_audit(
+        results,
+        rows,
+        missing_gt_characters_by_pair=missing_by_pair,
+        selected_threshold=0.05,
+        student_response_min_probability=None,
+        student_response_max_probability=0.30,
+    )
+    assert low_probability_audit["student_response_probability_gate_enabled"] is True
+    assert low_probability_audit["student_response_min_probability"] is None
+    assert low_probability_audit["student_response_max_probability"] == pytest.approx(
+        0.30
+    )
+    assert low_probability_audit["eligible_token_count_before_gate"] == 7
+    assert low_probability_audit["included_token_count"] == 3
+    assert (
+        low_probability_audit["excluded_by_student_response_probability_gate_count"]
+        == 4
+    )
+    assert low_probability_audit["correct_reinforced"] == 1
+    assert low_probability_audit["harmful_correct_suppressed"] == 0
+    assert low_probability_audit["harmful_wrong_promoted"] == 0
+    assert low_probability_audit["wrong_suppressed"] == 1
+    assert low_probability_audit["neutral_tokens"] == 1
+
+    high_pass = {
+        int(row["token_id"]): bool(
+            probe._classify_token_teacher_signal_row(
+                row,
+                threshold=0.05,
+                student_response_min_probability=0.30,
+            )["passes_student_response_probability_gate"]
+        )
+        for row in rows
+        if probe._token_teacher_signal_correctness(row) != "excluded"
+    }
+    assert high_pass == {
+        301: False,
+        302: True,
+        303: True,
+        304: False,
+        305: True,
+        306: False,
+        307: True,
+    }
+
+    low_pass = {
+        int(row["token_id"]): bool(
+            probe._classify_token_teacher_signal_row(
+                row,
+                threshold=0.05,
+                student_response_max_probability=0.30,
+            )["passes_student_response_probability_gate"]
+        )
+        for row in rows
+        if probe._token_teacher_signal_correctness(row) != "excluded"
+    }
+    assert low_pass == {
+        301: True,
+        302: False,
+        303: False,
+        304: True,
+        305: False,
+        306: True,
+        307: False,
+    }
+
+
+def test_token_teacher_signal_quadrants_html_is_standalone_and_has_key_content() -> (
+    None
+):
+    results, rows, missing_by_pair = _token_teacher_signal_fixture()
+    audit = probe._build_token_teacher_signal_audit(
+        results,
+        rows,
+        missing_gt_characters_by_pair=missing_by_pair,
+        selected_threshold=0.05,
+        student_response_min_probability=0.30,
+    )
+
+    rendered = probe._render_token_teacher_signal_quadrants_html(audit, rows)
+
+    assert rendered.lstrip().lower().startswith("<!doctype html>")
+    assert "<html" in rendered
+    assert "</html>" in rendered
+    assert "0.05" in rendered
+    assert "0.3" in rendered
+    assert "p_original" in rendered
+    assert "漏字" in rendered
+    for label in (
+        "correct_reinforced",
+        "harmful_correct_suppressed",
+        "harmful_wrong_promoted",
+        "wrong_suppressed",
+        "neutral",
+    ):
+        assert label in rendered
+    for filename in (
+        "token_teacher_signal_quadrants.csv",
+        "token_teacher_signal_quadrants_sample_summary.csv",
+        "token_teacher_signal_quadrants.json",
+    ):
+        assert filename in rendered
+    for token_id in ("301", "303", "307"):
+        assert token_id in rendered
+    assert "参与统计" in rendered
+    assert "排除格式 token" in rendered
+    assert "<iframe" not in rendered
+
+
+def test_rebuild_report_only_writes_token_teacher_signal_quadrant_artifacts(
+    tmp_path: Path,
+) -> None:
+    results, _, _ = _token_teacher_signal_fixture()
+    output_dir = tmp_path / "report"
+    for ordinal, result in enumerate(results, start=1):
+        sample_dir = output_dir / "samples" / f"{ordinal:03d}-{result['pair_id']}"
+        sample_dir.mkdir(parents=True)
+        (sample_dir / "result.json").write_text(
+            json.dumps(result, ensure_ascii=False),
+            encoding="utf-8",
+        )
+
+    assert (
+        probe.main(
+            [
+                "--output-dir",
+                str(output_dir),
+                "--rebuild-report-only",
+                "--teacher-signal-threshold",
+                "0.05",
+                "--student-response-min-probability",
+                "0.20",
+                "--student-response-max-probability",
+                "0.40",
+            ]
+        )
+        == 0
+    )
+
+    expected_files = {
+        "token_teacher_signal_quadrants.html",
+        "token_teacher_signal_quadrants.json",
+        "token_teacher_signal_quadrants.csv",
+        "token_teacher_signal_quadrants_sample_summary.csv",
+    }
+    assert expected_files <= {
+        path.name for path in output_dir.iterdir() if path.is_file()
+    }
+
+    audit = json.loads(
+        (output_dir / "token_teacher_signal_quadrants.json").read_text(
+            encoding="utf-8"
+        )
+    )
+    assert audit["selected_threshold"] == pytest.approx(0.05)
+    assert audit["student_response_min_probability"] == pytest.approx(0.20)
+    assert audit["student_response_max_probability"] == pytest.approx(0.40)
+    assert audit["eligible_token_count_before_gate"] == 7
+    assert audit["included_token_count"] == 4
+    assert audit["excluded_by_student_response_probability_gate_count"] == 3
+    assert audit["missing_gt_character_count"] == 1
+    assert audit["formatting_token_count"] == 1
+    assert audit["unknown_token_count"] == 1
+    assert audit["harmful_wrong_promoted"] == 1
+    assert audit["neutral_tokens"] == 2
+
+    with (output_dir / "token_teacher_signal_quadrants.csv").open(
+        encoding="utf-8-sig", newline=""
+    ) as handle:
+        csv_rows = list(csv.DictReader(handle))
+    assert len(csv_rows) == 9
+    assert {row["token_id"] for row in csv_rows} == {
+        str(token_id) for token_id in range(301, 310)
+    }
+    assert {
+        row["token_id"]: row["passes_student_response_probability_gate"]
+        for row in csv_rows
+        if row["token_id"] in {str(token_id) for token_id in range(301, 308)}
+    } == {
+        "301": "True",
+        "302": "False",
+        "303": "True",
+        "304": "False",
+        "305": "False",
+        "306": "True",
+        "307": "True",
+    }
+    assert {
+        row["token_label"] for row in csv_rows
+    } == {
+        "correct",
+        "hallucinated_substitution",
+        "hallucinated_insertion",
+        "mutation_opposite_variant",
+        "mutation_other",
+        "formatting",
+        "unknown",
+    }
+
+    with (
+        output_dir / "token_teacher_signal_quadrants_sample_summary.csv"
+    ).open(encoding="utf-8-sig", newline="") as handle:
+        sample_rows = list(csv.DictReader(handle))
+    assert len(sample_rows) == 1
+    assert sample_rows[0]["pair_id"] == "pair-token"
+    assert sample_rows[0]["missing_gt_character_count"] == "1"
+    assert sample_rows[0]["included_token_count"] == "4"
+
+    rendered = (output_dir / "token_teacher_signal_quadrants.html").read_text(
+        encoding="utf-8"
+    )
+    assert rendered.lstrip().lower().startswith("<!doctype html>")
+    assert "token_teacher_signal_quadrants.csv" in rendered
+    assert "harmful_wrong_promoted" in rendered
+    assert "neutral" in rendered
     assert "103" not in rendered
     assert "<iframe" not in rendered
 

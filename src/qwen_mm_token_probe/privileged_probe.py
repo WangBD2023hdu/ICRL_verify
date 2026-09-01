@@ -51,6 +51,14 @@ PRIVILEGED_PROMPT_TEMPLATE = (
 )
 DEFAULT_TEACHER_SIGNAL_THRESHOLD = 0.05
 TEACHER_SIGNAL_THRESHOLDS = (0.0, 0.01, 0.05, 0.1, 0.2, 0.5)
+TOKEN_TEACHER_SIGNAL_ERROR_LABELS = frozenset(
+    {
+        "hallucinated_insertion",
+        "hallucinated_substitution",
+        "mutation_opposite_variant",
+        "mutation_other",
+    }
+)
 
 
 @dataclass(frozen=True)
@@ -1411,13 +1419,15 @@ def _prepare_correct_token_teacher_rows(
     result: dict[str, Any],
     *,
     sample_report: str,
+    token_details: Sequence[dict[str, Any]] | None = None,
 ) -> list[dict[str, Any]]:
     """Select verified-correct and formatting response tokens for teacher audit."""
 
-    token_details, _ = _prepare_teacher_signal_token_details(
-        result,
-        sample_report=sample_report,
-    )
+    if token_details is None:
+        token_details, _ = _prepare_teacher_signal_token_details(
+            result,
+            sample_report=sample_report,
+        )
     prepared: list[dict[str, Any]] = []
     for row in token_details:
         token_label = str(row.get("token_label", "unknown"))
@@ -1700,15 +1710,349 @@ def _build_correct_token_teacher_audit(
     }
 
 
+def _token_teacher_signal_correctness(row: dict[str, Any]) -> str:
+    token_label = str(row.get("token_label", "unknown"))
+    if token_label == "correct":
+        return "correct"
+    if token_label in TOKEN_TEACHER_SIGNAL_ERROR_LABELS or bool(
+        row.get("is_hallucination", False)
+    ):
+        return "incorrect"
+    return "excluded"
+
+
+def _token_teacher_signal_exclusion_reason(row: dict[str, Any]) -> str:
+    if _token_teacher_signal_correctness(row) != "excluded":
+        return ""
+    if str(row.get("token_label", "unknown")) == "formatting":
+        return "formatting"
+    return "unknown_token_label"
+
+
+def _classify_token_teacher_signal_row(
+    row: dict[str, Any],
+    *,
+    threshold: float,
+    student_response_min_probability: float | None = None,
+    student_response_max_probability: float | None = None,
+) -> dict[str, Any]:
+    _validate_teacher_signal_threshold(threshold)
+    _validate_student_response_probability_gate(
+        student_response_min_probability,
+        student_response_max_probability,
+    )
+    classified = dict(row)
+    correctness = _token_teacher_signal_correctness(classified)
+    delta_logp = float(classified["delta_logp_teacher_minus_original"])
+    direction = _teacher_signal_direction(delta_logp, threshold)
+    student_probability = float(classified["p_original"])
+    passes_gate = (
+        student_response_min_probability is None
+        or student_probability >= student_response_min_probability
+    ) and (
+        student_response_max_probability is None
+        or student_probability < student_response_max_probability
+    )
+    if correctness == "excluded":
+        signal_class = "excluded"
+        signal_quality = "excluded"
+        quadrant = f"excluded_{_token_teacher_signal_exclusion_reason(classified)}"
+    elif not passes_gate:
+        signal_class = "excluded"
+        signal_quality = "excluded"
+        quadrant = "excluded_by_probability_gate"
+    elif direction == "neutral":
+        signal_class = "neutral"
+        signal_quality = "neutral"
+        quadrant = f"neutral_{correctness}"
+    else:
+        signal_class, signal_quality = _teacher_signal_class_and_quality(
+            correctness,
+            direction,
+        )
+        quadrant = signal_class
+    classified.update(
+        {
+            "correctness": correctness,
+            "token_correctness": correctness,
+            "token_correctness_rule": "token_label_and_gt_alignment",
+            "token_exclusion_reason": _token_teacher_signal_exclusion_reason(
+                classified
+            ),
+            "signal_threshold": threshold,
+            "signal_direction": direction,
+            "teacher_signal_class": signal_class,
+            "teacher_signal_quadrant": quadrant,
+            "signal_quality": signal_quality,
+            "is_active_signal": signal_quality in {"helpful", "harmful"},
+            "is_helpful_signal": signal_quality == "helpful",
+            "is_harmful_signal": signal_quality == "harmful",
+            "student_response_min_probability": student_response_min_probability,
+            "student_response_max_probability": student_response_max_probability,
+            "passes_student_response_probability_gate": passes_gate,
+            "included_in_token_teacher_signal_audit": (
+                correctness in {"correct", "incorrect"} and passes_gate
+            ),
+        }
+    )
+    return classified
+
+
+def _token_teacher_signal_metrics(
+    rows: Sequence[dict[str, Any]],
+    *,
+    threshold: float,
+    student_response_min_probability: float | None = None,
+    student_response_max_probability: float | None = None,
+) -> dict[str, Any]:
+    _validate_teacher_signal_threshold(threshold)
+    _validate_student_response_probability_gate(
+        student_response_min_probability,
+        student_response_max_probability,
+    )
+    classified_rows = [
+        _classify_token_teacher_signal_row(
+            row,
+            threshold=threshold,
+            student_response_min_probability=student_response_min_probability,
+            student_response_max_probability=student_response_max_probability,
+        )
+        for row in rows
+    ]
+    candidates = [
+        row
+        for row in classified_rows
+        if str(row["token_correctness"]) in {"correct", "incorrect"}
+    ]
+    included = [
+        row
+        for row in candidates
+        if bool(row["passes_student_response_probability_gate"])
+    ]
+    correct_rows = [row for row in included if row["token_correctness"] == "correct"]
+    incorrect_rows = [
+        row for row in included if row["token_correctness"] == "incorrect"
+    ]
+
+    def class_count(value: str) -> int:
+        return sum(str(row["teacher_signal_class"]) == value for row in included)
+
+    correct_reinforced = class_count("correct_reinforced")
+    correct_suppressed = class_count("harmful_correct_suppressed")
+    wrong_promoted = class_count("harmful_wrong_promoted")
+    wrong_suppressed = class_count("wrong_suppressed")
+    neutral_correct = sum(
+        str(row["teacher_signal_quadrant"]) == "neutral_correct" for row in included
+    )
+    neutral_incorrect = sum(
+        str(row["teacher_signal_quadrant"]) == "neutral_incorrect"
+        for row in included
+    )
+    helpful_count = correct_reinforced + wrong_suppressed
+    harmful_count = correct_suppressed + wrong_promoted
+    active_count = helpful_count + harmful_count
+    neutral_count = neutral_correct + neutral_incorrect
+    excluded_non_content = len(classified_rows) - len(candidates)
+    gate_excluded = len(candidates) - len(included)
+    return {
+        "threshold": threshold,
+        "total_response_tokens": len(classified_rows),
+        "eligible_token_count_before_gate": len(candidates),
+        "included_token_count": len(included),
+        "excluded_by_student_response_probability_gate_count": gate_excluded,
+        "student_response_probability_gate_coverage_rate": _ratio(
+            len(included), len(candidates)
+        ),
+        "student_response_probability_gate_enabled": (
+            student_response_min_probability is not None
+            or student_response_max_probability is not None
+        ),
+        "student_response_min_probability": student_response_min_probability,
+        "student_response_max_probability": student_response_max_probability,
+        "excluded_non_content_token_count": excluded_non_content,
+        "formatting_token_count": sum(
+            str(row.get("token_label", "")) == "formatting"
+            for row in classified_rows
+        ),
+        "unknown_token_count": sum(
+            str(row["token_correctness"]) == "excluded"
+            and str(row.get("token_label", "")) != "formatting"
+            for row in classified_rows
+        ),
+        "correct_tokens": len(correct_rows),
+        "incorrect_tokens": len(incorrect_rows),
+        "active_signal_tokens": active_count,
+        "neutral_tokens": neutral_count,
+        "neutral_correct_tokens": neutral_correct,
+        "neutral_incorrect_tokens": neutral_incorrect,
+        "correct_reinforced": correct_reinforced,
+        "harmful_correct_suppressed": correct_suppressed,
+        "harmful_wrong_promoted": wrong_promoted,
+        "wrong_suppressed": wrong_suppressed,
+        "helpful_signal_count": helpful_count,
+        "harmful_signal_count": harmful_count,
+        "harmful_signal_rate": _ratio(harmful_count, active_count),
+        "harmful_evaluable_token_rate": _ratio(harmful_count, len(included)),
+        "correct_token_reinforcement_rate": _ratio(
+            correct_reinforced, len(correct_rows)
+        ),
+        "correct_token_suppression_rate": _ratio(
+            correct_suppressed, len(correct_rows)
+        ),
+        "wrong_token_promotion_rate": _ratio(wrong_promoted, len(incorrect_rows)),
+        "wrong_token_suppression_rate": _ratio(
+            wrong_suppressed, len(incorrect_rows)
+        ),
+        "mean_delta_logp_correct": _mean(
+            float(row["delta_logp_teacher_minus_original"]) for row in correct_rows
+        ),
+        "mean_delta_logp_incorrect": _mean(
+            float(row["delta_logp_teacher_minus_original"])
+            for row in incorrect_rows
+        ),
+    }
+
+
+def _token_teacher_signal_error_breakdown(
+    rows: Sequence[dict[str, Any]],
+    *,
+    threshold: float,
+    student_response_min_probability: float | None = None,
+    student_response_max_probability: float | None = None,
+) -> list[dict[str, Any]]:
+    labels = sorted(
+        {
+            str(row.get("token_label", "unknown"))
+            for row in rows
+            if _token_teacher_signal_correctness(row) == "incorrect"
+        }
+    )
+    breakdown: list[dict[str, Any]] = []
+    for token_label in labels:
+        label_rows = [
+            row for row in rows if str(row.get("token_label", "unknown")) == token_label
+        ]
+        metrics = _token_teacher_signal_metrics(
+            label_rows,
+            threshold=threshold,
+            student_response_min_probability=student_response_min_probability,
+            student_response_max_probability=student_response_max_probability,
+        )
+        breakdown.append({"token_label": token_label, **metrics})
+    return breakdown
+
+
+def _build_token_teacher_signal_audit(
+    results: Sequence[dict[str, Any]],
+    rows: Sequence[dict[str, Any]],
+    *,
+    missing_gt_characters_by_pair: dict[str, int],
+    selected_threshold: float = DEFAULT_TEACHER_SIGNAL_THRESHOLD,
+    student_response_min_probability: float | None = None,
+    student_response_max_probability: float | None = None,
+) -> dict[str, Any]:
+    _validate_teacher_signal_threshold(selected_threshold)
+    _validate_student_response_probability_gate(
+        student_response_min_probability,
+        student_response_max_probability,
+    )
+    rows_by_pair: dict[str, list[dict[str, Any]]] = {}
+    for row in rows:
+        rows_by_pair.setdefault(str(row.get("pair_id", "")), []).append(dict(row))
+    result_by_pair = {str(result.get("pair_id", "")): result for result in results}
+    pair_ids = list(result_by_pair)
+    pair_ids.extend(
+        pair_id for pair_id in rows_by_pair if pair_id not in result_by_pair
+    )
+    sample_summary = []
+    for pair_id in pair_ids:
+        pair_rows = rows_by_pair.get(pair_id, [])
+        sample_summary.append(
+            {
+                "pair_id": pair_id,
+                "sample_report": (
+                    str(pair_rows[0].get("sample_report", "")) if pair_rows else ""
+                ),
+                "missing_gt_character_count": int(
+                    missing_gt_characters_by_pair.get(pair_id, 0)
+                ),
+                **_token_teacher_signal_metrics(
+                    pair_rows,
+                    threshold=selected_threshold,
+                    student_response_min_probability=student_response_min_probability,
+                    student_response_max_probability=student_response_max_probability,
+                ),
+            }
+        )
+    thresholds = sorted({*TEACHER_SIGNAL_THRESHOLDS, selected_threshold})
+    return {
+        "schema_version": 1,
+        "created_at": _utc_now(),
+        "audit_unit": "student_response_token",
+        "scope": "all_gt_aligned_correct_and_incorrect_content_tokens",
+        "selected_threshold": selected_threshold,
+        "active_signal_rule": "abs(delta_logp) > threshold",
+        "correct_token_rule": "token_label == correct",
+        "incorrect_token_rule": (
+            "token_label in hallucinated_insertion, hallucinated_substitution, "
+            "mutation_opposite_variant, mutation_other; or is_hallucination"
+        ),
+        "excluded_token_rule": "formatting and unknown token labels",
+        "student_response_probability_gate_enabled": (
+            student_response_min_probability is not None
+            or student_response_max_probability is not None
+        ),
+        "student_response_min_probability": student_response_min_probability,
+        "student_response_max_probability": student_response_max_probability,
+        "student_response_probability_gate_rule": (
+            _student_response_probability_gate_rule(
+                student_response_min_probability,
+                student_response_max_probability,
+            )
+        ),
+        "teacher_model_is_student": _teacher_model_is_student_for_results(results),
+        "completed_samples": len(pair_ids),
+        "missing_gt_character_count": sum(missing_gt_characters_by_pair.values()),
+        **_token_teacher_signal_metrics(
+            rows,
+            threshold=selected_threshold,
+            student_response_min_probability=student_response_min_probability,
+            student_response_max_probability=student_response_max_probability,
+        ),
+        "ungated_metrics": _token_teacher_signal_metrics(
+            rows,
+            threshold=selected_threshold,
+        ),
+        "threshold_sweep": [
+            _token_teacher_signal_metrics(
+                rows,
+                threshold=threshold,
+                student_response_min_probability=student_response_min_probability,
+                student_response_max_probability=student_response_max_probability,
+            )
+            for threshold in thresholds
+        ],
+        "error_type_breakdown": _token_teacher_signal_error_breakdown(
+            rows,
+            threshold=selected_threshold,
+            student_response_min_probability=student_response_min_probability,
+            student_response_max_probability=student_response_max_probability,
+        ),
+        "sample_summary": sample_summary,
+    }
+
+
 def _prepare_teacher_signal_mutation_rows(
     result: dict[str, Any],
     *,
     sample_report: str,
+    token_details: Sequence[dict[str, Any]] | None = None,
 ) -> list[dict[str, Any]]:
-    token_details, _ = _prepare_teacher_signal_token_details(
-        result,
-        sample_report=sample_report,
-    )
+    if token_details is None:
+        token_details, _ = _prepare_teacher_signal_token_details(
+            result,
+            sample_report=sample_report,
+        )
     tokens_by_index = {int(row["index"]): row for row in token_details}
     prepared: list[dict[str, Any]] = []
     for mutation in result.get("mutation_observations", []):
@@ -2066,6 +2410,8 @@ def rebuild_privileged_report(
     all_mutations: list[dict[str, Any]] = []
     teacher_signal_rows: list[dict[str, Any]] = []
     correct_token_teacher_rows: list[dict[str, Any]] = []
+    token_teacher_signal_rows: list[dict[str, Any]] = []
+    missing_gt_characters_by_pair: dict[str, int] = {}
     sample_rows: list[dict[str, Any]] = []
     for result_path, result in zip(result_paths, results):
         _write_sample_outputs(result_path.parent, result)
@@ -2082,15 +2428,24 @@ def rebuild_privileged_report(
             all_tokens.append({"pair_id": result["pair_id"], **row})
         for row in result["mutation_observations"]:
             all_mutations.append({"pair_id": result["pair_id"], **row})
+        token_details, missing_gt_characters = _prepare_teacher_signal_token_details(
+            result,
+            sample_report=relative_report.as_posix(),
+        )
+        pair_id = str(result["pair_id"])
+        token_teacher_signal_rows.extend(dict(row) for row in token_details)
+        missing_gt_characters_by_pair[pair_id] = missing_gt_characters
         prepared_rows = _prepare_teacher_signal_mutation_rows(
             result,
             sample_report=relative_report.as_posix(),
+            token_details=token_details,
         )
         teacher_signal_rows.extend(prepared_rows)
         correct_token_teacher_rows.extend(
             _prepare_correct_token_teacher_rows(
                 result,
                 sample_report=relative_report.as_posix(),
+                token_details=token_details,
             )
         )
 
@@ -2180,6 +2535,42 @@ def rebuild_privileged_report(
         _render_correct_token_teacher_audit_html(
             correct_token_teacher_audit,
             classified_correct_token_rows,
+        ),
+    )
+    classified_token_teacher_signal_rows = [
+        _classify_token_teacher_signal_row(
+            row,
+            threshold=teacher_signal_threshold,
+            student_response_min_probability=student_response_min_probability,
+            student_response_max_probability=student_response_max_probability,
+        )
+        for row in token_teacher_signal_rows
+    ]
+    token_teacher_signal_audit = _build_token_teacher_signal_audit(
+        results,
+        classified_token_teacher_signal_rows,
+        missing_gt_characters_by_pair=missing_gt_characters_by_pair,
+        selected_threshold=teacher_signal_threshold,
+        student_response_min_probability=student_response_min_probability,
+        student_response_max_probability=student_response_max_probability,
+    )
+    _write_json_atomic(
+        output_root / "token_teacher_signal_quadrants.json",
+        token_teacher_signal_audit,
+    )
+    _write_csv(
+        output_root / "token_teacher_signal_quadrants.csv",
+        classified_token_teacher_signal_rows,
+    )
+    _write_csv(
+        output_root / "token_teacher_signal_quadrants_sample_summary.csv",
+        token_teacher_signal_audit["sample_summary"],
+    )
+    _write_text_atomic(
+        output_root / "token_teacher_signal_quadrants.html",
+        _render_token_teacher_signal_quadrants_html(
+            token_teacher_signal_audit,
+            classified_token_teacher_signal_rows,
         ),
     )
     return global_summary
@@ -2961,6 +3352,278 @@ def _render_correct_token_teacher_audit_html(
 </main></body></html>"""
 
 
+def _token_teacher_signal_label(value: str) -> str:
+    return {
+        "hallucinated_substitution": "普通替换错误",
+        "hallucinated_insertion": "额外插入错误",
+        "mutation_opposite_variant": "变异词读回旧字符",
+        "mutation_other": "变异词其他错误",
+        "correct": "GT 对齐正确",
+        "formatting": "格式 token",
+    }.get(value, value)
+
+
+def _token_teacher_signal_class_label(value: str) -> str:
+    return {
+        "correct_reinforced": "正确 token 被增强",
+        "harmful_correct_suppressed": "有害：正确 token 被抑制",
+        "harmful_wrong_promoted": "有害：错误 token 被增强",
+        "wrong_suppressed": "错误 token 被抑制",
+        "neutral_correct": "正确 token 中性",
+        "neutral_incorrect": "错误 token 中性",
+        "excluded_by_probability_gate": "未通过概率门控",
+        "excluded_formatting": "排除格式 token",
+        "excluded_unknown_token_label": "排除未知标签",
+    }.get(value, value)
+
+
+def _token_teacher_signal_threshold_row(row: dict[str, Any]) -> str:
+    return (
+        "<tr>"
+        f"<td>{float(row['threshold']):.2f}</td>"
+        f"<td>{int(row['active_signal_tokens'])}</td>"
+        f"<td>{int(row['harmful_correct_suppressed'])}</td>"
+        f"<td>{_audit_rate(row['correct_token_suppression_rate'])}</td>"
+        f"<td>{int(row['harmful_wrong_promoted'])}</td>"
+        f"<td>{_audit_rate(row['wrong_token_promotion_rate'])}</td>"
+        f"<td>{int(row['harmful_signal_count'])}</td>"
+        f"<td>{_audit_rate(row['harmful_signal_rate'])}</td>"
+        f"<td>{int(row['neutral_tokens'])}</td>"
+        "</tr>"
+    )
+
+
+def _token_teacher_signal_error_row(row: dict[str, Any]) -> str:
+    return (
+        "<tr>"
+        f"<td>{html.escape(_token_teacher_signal_label(str(row['token_label'])))}</td>"
+        f"<td><code>{html.escape(str(row['token_label']))}</code></td>"
+        f"<td>{int(row['eligible_token_count_before_gate'])}</td>"
+        f"<td>{int(row['included_token_count'])}</td>"
+        f"<td class='harmful-text'>{int(row['harmful_wrong_promoted'])}</td>"
+        f"<td>{_audit_rate(row['wrong_token_promotion_rate'])}</td>"
+        f"<td class='helpful-text'>{int(row['wrong_suppressed'])}</td>"
+        f"<td>{_audit_rate(row['wrong_token_suppression_rate'])}</td>"
+        f"<td>{int(row['neutral_incorrect_tokens'])}</td>"
+        f"<td class='{_delta_class(row['mean_delta_logp_incorrect'])}'>"
+        f"{float(row['mean_delta_logp_incorrect']):+.4f}</td>"
+        "</tr>"
+    )
+
+
+def _token_teacher_signal_sample_row(row: dict[str, Any]) -> str:
+    report = str(row.get("sample_report", ""))
+    pair_id = html.escape(str(row.get("pair_id", "")))
+    pair_cell = (
+        f"<a href='{html.escape(report, quote=True)}' target='_blank'>{pair_id}</a>"
+        if report
+        else pair_id
+    )
+    return (
+        "<tr>"
+        f"<td>{pair_cell}</td>"
+        f"<td>{int(row['eligible_token_count_before_gate'])}</td>"
+        f"<td>{int(row['included_token_count'])}</td>"
+        f"<td>{int(row['correct_tokens'])}</td>"
+        f"<td>{int(row['incorrect_tokens'])}</td>"
+        f"<td class='harmful-text'>{int(row['harmful_correct_suppressed'])}</td>"
+        f"<td class='harmful-text'>{int(row['harmful_wrong_promoted'])}</td>"
+        f"<td>{int(row['harmful_signal_count'])}</td>"
+        f"<td>{_audit_rate(row['harmful_signal_rate'])}</td>"
+        f"<td>{int(row['neutral_tokens'])}</td>"
+        f"<td>{int(row['missing_gt_character_count'])}</td>"
+        "</tr>"
+    )
+
+
+def _token_teacher_signal_detail_row(row: dict[str, Any]) -> str:
+    index = int(row.get("index", -1))
+    report = str(row.get("sample_report", ""))
+    location = (
+        f"<a href='{html.escape(report, quote=True)}#token-{index}' target='_blank'>"
+        f"#{index}</a>"
+        if report
+        else f"#{index}"
+    )
+    token = _display_token(str(row.get("raw_token", row.get("token", ""))))
+    aligned_gt = _display_token(str(row.get("aligned_gt_piece", "")))
+    teacher_top = _display_token(str(row.get("top_raw_token_teacher", "")))
+    quadrant = str(row.get("teacher_signal_quadrant", ""))
+    passes_gate = bool(row.get("passes_student_response_probability_gate", True))
+    included = bool(row.get("included_in_token_teacher_signal_audit", False))
+    correctness = str(row.get("token_correctness", "excluded"))
+    correctness_label = {
+        "correct": "正确",
+        "incorrect": "错误",
+        "excluded": "排除",
+    }.get(correctness, correctness)
+    row_class = ""
+    if not included:
+        row_class = "gate-excluded-row"
+    elif quadrant in {"harmful_correct_suppressed", "harmful_wrong_promoted"}:
+        row_class = "harmful-row"
+    elif quadrant in {"correct_reinforced", "wrong_suppressed"}:
+        row_class = "helpful-row"
+    return (
+        f"<tr class='{row_class}'>"
+        f"<td>{html.escape(str(row.get('pair_id', '')))}</td>"
+        f"<td>{location}</td>"
+        f"<td>{html.escape(correctness_label)}</td>"
+        f"<td>{html.escape(_token_teacher_signal_label(str(row.get('token_label', ''))))}"
+        f"<small><code>{html.escape(str(row.get('token_label', '')))}</code></small></td>"
+        f"<td><code>{html.escape(token) or '&lt;empty&gt;'}</code>"
+        f"<small>ID {int(row.get('token_id', -1))}</small></td>"
+        f"<td><code>{html.escape(aligned_gt) or '-'}</code></td>"
+        f"<td>{float(row['p_original']):.6f}</td>"
+        f"<td>{'是' if included else '否'}"
+        f"<small>概率门控：{'通过' if passes_gate else '未通过'}</small></td>"
+        f"<td>{float(row['p_teacher']):.6f}</td>"
+        f"<td class='{_delta_class(row['delta_logp_teacher_minus_original'])}'>"
+        f"{float(row['delta_logp_teacher_minus_original']):+.6f}</td>"
+        f"<td>{html.escape(_token_teacher_signal_class_label(quadrant))}"
+        f"<small><code>{html.escape(quadrant)}</code></small></td>"
+        f"<td><code>{html.escape(teacher_top) or '&lt;empty&gt;'}</code>"
+        f"<small>ID {int(row.get('top_token_id_teacher', -1))} · "
+        f"p {float(row.get('top_p_teacher', 0.0)):.6f}</small></td>"
+        "</tr>"
+    )
+
+
+def _token_teacher_signal_gate_description(audit: dict[str, Any]) -> str:
+    min_value = audit.get("student_response_min_probability")
+    max_value = audit.get("student_response_max_probability")
+    minimum = float(min_value) if min_value is not None else None
+    maximum = float(max_value) if max_value is not None else None
+    if minimum is None and maximum is None:
+        return "未启用学生输出 token 概率门控，全部正确/错误内容 token 参与。"
+    if minimum is None:
+        return (
+            f"仅 <code>p_original &lt; {maximum:.6g}</code> 的低概率 token 参与，"
+            "等于上界时不参与。"
+        )
+    if maximum is None:
+        return (
+            f"仅 <code>p_original &gt;= {minimum:.6g}</code> 的高概率 token 参与，"
+            "等于下界时参与。"
+        )
+    return (
+        f"仅 <code>{minimum:.6g} &lt;= p_original &lt; {maximum:.6g}</code> "
+        "区间内的 token 参与，区间左闭右开。"
+    )
+
+
+def _render_token_teacher_signal_quadrants_html(
+    audit: dict[str, Any],
+    rows: Sequence[dict[str, Any]],
+) -> str:
+    threshold = float(audit["selected_threshold"])
+    minimum = audit.get("student_response_min_probability")
+    maximum = audit.get("student_response_max_probability")
+    min_probability = float(minimum) if minimum is not None else None
+    max_probability = float(maximum) if maximum is not None else None
+    classified_rows = [
+        _classify_token_teacher_signal_row(
+            row,
+            threshold=threshold,
+            student_response_min_probability=min_probability,
+            student_response_max_probability=max_probability,
+        )
+        for row in rows
+    ]
+    ordered_rows = sorted(
+        classified_rows,
+        key=lambda row: (str(row.get("pair_id", "")), int(row.get("index", -1))),
+    )
+    detail_rows = "".join(_token_teacher_signal_detail_row(row) for row in ordered_rows)
+    if not detail_rows:
+        detail_rows = "<tr><td colspan='12' class='empty'>没有可判定正误的内容 token</td></tr>"
+    threshold_rows = "".join(
+        _token_teacher_signal_threshold_row(row) for row in audit["threshold_sweep"]
+    )
+    error_rows = (
+        "".join(
+            _token_teacher_signal_error_row(row)
+            for row in audit["error_type_breakdown"]
+        )
+        or "<tr><td colspan='10' class='empty'>没有错误 token</td></tr>"
+    )
+    sample_rows = "".join(
+        _token_teacher_signal_sample_row(row)
+        for row in sorted(
+            audit["sample_summary"],
+            key=lambda row: (
+                int(row["harmful_signal_count"]),
+                int(row["incorrect_tokens"]),
+            ),
+            reverse=True,
+        )
+    )
+    metrics = "".join(
+        [
+            _audit_metric("全部 Response token", audit["total_response_tokens"]),
+            _audit_metric(
+                "门控前正确/错误候选", audit["eligible_token_count_before_gate"]
+            ),
+            _audit_metric("门控后参与", audit["included_token_count"]),
+            _audit_metric(
+                "门控覆盖率",
+                audit["student_response_probability_gate_coverage_rate"],
+            ),
+            _audit_metric(
+                "门控排除",
+                audit["excluded_by_student_response_probability_gate_count"],
+                tone="neutral",
+            ),
+            _audit_metric("正确 token", audit["correct_tokens"]),
+            _audit_metric("错误 token", audit["incorrect_tokens"], tone="warning"),
+            _audit_metric("活跃教师信号", audit["active_signal_tokens"]),
+            _audit_metric(
+                "有害教师信号",
+                audit["harmful_signal_count"],
+                tone="harmful",
+            ),
+            _audit_metric("有害信号率", audit["harmful_signal_rate"], tone="harmful"),
+            _audit_metric("中性 token", audit["neutral_tokens"], tone="neutral"),
+            _audit_metric(
+                "排除格式 token", audit["formatting_token_count"], tone="neutral"
+            ),
+            _audit_metric(
+                "漏字字符（无 token）",
+                audit["missing_gt_character_count"],
+                tone="warning",
+            ),
+        ]
+    )
+    correct_count = int(audit["correct_tokens"])
+    incorrect_count = int(audit["incorrect_tokens"])
+    teacher_mode = audit.get("teacher_model_is_student")
+    teacher_description = (
+        "学生与 Teacher 为同一模型，差异来自输入条件。"
+        if teacher_mode is True
+        else (
+            "学生与 Teacher 为不同模型，差异同时包含模型参数与输入条件。"
+            if teacher_mode is False
+            else "结果未记录学生与 Teacher 是否为同一模型。"
+        )
+    )
+    return f"""<!doctype html>
+<html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>全量 Token Teacher 信号四象限审计</title>{_teacher_signal_audit_css()}</head><body><main>
+<nav><a href="report.html">逐 Token 原始可视化</a><a href="token_teacher_signal_quadrants.csv">四象限 Token CSV</a><a href="token_teacher_signal_quadrants_sample_summary.csv">样本统计 CSV</a><a href="token_teacher_signal_quadrants.json">审计 JSON</a><a href="teacher_signal_audit.html">变异词四象限</a><a href="correct_token_teacher_rejection.html">正确 Token 审计</a></nav>
+<header><h1>全量 Response Token 的 Teacher 信号四象限</h1><p>复用 <code>teacher_signal_audit</code> 的四象限定义，并扩展到全部可与 GT 对齐判定正误的内容 token。有效信号阈值为 <code>|Δlogp| &gt; {threshold:.2f}</code>。{_token_teacher_signal_gate_description(audit)}</p><p>{html.escape(teacher_description)}</p></header>
+<section><h2>总体结果</h2><div class="audit-metrics">{metrics}</div></section>
+<section><h2>Token 教师信号四象限</h2><div class="audit-table-scroll"><table class="matrix"><thead><tr><th>学生 Response token</th><th>Teacher 提高该 token 概率</th><th>Teacher 降低该 token 概率</th><th>中性</th></tr></thead><tbody>
+<tr><th>GT 对齐正确<br><small>{correct_count} tokens</small></th>{_audit_matrix_cell(int(audit["correct_reinforced"]), correct_count, tone="helpful", label="正确 token 被增强", internal_label="correct_reinforced")}{_audit_matrix_cell(int(audit["harmful_correct_suppressed"]), correct_count, tone="harmful", label="有害：正确 token 被抑制", internal_label="harmful_correct_suppressed")}{_audit_matrix_cell(int(audit["neutral_correct_tokens"]), correct_count, tone="neutral", label="变化不足阈值", internal_label="neutral")}</tr>
+<tr><th>GT 对齐错误<br><small>{incorrect_count} tokens</small></th>{_audit_matrix_cell(int(audit["harmful_wrong_promoted"]), incorrect_count, tone="harmful", label="有害：错误 token 被增强", internal_label="harmful_wrong_promoted")}{_audit_matrix_cell(int(audit["wrong_suppressed"]), incorrect_count, tone="helpful", label="错误 token 被抑制", internal_label="wrong_suppressed")}{_audit_matrix_cell(int(audit["neutral_incorrect_tokens"]), incorrect_count, tone="neutral", label="变化不足阈值", internal_label="neutral")}</tr>
+</tbody></table></div><p class="footnote">有害信号率的分母仅包含通过概率门控且 <code>|Δlogp|</code> 超过阈值的活跃 token。格式 token 与漏字不进入四象限。</p></section>
+<section><h2>阈值敏感性</h2><div class="audit-table-scroll compact"><table><thead><tr><th>τ</th><th>活跃 token</th><th>正确被抑制</th><th>正确抑制率</th><th>错误被增强</th><th>错误增强率</th><th>有害信号</th><th>有害率</th><th>中性</th></tr></thead><tbody>{threshold_rows}</tbody></table></div></section>
+<section><h2>错误 Token 类型</h2><div class="audit-table-scroll"><table><thead><tr><th>错误类型</th><th>内部标签</th><th>门控前</th><th>门控后</th><th>错误被增强</th><th>增强率</th><th>错误被抑制</th><th>抑制率</th><th>中性</th><th>平均 Δlogp</th></tr></thead><tbody>{error_rows}</tbody></table></div></section>
+<section><div class="section-heading"><h2>全部 Response Token 与筛选状态</h2><span>{len(ordered_rows)} tokens</span></div><div class="audit-table-scroll"><table class="correct-token-table"><thead><tr><th>样本</th><th>索引</th><th>正误</th><th>错误类型</th><th>Response token</th><th>GT 对齐文本</th><th>p original</th><th>参与统计</th><th>p teacher</th><th>Δlogp</th><th>四象限分类</th><th>Teacher Top-1</th></tr></thead><tbody>{detail_rows}</tbody></table></div></section>
+<section><h2>按样本统计</h2><div class="audit-table-scroll"><table><thead><tr><th>样本</th><th>门控前</th><th>门控后</th><th>正确</th><th>错误</th><th>正确被抑制</th><th>错误被增强</th><th>有害信号</th><th>有害率</th><th>中性</th><th>漏字字符</th></tr></thead><tbody>{sample_rows}</tbody></table></div></section>
+<section class="method"><h2>统计边界</h2><p><code>token_label=correct</code> 记为正确；普通插入、普通替换、变异词读回旧字符与其他变异错误记为错误。一个 token 同时覆盖正确和错误字符时，只要含替换或插入字符就记为错误。格式 token 没有可用的字符级正确性，单独排除。漏字没有 Response token，因此只报告字符数量，不能进入 token 四象限。逐 token CSV 和本页明细保留所有行；<code>passes_student_response_probability_gate</code> 记录概率条件是否通过，<code>included_in_token_teacher_signal_audit</code> 表示该行最终是否进入四象限统计。</p></section>
+</main></body></html>"""
+
+
 def _teacher_signal_audit_css() -> str:
     return """<style>
 :root { font-family: Inter, system-ui, -apple-system, "Segoe UI", sans-serif; color: #1c292d; background: #f4f6f5; line-height: 1.45; font-synthesis: none; }
@@ -3003,6 +3666,7 @@ th:first-child, td:first-child { text-align: left; }
 .examples-table code { display: inline-block; max-width: 220px; overflow: hidden; text-overflow: ellipsis; }
 .examples-table small { color: #66777c; font-size: 10px; }
 .correct-token-table small { display: block; color: #66777c; font-size: 10px; }
+.correct-token-table .helpful-row { background: #f2faf5; }
 .correct-token-table .harmful-row { background: #fff6f6; }
 .correct-token-table .gate-excluded-row { color: #738187; background: #f1f3f2; opacity: 0.72; }
 .gain { color: #08764a; font-weight: 700; }
@@ -3978,20 +4642,21 @@ def _build_parser() -> argparse.ArgumentParser:
         "--student-response-min-probability",
         type=float,
         help=(
-            "Optional correct-token audit gate. Only actual student response "
+            "Optional token-audit gate. Only actual student response "
             "tokens whose original-context p_original is greater than or equal "
-            "to this value enter teacher-harm statistics. The saved token CSV "
-            "keeps every candidate."
+            "to this value enter correct-token and full-token quadrant "
+            "statistics. The saved token CSV files keep every candidate."
         ),
     )
     parser.add_argument(
         "--student-response-max-probability",
         type=float,
         help=(
-            "Optional correct-token audit upper gate. Only actual student "
+            "Optional token-audit upper gate. Only actual student "
             "response tokens whose original-context p_original is strictly "
-            "below this value enter teacher-harm statistics. Combine with the "
-            "minimum gate to select a half-open probability interval."
+            "below this value enter correct-token and full-token quadrant "
+            "statistics. Combine with the minimum gate to select a half-open "
+            "probability interval."
         ),
     )
     parser.add_argument("--no-resume", action="store_true")
@@ -4018,6 +4683,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             f"Rebuilt report: {Path(args.output_dir).expanduser().resolve() / 'report.html'} "
             f"audit={Path(args.output_dir).expanduser().resolve() / 'teacher_signal_audit.html'} "
             f"correct_token_audit={Path(args.output_dir).expanduser().resolve() / 'correct_token_teacher_rejection.html'} "
+            f"token_quadrants={Path(args.output_dir).expanduser().resolve() / 'token_teacher_signal_quadrants.html'} "
             f"samples={summary['completed_samples']} tokens={summary['total_tokens']}",
             flush=True,
         )

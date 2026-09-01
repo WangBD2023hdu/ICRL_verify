@@ -380,13 +380,13 @@ qwen-mm-privileged-probe \
 `--teacher-signal-threshold` 影响变异词教师信号分类，以及正确 token 页面中的明显
 压低判定；它不改变任何模型概率。
 
-`--student-response-min-probability 0.95` 只影响正确内容 token 与格式 token 的
-教师不认可统计。门控使用学生实际输出 token 在原图条件下的
+`--student-response-min-probability 0.95` 同时作用于正确 token 教师不认可统计和
+全量正确/错误 token 四象限统计。门控使用学生实际输出 token 在原图条件下的
 `p_original >= 0.95`；等于 0.95 的 token 也参与统计。这里使用的不是整个词表
 分布的 Top-1 概率 `top_p_original`，因此采样产生的非 Top-1 response token 也会
-按照其自身概率正确判断。HTML 和 JSON 同时保留门控前对照指标，CSV 保留全部
-候选并通过 `passes_student_response_probability_gate` 标记是否参与统计。该参数
-同样不需要重新推理。门控后的教师有害信号主口径为
+按照其自身概率正确判断。两个审计的 HTML 和 JSON 都保留门控前对照指标，CSV
+保留全部候选并通过 `passes_student_response_probability_gate` 标记是否参与统计。
+该参数同样不需要重新推理。正确 token 页面中，门控后的教师有害信号主口径为
 `delta_logp < -teacher_signal_threshold`；任意概率下降和 Teacher Top-1 改变继续
 作为独立指标展示，不合并进一个含义不清的比例。
 
@@ -434,6 +434,10 @@ abs(decision_token_delta_logp) > teacher_signal_threshold
 | `correct_token_teacher_rejection.json` | 门控覆盖率、门控前对照、概率压低、Top-1 拒绝、分组与阈值扫描统计 |
 | `correct_token_teacher_rejection.csv` | 全部正确/格式候选的逐行明细及 `passes_student_response_probability_gate` 标记 |
 | `correct_token_teacher_rejection_sample_summary.csv` | 每个样本的门控覆盖率与正确 token 教师不认可摘要 |
+| `token_teacher_signal_quadrants.html` | 通过学生概率门控后，正确/错误 token 与 Teacher 增强/抑制的四象限页面 |
+| `token_teacher_signal_quadrants.json` | 四象限总计、未门控对照、阈值扫描、错误类型和样本统计 |
+| `token_teacher_signal_quadrants.csv` | 全部可判定正误的内容 token 明细；保留未通过门控的行及门控标记 |
+| `token_teacher_signal_quadrants_sample_summary.csv` | 每个样本的四象限、门控覆盖率、中性信号和漏字字符统计 |
 | `failures.jsonl` | 失败样本及异常信息，仅发生失败时出现 |
 
 每个 `samples/<ordinal>_<pair_id>/` 目录包含：
@@ -487,6 +491,12 @@ Top-1 token ID 不同、Teacher Top-1 解码文本不同。格式 token 按要�
 换行和 Markdown 格式在 OCR 对齐标准化时会被移除，因此其“正确”状态没有经过与
 普通内容 token 相同的字符级 GT 验证。
 
+全量四象限页面只让通过学生概率门控、且能由 GT 对齐判定为正确或错误的内容
+token 进入统计。四个活跃类别为：正确 token 被增强、正确 token 被抑制、错误
+token 被增强、错误 token 被抑制。`abs(delta_logp) <= teacher_signal_threshold`
+单独记为中性；格式 token 与未知标签排除，GT 漏字因为没有 response token 只按
+字符计数。页面和 CSV 仍保留被排除行，便于核查筛选过程。
+
 ## 14. 在本地查看服务器结果
 
 服务器没有浏览器时，可以将整个输出目录下载到本地后直接打开 `report.html` 和
@@ -511,6 +521,7 @@ ssh -L 8000:127.0.0.1:8000 <user>@<server>
 http://127.0.0.1:8000/report.html
 http://127.0.0.1:8000/teacher_signal_audit.html
 http://127.0.0.1:8000/correct_token_teacher_rejection.html
+http://127.0.0.1:8000/token_teacher_signal_quadrants.html
 ```
 
 ## 15. 建议保存的复现信息

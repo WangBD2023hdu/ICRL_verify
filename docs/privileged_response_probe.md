@@ -111,6 +111,27 @@ audit. It includes `token_label=correct` and, by request, formatting tokens:
   probability gate;
 - `correct_token_teacher_rejection_sample_summary.csv`: one row per sample.
 
+A third, standalone audit expands the same four-quadrant definition used by
+`teacher_signal_audit` to every response content token whose correctness can be
+decided by GT alignment:
+
+- `token_teacher_signal_quadrants.html`: correct/incorrect token by Teacher
+  increase/decrease matrix, threshold sweep, error-type breakdown, all token
+  details, and per-sample metrics;
+- `token_teacher_signal_quadrants.json`: aggregate metrics, ungated comparison,
+  threshold sweep, error-type breakdown, and sample summaries;
+- `token_teacher_signal_quadrants.csv`: every response token in original order,
+  including excluded formatting/unknown rows, its quadrant, and probability-gate
+  status;
+- `token_teacher_signal_quadrants_sample_summary.csv`: one row per sample.
+
+The four active classes are `correct_reinforced`,
+`harmful_correct_suppressed`, `harmful_wrong_promoted`, and
+`wrong_suppressed`. Signals with `abs(delta_logp) <= threshold` are reported as
+neutral. Formatting tokens are excluded because normalization cannot verify
+their correctness. Missing GT characters have no response token, so they are
+reported separately and cannot enter a token quadrant.
+
 The audit reports four separate notions rather than one ambiguous rejection
 rate: any `delta_logp < 0`, suppression beyond
 `delta_logp < -teacher_signal_threshold`, Teacher Top-1 using a different token
@@ -120,14 +141,15 @@ verified because OCR normalization removes formatting syntax and whitespace.
 Use `--student-response-min-probability 0.95` for high-confidence candidates
 with `p_original >= 0.95`, or `--student-response-max-probability 0.95` for
 low-confidence candidates with `p_original < 0.95`. Supplying both selects the
-half-open interval `min <= p_original < max`. `p_original` is the probability
-assigned to the actual student response token, not the maximum probability over
-the vocabulary. The comparison page retains ungated metrics, and the CSV
-retains excluded candidates for auditability. These are report-only filters and
-can be changed with `--rebuild-report-only` without another model forward. For
-the gated correct/formatting candidates, the primary teacher harmful-signal rate uses
-`delta_logp < -teacher_signal_threshold`; raw probability decreases and Teacher
-Top-1 changes remain separate diagnostics.
+half-open interval `min <= p_original < max`. This gate applies to both the
+correct-token rejection audit and the full-token four-quadrant audit.
+`p_original` is the probability assigned to the actual student response token,
+not the maximum probability over the vocabulary. Both audits retain ungated
+metrics, and their CSV files retain excluded candidates for auditability. These
+are report-only filters and can be changed with `--rebuild-report-only` without
+another model forward. For the gated correct/formatting candidates, the primary
+teacher harmful-signal rate uses `delta_logp < -teacher_signal_threshold`; raw
+probability decreases and Teacher Top-1 changes remain separate diagnostics.
 
 Only annotated mutation words are included; ordinary response words never enter
 the audit denominator. Each mutation is counted once even when its readback has
