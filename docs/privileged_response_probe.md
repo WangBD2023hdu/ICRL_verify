@@ -117,14 +117,15 @@ rate: any `delta_logp < 0`, suppression beyond
 ID, and Teacher Top-1 decoding to a different surface. Formatting tokens are
 included in a separate group, but their correctness is not character-alignment
 verified because OCR normalization removes formatting syntax and whitespace.
-Use `--student-response-min-probability 0.95` to make only high-confidence
-candidates with `p_original >= 0.95` enter these harmful-signal statistics.
-`p_original` is the probability assigned to the actual student response token,
-not the maximum probability over the vocabulary. The comparison page retains
-ungated metrics, and the CSV retains excluded candidates for auditability. This
-is a report-only filter and can be changed with `--rebuild-report-only` without
-another model forward. For the gated correct/formatting candidates, the primary
-teacher harmful-signal rate uses
+Use `--student-response-min-probability 0.95` for high-confidence candidates
+with `p_original >= 0.95`, or `--student-response-max-probability 0.95` for
+low-confidence candidates with `p_original < 0.95`. Supplying both selects the
+half-open interval `min <= p_original < max`. `p_original` is the probability
+assigned to the actual student response token, not the maximum probability over
+the vocabulary. The comparison page retains ungated metrics, and the CSV
+retains excluded candidates for auditability. These are report-only filters and
+can be changed with `--rebuild-report-only` without another model forward. For
+the gated correct/formatting candidates, the primary teacher harmful-signal rate uses
 `delta_logp < -teacher_signal_threshold`; raw probability decreases and Teacher
 Top-1 changes remain separate diagnostics.
 
@@ -158,3 +159,6 @@ qwen-mm-privileged-probe \
   --student-response-min-probability 0.95 \
   --rebuild-report-only
 ```
+
+Replace the minimum option with `--student-response-max-probability 0.95` to
+audit the complementary low-confidence group.

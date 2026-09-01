@@ -389,6 +389,20 @@ qwen-mm-privileged-probe \
 同样不需要重新推理。门控后的教师有害信号主口径为
 `delta_logp < -teacher_signal_threshold`；任意概率下降和 Teacher Top-1 改变继续
 作为独立指标展示，不合并进一个含义不清的比例。
+
+低概率组使用：
+
+```bash
+qwen-mm-privileged-probe \
+  --output-dir "$SINGLE_OUTPUT" \
+  --teacher-signal-threshold 0.05 \
+  --student-response-max-probability 0.95 \
+  --rebuild-report-only
+```
+
+其规则为 `p_original < 0.95`，所以等于 0.95 的 token 不进入低概率组。最小值与
+最大值也可以同时提供，此时选择左闭右开的区间
+`min <= p_original < max`，并要求 `min < max`。
 当前有效信号定义为：
 
 ```text

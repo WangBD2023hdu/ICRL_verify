@@ -148,6 +148,7 @@ def run_privileged_probe(
     heartbeat_seconds: float = 30.0,
     teacher_signal_threshold: float = DEFAULT_TEACHER_SIGNAL_THRESHOLD,
     student_response_min_probability: float | None = None,
+    student_response_max_probability: float | None = None,
 ) -> PrivilegedProbeSummary:
     """Generate once with the student and score its IDs in two contexts."""
 
@@ -170,7 +171,10 @@ def run_privileged_probe(
     if image_patch_size <= 0:
         raise ValueError("image_patch_size must be positive")
     _validate_teacher_signal_threshold(teacher_signal_threshold)
-    _validate_student_response_min_probability(student_response_min_probability)
+    _validate_student_response_probability_gate(
+        student_response_min_probability,
+        student_response_max_probability,
+    )
 
     student_model_id = str(model_id)
     resolved_teacher_model_id = (
@@ -215,6 +219,7 @@ def run_privileged_probe(
         "limit": limit,
         "teacher_signal_threshold": teacher_signal_threshold,
         "student_response_min_probability": student_response_min_probability,
+        "student_response_max_probability": student_response_max_probability,
     }
     _write_json_atomic(output_root / "config.json", config)
 
@@ -351,6 +356,7 @@ def run_privileged_probe(
             output_root,
             teacher_signal_threshold=teacher_signal_threshold,
             student_response_min_probability=student_response_min_probability,
+            student_response_max_probability=student_response_max_probability,
         )
         completed_total = int(report_summary["completed_samples"])
     except Exception as exc:  # noqa: BLE001 - report errors must not hide run status
@@ -1143,6 +1149,49 @@ def _validate_student_response_min_probability(value: float | None) -> None:
         )
 
 
+def _validate_student_response_max_probability(value: float | None) -> None:
+    if value is None:
+        return
+    if not math.isfinite(value) or not 0 <= value <= 1:
+        raise ValueError(
+            "student_response_max_probability must be finite and in the interval [0, 1]"
+        )
+
+
+def _validate_student_response_probability_gate(
+    min_probability: float | None,
+    max_probability: float | None,
+) -> None:
+    _validate_student_response_min_probability(min_probability)
+    _validate_student_response_max_probability(max_probability)
+    if (
+        min_probability is not None
+        and max_probability is not None
+        and min_probability >= max_probability
+    ):
+        raise ValueError(
+            "student_response_min_probability must be less than "
+            "student_response_max_probability"
+        )
+
+
+def _student_response_probability_gate_rule(
+    min_probability: float | None,
+    max_probability: float | None,
+) -> str:
+    _validate_student_response_probability_gate(min_probability, max_probability)
+    if min_probability is None and max_probability is None:
+        return "disabled"
+    if min_probability is None:
+        return "p_original < student_response_max_probability"
+    if max_probability is None:
+        return "p_original >= student_response_min_probability"
+    return (
+        "student_response_min_probability <= p_original "
+        "< student_response_max_probability"
+    )
+
+
 def _teacher_signal_correctness(row: dict[str, Any]) -> str:
     existing = str(row.get("correctness", ""))
     if existing in {"correct", "incorrect", "excluded"}:
@@ -1395,15 +1444,22 @@ def _classify_correct_token_teacher_row(
     *,
     threshold: float,
     student_response_min_probability: float | None = None,
+    student_response_max_probability: float | None = None,
 ) -> dict[str, Any]:
     _validate_teacher_signal_threshold(threshold)
-    _validate_student_response_min_probability(student_response_min_probability)
+    _validate_student_response_probability_gate(
+        student_response_min_probability,
+        student_response_max_probability,
+    )
     classified = dict(row)
     delta_logp = float(classified["delta_logp_teacher_minus_original"])
     student_response_probability = float(classified["p_original"])
     passes_student_response_probability_gate = (
         student_response_min_probability is None
         or student_response_probability >= student_response_min_probability
+    ) and (
+        student_response_max_probability is None
+        or student_response_probability < student_response_max_probability
     )
     exact_top1_accepted = bool(classified.get("target_is_top_teacher", False))
     same_surface_top1_accepted = exact_top1_accepted or bool(
@@ -1428,6 +1484,7 @@ def _classify_correct_token_teacher_row(
         {
             "teacher_signal_threshold": threshold,
             "student_response_min_probability": student_response_min_probability,
+            "student_response_max_probability": student_response_max_probability,
             "passes_student_response_probability_gate": (
                 passes_student_response_probability_gate
             ),
@@ -1452,12 +1509,14 @@ def _correct_token_teacher_metrics(
     *,
     threshold: float,
     student_response_min_probability: float | None = None,
+    student_response_max_probability: float | None = None,
 ) -> dict[str, Any]:
     candidate_rows = [
         _classify_correct_token_teacher_row(
             row,
             threshold=threshold,
             student_response_min_probability=student_response_min_probability,
+            student_response_max_probability=student_response_max_probability,
         )
         for row in rows
     ]
@@ -1483,8 +1542,10 @@ def _correct_token_teacher_metrics(
         "threshold": threshold,
         "student_response_probability_gate_enabled": (
             student_response_min_probability is not None
+            or student_response_max_probability is not None
         ),
         "student_response_min_probability": student_response_min_probability,
+        "student_response_max_probability": student_response_max_probability,
         "eligible_token_count_before_gate": eligible_before_gate,
         "included_token_count": total,
         "excluded_by_student_response_probability_gate_count": (
@@ -1533,9 +1594,13 @@ def _build_correct_token_teacher_audit(
     *,
     selected_threshold: float = DEFAULT_TEACHER_SIGNAL_THRESHOLD,
     student_response_min_probability: float | None = None,
+    student_response_max_probability: float | None = None,
 ) -> dict[str, Any]:
     _validate_teacher_signal_threshold(selected_threshold)
-    _validate_student_response_min_probability(student_response_min_probability)
+    _validate_student_response_probability_gate(
+        student_response_min_probability,
+        student_response_max_probability,
+    )
     thresholds = sorted({*TEACHER_SIGNAL_THRESHOLDS, selected_threshold})
     rows_by_pair: dict[str, list[dict[str, Any]]] = {}
     for row in rows:
@@ -1558,6 +1623,7 @@ def _build_correct_token_teacher_audit(
                     pair_rows,
                     threshold=selected_threshold,
                     student_response_min_probability=student_response_min_probability,
+                    student_response_max_probability=student_response_max_probability,
                 ),
             }
         )
@@ -1573,6 +1639,7 @@ def _build_correct_token_teacher_audit(
                     group_rows,
                     threshold=selected_threshold,
                     student_response_min_probability=student_response_min_probability,
+                    student_response_max_probability=student_response_max_probability,
                 ),
             }
         )
@@ -1583,12 +1650,15 @@ def _build_correct_token_teacher_audit(
         "selected_threshold": selected_threshold,
         "student_response_probability_gate_enabled": (
             student_response_min_probability is not None
+            or student_response_max_probability is not None
         ),
         "student_response_min_probability": student_response_min_probability,
+        "student_response_max_probability": student_response_max_probability,
         "student_response_probability_gate_rule": (
-            "p_original >= student_response_min_probability"
-            if student_response_min_probability is not None
-            else "disabled"
+            _student_response_probability_gate_rule(
+                student_response_min_probability,
+                student_response_max_probability,
+            )
         ),
         "included_token_labels": ["correct", "formatting"],
         "verified_correct_rule": "token_label == correct",
@@ -1610,6 +1680,7 @@ def _build_correct_token_teacher_audit(
             rows,
             threshold=selected_threshold,
             student_response_min_probability=student_response_min_probability,
+            student_response_max_probability=student_response_max_probability,
         ),
         "ungated_metrics": _correct_token_teacher_metrics(
             rows,
@@ -1620,6 +1691,7 @@ def _build_correct_token_teacher_audit(
                 rows,
                 threshold=threshold,
                 student_response_min_probability=student_response_min_probability,
+                student_response_max_probability=student_response_max_probability,
             )
             for threshold in thresholds
         ],
@@ -1976,9 +2048,13 @@ def rebuild_privileged_report(
     *,
     teacher_signal_threshold: float = DEFAULT_TEACHER_SIGNAL_THRESHOLD,
     student_response_min_probability: float | None = None,
+    student_response_max_probability: float | None = None,
 ) -> dict[str, Any]:
     _validate_teacher_signal_threshold(teacher_signal_threshold)
-    _validate_student_response_min_probability(student_response_min_probability)
+    _validate_student_response_probability_gate(
+        student_response_min_probability,
+        student_response_max_probability,
+    )
     output_root = Path(output_dir).expanduser().resolve()
     result_paths = sorted((output_root / "samples").glob("*/result.json"))
     if not result_paths:
@@ -2076,6 +2152,7 @@ def rebuild_privileged_report(
             row,
             threshold=teacher_signal_threshold,
             student_response_min_probability=student_response_min_probability,
+            student_response_max_probability=student_response_max_probability,
         )
         for row in correct_token_teacher_rows
     ]
@@ -2084,6 +2161,7 @@ def rebuild_privileged_report(
         classified_correct_token_rows,
         selected_threshold=teacher_signal_threshold,
         student_response_min_probability=student_response_min_probability,
+        student_response_max_probability=student_response_max_probability,
     )
     _write_json_atomic(
         output_root / "correct_token_teacher_rejection.json",
@@ -2731,11 +2809,16 @@ def _render_correct_token_teacher_audit_html(
     student_response_min_probability = (
         float(gate_value) if gate_value is not None else None
     )
+    max_gate_value = audit.get("student_response_max_probability")
+    student_response_max_probability = (
+        float(max_gate_value) if max_gate_value is not None else None
+    )
     classified_rows = [
         _classify_correct_token_teacher_row(
             row,
             threshold=threshold,
             student_response_min_probability=student_response_min_probability,
+            student_response_max_probability=student_response_max_probability,
         )
         for row in rows
     ]
@@ -2818,17 +2901,35 @@ def _render_correct_token_teacher_audit_html(
     detail_rows = "".join(_correct_token_detail_row(row) for row in ordered_rows)
     if not detail_rows:
         detail_rows = "<tr><td colspan='15' class='empty'>没有符合条件的正确或格式 token</td></tr>"
-    gate_description = (
-        "未启用学生输出 token 概率门控，全部候选 token 参与统计。"
-        if student_response_min_probability is None
-        else (
+    if (
+        student_response_min_probability is None
+        and student_response_max_probability is None
+    ):
+        gate_description = "未启用学生输出 token 概率门控，全部候选 token 参与统计。"
+    elif student_response_min_probability is None:
+        gate_description = (
+            "仅学生实际输出 token 在原图条件下满足 "
+            f"<code>p_original &lt; {student_response_max_probability:.6g}</code> "
+            "的低概率 token 参与教师信号有害统计；等于上界时不参与。"
+        )
+    elif student_response_max_probability is None:
+        gate_description = (
             "仅学生实际输出 token 在原图条件下满足 "
             f"<code>p_original &gt;= {student_response_min_probability:.6g}</code> "
-            "的高概率 token 参与教师信号有害统计；等于阈值时参与。"
+            "的高概率 token 参与教师信号有害统计；等于下界时参与。"
         )
-    )
+    else:
+        gate_description = (
+            "仅学生实际输出 token 在原图条件下满足 "
+            f"<code>{student_response_min_probability:.6g} &lt;= p_original "
+            f"&lt; {student_response_max_probability:.6g}</code> 的 token 参与教师"
+            "信号有害统计；区间左闭右开。"
+        )
     gate_comparison = ""
-    if student_response_min_probability is not None:
+    if (
+        student_response_min_probability is not None
+        or student_response_max_probability is not None
+    ):
         comparison_rows = "".join(
             [
                 _correct_token_gate_comparison_row(
@@ -3883,6 +3984,16 @@ def _build_parser() -> argparse.ArgumentParser:
             "keeps every candidate."
         ),
     )
+    parser.add_argument(
+        "--student-response-max-probability",
+        type=float,
+        help=(
+            "Optional correct-token audit upper gate. Only actual student "
+            "response tokens whose original-context p_original is strictly "
+            "below this value enter teacher-harm statistics. Combine with the "
+            "minimum gate to select a half-open probability interval."
+        ),
+    )
     parser.add_argument("--no-resume", action="store_true")
     parser.add_argument("--fail-fast", action="store_true")
     parser.add_argument(
@@ -3901,6 +4012,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             args.output_dir,
             teacher_signal_threshold=args.teacher_signal_threshold,
             student_response_min_probability=(args.student_response_min_probability),
+            student_response_max_probability=(args.student_response_max_probability),
         )
         print(
             f"Rebuilt report: {Path(args.output_dir).expanduser().resolve() / 'report.html'} "
@@ -3939,6 +4051,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         heartbeat_seconds=args.heartbeat_seconds,
         teacher_signal_threshold=args.teacher_signal_threshold,
         student_response_min_probability=args.student_response_min_probability,
+        student_response_max_probability=args.student_response_max_probability,
     )
     print(
         f"Privileged probe complete: output={summary.output_dir} "
