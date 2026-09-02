@@ -68,6 +68,7 @@ from arxiv_canonical_reflow_v4.mutation import (
     RenderedWord,
     apply_page_mutations,
     choose_page_mutations,
+    choose_source_page_mutations,
     markdown_diff_count,
     validate_mutated_word_geometry,
 )
@@ -97,6 +98,8 @@ Please convert the image document into Markdown format, strictly adhering to the
 _PAGE_MARGIN_PT = 0.72 * 72.0
 _SAFE_PAPER_STEM_RE = re.compile(r"^[A-Za-z0-9._-]+$")
 _CRAWLER_CACHE_SCHEMA_VERSION = 1
+_VERBOSE_OUTPUT = False
+_STATUS_LINE_WIDTH = 0
 
 
 class PipelineError(RuntimeError):
@@ -119,6 +122,8 @@ class WorkerConfig:
     two_column_rate: float
     target_fill_ratio: float
     min_fill_ratio: float
+    work_dir: str | None = None
+    minimal_output: bool = True
 
 
 @dataclass(frozen=True, slots=True)
@@ -178,9 +183,99 @@ class CrawlerArchive:
     input_mtime_ns: int
 
 
+def _status_field(message: str, name: str, default: str = "0") -> str:
+    match = re.search(rf"(?:^| ){re.escape(name)}=([^ ]+)", message)
+    return match.group(1) if match else default
+
+
+def _status_line(message: str, *, finish: bool = False) -> None:
+    global _STATUS_LINE_WIDTH
+    padding = " " * max(0, _STATUS_LINE_WIDTH - len(message))
+    print(f"\r{message}{padding}", end="\n" if finish else "", flush=True)
+    _STATUS_LINE_WIDTH = 0 if finish else len(message)
+
+
 def _emit(stage: str, message: str) -> None:
     stamp = time.strftime("%Y-%m-%d %H:%M:%S")
-    print(f"[{stamp}] [{stage}] {message}", flush=True)
+    if _VERBOSE_OUTPUT:
+        print(f"[{stamp}] [{stage}] {message}", flush=True)
+        return
+    if stage == "start":
+        _status_line(
+            "Start: "
+            f"sources={_status_field(message, 'papers')} "
+            f"target={_status_field(message, 'target_count', 'all')} "
+            f"workers={_status_field(message, 'workers')} "
+            f"output={_status_field(message, 'output')}",
+            finish=True,
+        )
+    elif stage in {
+        "crawler-stream-unit",
+        "crawler-stream-progress",
+        "extract-unit",
+        "extract-progress",
+    }:
+        _status_line(
+            "Source preparation "
+            f"{_status_field(message, 'completed')}, "
+            f"candidates={_status_field(message, 'cumulative_candidates', _status_field(message, 'candidates'))}, "
+            f"errors={_status_field(message, 'errors')}"
+        )
+    elif stage == "compile-progress":
+        _status_line(
+            "Edited-page compilation "
+            f"jobs={_status_field(message, 'completed_jobs')}, "
+            f"accepted={_status_field(message, 'accepted')}, "
+            f"rejected={_status_field(message, 'rejected')}"
+        )
+    elif stage == "finish":
+        _status_line(f"Completed: {message}", finish=True)
+
+
+class _TargetProgress:
+    def __init__(self, target: int, *, initial: int = 0) -> None:
+        self.target = target
+        self.initial = initial
+        self.accepted = initial
+        self.rejected = 0
+        self.started = time.monotonic()
+        self.last_refresh = 0.0
+
+    def update(self, *, accepted: int, rejected: int, force: bool = False) -> None:
+        changed = accepted != self.accepted
+        self.accepted = accepted
+        self.rejected = rejected
+        now = time.monotonic()
+        if not (force or changed or now - self.last_refresh >= 30):
+            return
+        elapsed = now - self.started
+        rate = max(0, self.accepted - self.initial) / max(elapsed, 1e-9)
+        if self.target > 0:
+            shown = min(self.accepted, self.target)
+            fraction = shown / self.target
+            width = 30
+            filled = min(width, int(width * fraction))
+            bar = "#" * filled + "-" * (width - filled)
+            eta = f"{(self.target - shown) / rate:.0f}s" if rate > 0 else "--"
+            message = (
+                f"[{bar}] {shown}/{self.target} ({fraction:.1%}) "
+                f"rejected={self.rejected} rate={rate:.2f}/s eta={eta}"
+            )
+        else:
+            message = (
+                f"Accepted={self.accepted} rejected={self.rejected} "
+                f"rate={rate:.2f}/s elapsed={elapsed:.0f}s"
+            )
+        _status_line(message)
+        self.last_refresh = now
+
+    def finish(self, *, accepted: int, rejected: int) -> None:
+        self.update(
+            accepted=accepted,
+            rejected=rejected,
+            force=True,
+        )
+        _status_line("", finish=True)
 
 
 def _atomic_text(path: Path, value: str) -> None:
@@ -222,9 +317,7 @@ def _read_jsonl(path: Path) -> list[dict[str, Any]]:
                     f"invalid_jsonl:{path}:{line_number}:{exc}"
                 ) from exc
             if not isinstance(value, dict):
-                raise PipelineError(
-                    f"jsonl_row_is_not_object:{path}:{line_number}"
-                )
+                raise PipelineError(f"jsonl_row_is_not_object:{path}:{line_number}")
             rows.append(value)
     return rows
 
@@ -270,9 +363,7 @@ def _crawler_archive_path(
             candidates.append(candidate.resolve())
     unique = sorted(set(candidates))
     if len(unique) != 1:
-        raise PipelineError(
-            f"source_archive_not_unique:{paper_id}:found={len(unique)}"
-        )
+        raise PipelineError(f"source_archive_not_unique:{paper_id}:found={len(unique)}")
     return unique[0]
 
 
@@ -288,7 +379,9 @@ def _discover_crawler_archives(
         crawler_root = root
         papers_root = root / "papers"
     else:
-        crawler_root = root.parent if (root.parent / "results.jsonl").is_file() else root
+        crawler_root = (
+            root.parent if (root.parent / "results.jsonl").is_file() else root
+        )
         papers_root = root
     if not papers_root.is_dir():
         raise PipelineError(f"crawler_papers_root_missing:{papers_root}")
@@ -373,8 +466,7 @@ def _cached_crawler_paper_valid(
         return False
     main_tex = metadata.get("main_tex")
     return bool(
-        metadata.get("crawler_cache_schema_version")
-        == _CRAWLER_CACHE_SCHEMA_VERSION
+        metadata.get("crawler_cache_schema_version") == _CRAWLER_CACHE_SCHEMA_VERSION
         and metadata.get("status") == "prepared"
         and metadata.get("archive_bytes") == archive.input_bytes
         and metadata.get("archive_mtime_ns") == archive.input_mtime_ns
@@ -406,9 +498,7 @@ def _materialize_crawler_archive(
         }
 
     staging_root = cache_root / ".staging"
-    staging = staging_root / (
-        f"{archive.paper_id}.{os.getpid()}.{time.time_ns()}"
-    )
+    staging = staging_root / (f"{archive.paper_id}.{os.getpid()}.{time.time_ns()}")
     source_dir = staging / "source"
     staging.mkdir(parents=True, exist_ok=False)
     try:
@@ -551,9 +641,7 @@ def _parse_bbox_output(output: str, *, layout: str) -> BBoxObservation:
     page = pages[0]
     width = float(page.attrib["width"])
     height = float(page.attrib["height"])
-    lines: list[
-        tuple[int, float, float, float, str, tuple[RenderedWord, ...]]
-    ] = []
+    lines: list[tuple[int, float, float, float, str, tuple[RenderedWord, ...]]] = []
     for line in (element for element in page.iter() if element.tag.endswith("line")):
         word_elements = [word for word in line if word.tag.endswith("word")]
         if not word_elements:
@@ -664,8 +752,8 @@ def _compile_once(page: CanonicalPage, config: WorkerConfig) -> WorkerResult:
     started = time.monotonic()
     tex = build_page_tex(page)
     page_signature = _page_signature(page, tex)
-    output_root = Path(config.output_dir)
-    page_dir = output_root / "pages" / page.page_id
+    work_root = Path(config.work_dir or config.output_dir)
+    page_dir = work_root / "pages" / page.page_id
     result_path = page_dir / "result.json"
     if result_path.is_file():
         try:
@@ -932,6 +1020,262 @@ def _mutation_change(
     }
 
 
+def _direct_mutation_rejection(
+    page: CanonicalPage,
+    *,
+    page_id: str,
+    reason: str,
+    started: float,
+    mutations: Sequence[PageMutation] = (),
+    markdown: str | None = None,
+) -> WorkerResult:
+    return WorkerResult(
+        page_id=page_id,
+        paper_id=page.paper_id,
+        status="rejected",
+        reason=reason,
+        layout=page.layout,
+        has_table=page.has_table,
+        markdown=page.markdown if markdown is None else markdown,
+        verifier_recall=None,
+        verifier_precision=None,
+        pdf=None,
+        image=None,
+        block_ids=tuple(block.block_id for block in page.blocks),
+        source_node_ids=tuple(block.node_id for block in page.blocks),
+        content_fill_ratio=None,
+        column_fill_ratios=(),
+        page_signature=None,
+        elapsed_seconds=time.monotonic() - started,
+        mutation_count=len(mutations),
+        changes=(),
+        clean_page_id=None,
+        max_mutation_vertical_shift_points=None,
+        variant="confusable_edit",
+    )
+
+
+def _direct_result_cache(
+    page: CanonicalPage,
+    config: WorkerConfig,
+) -> WorkerResult | None:
+    result_path = Path(config.output_dir) / "pages" / page.page_id / "result.json"
+    if not result_path.is_file():
+        return None
+    try:
+        existing = json.loads(result_path.read_text(encoding="utf-8"))
+        expected_signature = _page_signature(page, build_page_tex(page))
+        cached = _worker_result_from_json(existing)
+    except (KeyError, TypeError, ValueError, json.JSONDecodeError):
+        return None
+    if (
+        existing.get("pipeline_version") != PIPELINE_VERSION
+        or cached.page_signature != expected_signature
+        or cached.status != "accepted"
+        or cached.variant != "confusable_edit"
+        or cached.image is None
+        or not cached.changes
+        or not Path(cached.image).is_file()
+    ):
+        return None
+    return cached
+
+
+def _finish_direct_compile(
+    result: WorkerResult,
+    config: WorkerConfig,
+) -> WorkerResult:
+    """Promote only an accepted PNG/GT and discard its compiler workspace."""
+
+    output_root = Path(config.output_dir)
+    work_root = Path(config.work_dir or config.output_dir)
+    work_page_dir = work_root / "pages" / result.page_id
+    final_result = result
+    if result.status == "accepted" and result.image is not None:
+        final_page_dir = output_root / "pages" / result.page_id
+        final_page_dir.mkdir(parents=True, exist_ok=True)
+        final_image = final_page_dir / "page.png"
+        source_image = Path(result.image)
+        if source_image.resolve() != final_image.resolve():
+            temporary_image = final_image.with_name(final_image.name + ".tmp")
+            shutil.copy2(source_image, temporary_image)
+            temporary_image.replace(final_image)
+        _atomic_text(final_page_dir / "ground_truth.md", result.markdown + "\n")
+        final_result = replace(
+            result,
+            pdf=None,
+            image=str(final_image.resolve()),
+        )
+        _atomic_json(
+            final_page_dir / "result.json",
+            {"pipeline_version": PIPELINE_VERSION, **asdict(final_result)},
+        )
+    else:
+        final_result = replace(result, pdf=None, image=None)
+    if work_root.resolve() != output_root.resolve() and work_page_dir.exists():
+        shutil.rmtree(work_page_dir)
+    return final_result
+
+
+def _direct_mutate_and_compile(
+    page: CanonicalPage,
+    config: WorkerConfig,
+    mutation_config: MutationConfig,
+) -> WorkerResult:
+    """Mutate source channels first and compile only the edited page."""
+
+    started = time.monotonic()
+    page_id = _mutation_page_id(page.page_id, mutation_config)
+    mutations = choose_source_page_mutations(
+        page,
+        seed=mutation_config.seed,
+        minimum=mutation_config.minimum_per_page,
+        maximum=mutation_config.maximum_per_page,
+        maximum_probability=mutation_config.maximum_probability,
+    )
+    if len(mutations) < mutation_config.minimum_per_page:
+        return _direct_mutation_rejection(
+            page,
+            page_id=page_id,
+            reason=(
+                "fewer_than_minimum_source_mutations:"
+                f"required={mutation_config.minimum_per_page}:found={len(mutations)}"
+            ),
+            started=started,
+        )
+
+    mutated_page = apply_page_mutations(page, mutations, page_id=page_id)
+    cached = _direct_result_cache(mutated_page, config)
+    if cached is not None:
+        return cached
+    expected_differences = len(mutations)
+    channel_differences = {
+        "markdown": markdown_diff_count(page.markdown, mutated_page.markdown),
+        "verifier": markdown_diff_count(
+            page.verifier_text,
+            mutated_page.verifier_text,
+        ),
+        "latex": markdown_diff_count(
+            build_page_tex(page),
+            build_page_tex(mutated_page),
+        ),
+    }
+    if any(value != expected_differences for value in channel_differences.values()):
+        return _direct_mutation_rejection(
+            page,
+            page_id=page_id,
+            reason=f"mutation_channel_diff_mismatch:{channel_differences}",
+            started=started,
+            mutations=mutations,
+            markdown=mutated_page.markdown,
+        )
+
+    edited_result = _compile_once(mutated_page, config)
+    if edited_result.status != "accepted" or edited_result.pdf is None:
+        result = replace(
+            edited_result,
+            status="rejected",
+            reason=f"edited_{edited_result.reason or 'compile_rejected'}",
+            pdf=None,
+            image=None,
+            elapsed_seconds=time.monotonic() - started,
+            mutation_count=len(mutations),
+            changes=(),
+            clean_page_id=None,
+            max_mutation_vertical_shift_points=None,
+            variant="confusable_edit",
+        )
+        return _finish_direct_compile(result, config)
+
+    page_dir = Path(config.work_dir or config.output_dir) / "pages" / page_id
+    observation, observation_error = _bbox_text_for_verification(
+        Path(edited_result.pdf),
+        layout=mutated_page.layout,
+        config=config,
+        page_dir=page_dir,
+    )
+    if observation_error is not None or observation is None:
+        result = replace(
+            edited_result,
+            status="rejected",
+            reason=f"edited_bbox_failed:{observation_error or 'unknown'}",
+            pdf=None,
+            image=None,
+            elapsed_seconds=time.monotonic() - started,
+            mutation_count=len(mutations),
+            changes=(),
+            clean_page_id=None,
+            max_mutation_vertical_shift_points=None,
+            variant="confusable_edit",
+        )
+        return _finish_direct_compile(result, config)
+
+    rendered_indices: dict[str, list[int]] = {}
+    for index, word in enumerate(observation.words):
+        rendered_indices.setdefault(word.text, []).append(index)
+    located: list[PageMutation] = []
+    for mutation in mutations:
+        indexes = rendered_indices.get(mutation.mutated_word, [])
+        if len(indexes) != 1:
+            result = replace(
+                edited_result,
+                status="rejected",
+                reason=(
+                    "edited_mutation_word_not_unique:"
+                    f"word={mutation.mutated_word}:matches={len(indexes)}"
+                ),
+                pdf=None,
+                image=None,
+                elapsed_seconds=time.monotonic() - started,
+                mutation_count=len(mutations),
+                changes=(),
+                clean_page_id=None,
+                max_mutation_vertical_shift_points=None,
+                variant="confusable_edit",
+            )
+            return _finish_direct_compile(result, config)
+        located.append(replace(mutation, rendered_word_index=indexes[0]))
+
+    if edited_result.image is None:
+        result = replace(
+            edited_result,
+            status="rejected",
+            reason="edited_page_missing_image",
+            pdf=None,
+            image=None,
+            elapsed_seconds=time.monotonic() - started,
+            mutation_count=len(mutations),
+            changes=(),
+            clean_page_id=None,
+            max_mutation_vertical_shift_points=None,
+            variant="confusable_edit",
+        )
+        return _finish_direct_compile(result, config)
+
+    with Image.open(edited_result.image) as image:
+        image_width, image_height = image.size
+    changes = tuple(
+        _mutation_change(
+            mutation,
+            observation.words[mutation.rendered_word_index],
+            observation=observation,
+            image_width=image_width,
+            image_height=image_height,
+        )
+        for mutation in located
+    )
+    result = replace(
+        edited_result,
+        elapsed_seconds=time.monotonic() - started,
+        mutation_count=len(located),
+        changes=changes,
+        clean_page_id=None,
+        max_mutation_vertical_shift_points=None,
+        variant="confusable_edit",
+    )
+    return _finish_direct_compile(result, config)
+
+
 def _mutate_and_compile(
     clean_result: WorkerResult,
     clean_page: CanonicalPage,
@@ -1092,9 +1436,7 @@ def _mutate_and_compile(
             mutation_count=len(mutations),
             changes=(),
             clean_page_id=clean_result.page_id,
-            max_mutation_vertical_shift_points=(
-                validation.max_vertical_shift_points
-            ),
+            max_mutation_vertical_shift_points=(validation.max_vertical_shift_points),
             variant="confusable_edit",
         )
         _persist_terminal_result(result, config)
@@ -1113,9 +1455,7 @@ def _mutate_and_compile(
             mutation_count=len(mutations),
             changes=(),
             clean_page_id=clean_result.page_id,
-            max_mutation_vertical_shift_points=(
-                validation.max_vertical_shift_points
-            ),
+            max_mutation_vertical_shift_points=(validation.max_vertical_shift_points),
             variant="confusable_edit",
         )
         _persist_terminal_result(result, config)
@@ -1231,16 +1571,58 @@ def _initial_bundle_end(
 
 def _persist_terminal_result(result: WorkerResult, config: WorkerConfig) -> None:
     page_dir = Path(config.output_dir) / "pages" / result.page_id
-    _atomic_json(
-        page_dir / "terminal_result.json",
-        {"pipeline_version": PIPELINE_VERSION, **asdict(result)},
-    )
+    if result.status != "accepted" and result.variant == "confusable_edit":
+        if page_dir.is_dir():
+            shutil.rmtree(page_dir)
+        if config.minimal_output:
+            return
+    if not config.minimal_output:
+        _atomic_json(
+            page_dir / "terminal_result.json",
+            {"pipeline_version": PIPELINE_VERSION, **asdict(result)},
+        )
+    if (
+        result.status == "accepted"
+        and result.variant == "confusable_edit"
+        and result.image is not None
+        and result.changes
+    ):
+        # A dense source-pool job can take minutes and return many terminal
+        # pages at once.  Persist each accepted page from its worker instead of
+        # waiting for the whole job (or the whole corpus) to finish.  Unique
+        # filenames make these atomic writes safe across processes.
+        parts_dir = Path(config.output_dir) / "realtime_training" / "parts"
+        sft, verl = _realtime_training_rows(result, parts_dir.parent)
+        _atomic_text(
+            parts_dir / f"{result.page_id}.sft.jsonl",
+            json.dumps(sft, ensure_ascii=False) + "\n",
+        )
+        _atomic_text(
+            parts_dir / f"{result.page_id}.verl.jsonl",
+            json.dumps(verl, ensure_ascii=False) + "\n",
+        )
+
+
+def _remove_nonterminal_direct_artifacts(
+    attempts: Sequence[WorkerResult],
+    *,
+    terminal_page_ids: set[str],
+    config: WorkerConfig,
+) -> None:
+    for attempt in attempts:
+        if attempt.variant != "confusable_edit" or attempt.page_id in terminal_page_ids:
+            continue
+        page_dir = Path(config.output_dir) / "pages" / attempt.page_id
+        if page_dir.is_dir():
+            shutil.rmtree(page_dir)
 
 
 def _compile_with_rescue(
     page: CanonicalPage,
     config: WorkerConfig,
     depth: int = 0,
+    *,
+    mutation_config: MutationConfig | None = None,
 ) -> tuple[WorkerResult, ...]:
     """Compile a source sequence into dense pages with one-bundle backoff.
 
@@ -1252,11 +1634,19 @@ def _compile_with_rescue(
     """
 
     del depth  # retained in the signature for callers of the earlier V4 pilot
+
+    def compile_candidate(candidate: CanonicalPage) -> WorkerResult:
+        if mutation_config is None:
+            return _compile_once(candidate, config)
+        return _direct_mutate_and_compile(candidate, config, mutation_config)
+
     bundles = list(bundle_blocks(page.blocks))
     terminal: list[WorkerResult] = []
     start = 0
     output_ordinal = 1
     while start < len(bundles):
+        terminal_start = len(terminal)
+        attempt_results: list[WorkerResult] = []
         end = _initial_bundle_end(
             bundles,
             start=start,
@@ -1281,7 +1671,8 @@ def _compile_with_rescue(
             if attempt_key in attempted_ends:
                 break
             attempted_ends.add(attempt_key)
-            result = _compile_once(candidate, config)
+            result = compile_candidate(candidate)
+            attempt_results.append(result)
             last_result = result
             attempts += 1
 
@@ -1297,7 +1688,10 @@ def _compile_with_rescue(
                 break
             if (
                 result.reason is not None
-                and result.reason.startswith("sparse_page:")
+                and (
+                    result.reason.startswith("sparse_page:")
+                    or result.reason.startswith("fewer_than_minimum_source_mutations:")
+                )
                 and current_end < len(bundles)
             ):
                 current_end += 1
@@ -1318,7 +1712,8 @@ def _compile_with_rescue(
                 output_ordinal=output_ordinal,
                 config=config,
             )
-            last_result = _compile_once(candidate, config)
+            last_result = compile_candidate(candidate)
+            attempt_results.append(last_result)
             attempts += 1
             if last_result.status == "accepted":
                 best = (start + 1, last_result)
@@ -1345,7 +1740,8 @@ def _compile_with_rescue(
                     config=config,
                     force_layout="one_column",
                 )
-                obstruction_result = _compile_once(obstruction, config)
+                obstruction_result = compile_candidate(obstruction)
+                attempt_results.append(obstruction_result)
                 attempts += 1
                 if obstruction_result.status != "accepted":
                     obstruction_result = replace(
@@ -1355,6 +1751,11 @@ def _compile_with_rescue(
                     )
                     terminal.append(obstruction_result)
                     _persist_terminal_result(obstruction_result, config)
+                    _remove_nonterminal_direct_artifacts(
+                        attempt_results,
+                        terminal_page_ids={obstruction_result.page_id},
+                        config=config,
+                    )
                     del bundles[best_end]
                     output_ordinal += 1
                     continue
@@ -1368,7 +1769,8 @@ def _compile_with_rescue(
                     config=config,
                     force_layout="one_column",
                 )
-                fallback_result = _compile_once(fallback, config)
+                fallback_result = compile_candidate(fallback)
+                attempt_results.append(fallback_result)
                 attempts += 1
                 if (
                     fallback_result.status == "accepted"
@@ -1404,6 +1806,11 @@ def _compile_with_rescue(
             terminal.append(result)
             _persist_terminal_result(result, config)
             start += 1
+        _remove_nonterminal_direct_artifacts(
+            attempt_results,
+            terminal_page_ids={item.page_id for item in terminal[terminal_start:]},
+            config=config,
+        )
         output_ordinal += 1
     return tuple(terminal)
 
@@ -1717,6 +2124,249 @@ def _extract_paper_job(
         }
 
 
+def _prepare_extract_crawler_job(
+    archive: CrawlerArchive,
+    cache_root: Path,
+    target_weight: int,
+    two_column_rate: float,
+) -> tuple[tuple[CanonicalPage, ...], dict[str, Any] | None, dict[str, Any]]:
+    """Unpack, extract immutable AST pages, then delete the unpacked copy."""
+
+    job_root = (
+        cache_root / "jobs" / f"{archive.paper_id}.{os.getpid()}.{time.time_ns()}"
+    )
+    preparation: dict[str, Any] = {
+        "paper_id": archive.paper_id,
+        "status": "failed",
+        "paper_dir": None,
+        "archive": archive.archive,
+        "input_bytes": archive.input_bytes,
+    }
+    pages: tuple[CanonicalPage, ...] = ()
+    report: dict[str, Any] | None = None
+    try:
+        preparation = _materialize_crawler_archive(archive, job_root)
+        if preparation.get("status") != "prepared" or not preparation.get("paper_dir"):
+            return (), None, preparation
+        paper_dir = Path(str(preparation["paper_dir"]))
+        pages, report = _extract_paper_job(
+            paper_dir,
+            target_weight,
+            two_column_rate,
+        )
+        return pages, report, preparation
+    finally:
+        cleanup_started = time.monotonic()
+        try:
+            shutil.rmtree(job_root)
+            preparation["cache_cleanup"] = "deleted"
+        except FileNotFoundError:
+            preparation["cache_cleanup"] = "already_absent"
+        except OSError as error:
+            preparation["cache_cleanup"] = "failed"
+            preparation["cache_cleanup_error"] = f"{type(error).__name__}: {error}"
+        preparation["temporary_paper_dir"] = preparation.get("paper_dir")
+        preparation["paper_dir"] = None
+        preparation["cache_cleanup_elapsed_seconds"] = (
+            time.monotonic() - cleanup_started
+        )
+
+
+def _prepare_extract_crawler_parallel(
+    archives: Sequence[CrawlerArchive],
+    *,
+    cache_root: Path,
+    workers: int,
+    target_weight: int,
+    two_column_rate: float,
+    global_started: float,
+) -> tuple[
+    list[CanonicalPage],
+    list[dict[str, Any]],
+    int,
+    list[dict[str, Any]],
+    dict[str, Any],
+]:
+    """Stream raw bins through unpack+AST extraction with bounded disk use."""
+
+    total = len(archives)
+    total_bytes = sum(item.input_bytes for item in archives)
+    phase_started = time.monotonic()
+    completed = prepared = rejected = preparation_errors = 0
+    extraction_successes = extraction_errors = candidates = 0
+    completed_bytes = expanded_bytes = cleaned = cleanup_errors = 0
+    pages_by_id: dict[str, tuple[CanonicalPage, ...]] = {}
+    extraction_reports: dict[str, dict[str, Any]] = {}
+    preparation_results: dict[str, dict[str, Any]] = {}
+    iterator = iter(archives)
+    max_inflight = min(total, max(1, workers * 2))
+
+    def submit_next(
+        executor: ProcessPoolExecutor,
+        pending: dict[Any, CrawlerArchive],
+    ) -> bool:
+        try:
+            archive = next(iterator)
+        except StopIteration:
+            return False
+        pending[
+            executor.submit(
+                _prepare_extract_crawler_job,
+                archive,
+                cache_root,
+                target_weight,
+                two_column_rate,
+            )
+        ] = archive
+        return True
+
+    _emit(
+        "crawler-stream-start",
+        f"archives={total} input_bytes={total_bytes} workers={workers} "
+        f"max_inflight={max_inflight} temporary_cache={cache_root}",
+    )
+    with ProcessPoolExecutor(max_workers=min(workers, max(1, total))) as executor:
+        pending: dict[Any, CrawlerArchive] = {}
+        while len(pending) < max_inflight and submit_next(executor, pending):
+            pass
+        while pending:
+            done, _ = wait(pending, timeout=30, return_when=FIRST_COMPLETED)
+            if not done:
+                elapsed = time.monotonic() - phase_started
+                rate = completed / max(elapsed, 1e-9)
+                eta = (total - completed) / max(rate, 1e-9)
+                _emit(
+                    "crawler-stream-progress",
+                    f"completed={completed}/{total} percent="
+                    f"{completed / max(1, total):.1%} pending={len(pending)} "
+                    f"bytes={completed_bytes}/{total_bytes} "
+                    f"prepared={prepared} rejected={rejected} "
+                    f"errors={preparation_errors + extraction_errors} "
+                    f"candidates={candidates} cache_deleted={cleaned} "
+                    f"cleanup_errors={cleanup_errors} rate={rate:.3f}_papers/s "
+                    f"elapsed={elapsed:.1f}s eta={eta:.1f}s",
+                )
+                continue
+            for future in done:
+                archive = pending.pop(future)
+                try:
+                    paper_pages, extraction_report, preparation = future.result()
+                except Exception as error:  # noqa: BLE001 - isolate process failure
+                    paper_pages = ()
+                    extraction_report = None
+                    preparation = {
+                        "paper_id": archive.paper_id,
+                        "status": "failed",
+                        "paper_dir": None,
+                        "archive": archive.archive,
+                        "input_bytes": archive.input_bytes,
+                        "error": f"worker_error:{type(error).__name__}:{error}",
+                        "cache_cleanup": "unknown_after_worker_error",
+                        "elapsed_seconds": 0.0,
+                    }
+                paper_id = archive.paper_id
+                preparation_results[paper_id] = preparation
+                pages_by_id[paper_id] = paper_pages
+                if extraction_report is not None:
+                    extraction_reports[paper_id] = extraction_report
+                completed += 1
+                completed_bytes += archive.input_bytes
+                expanded_bytes += int(preparation.get("expanded_bytes", 0))
+                prepared += preparation.get("status") == "prepared"
+                rejected += preparation.get("status") == "rejected"
+                preparation_errors += preparation.get("status") == "failed"
+                extraction_successes += bool(
+                    extraction_report and extraction_report.get("status") == "success"
+                )
+                extraction_errors += bool(
+                    extraction_report and extraction_report.get("status") != "success"
+                )
+                candidates += len(paper_pages)
+                cleaned += preparation.get("cache_cleanup") in {
+                    "deleted",
+                    "already_absent",
+                }
+                cleanup_errors += preparation.get("cache_cleanup") == "failed"
+                elapsed = time.monotonic() - phase_started
+                rate = completed / max(elapsed, 1e-9)
+                byte_rate = completed_bytes / max(elapsed, 1e-9)
+                eta = (total - completed) / max(rate, 1e-9)
+                _emit(
+                    "crawler-stream-unit",
+                    f"completed={completed}/{total} percent="
+                    f"{completed / max(1, total):.1%} current={paper_id} "
+                    f"prepare={preparation.get('status')} extract="
+                    f"{extraction_report.get('status') if extraction_report else 'skipped'} "
+                    f"cache_cleanup={preparation.get('cache_cleanup')} "
+                    f"paper_candidates={len(paper_pages)} "
+                    f"cumulative_candidates={candidates} bytes="
+                    f"{completed_bytes}/{total_bytes} expanded_bytes={expanded_bytes} "
+                    f"throughput={rate:.3f}_papers/s "
+                    f"byte_rate={byte_rate / 1048576:.2f}_MiB/s "
+                    f"elapsed={elapsed:.1f}s eta={eta:.1f}s "
+                    f"accepted={extraction_successes} rejected={rejected} "
+                    f"errors={preparation_errors + extraction_errors} "
+                    f"cache_deleted={cleaned} cleanup_errors={cleanup_errors}",
+                )
+                submit_next(executor, pending)
+
+    ordered_ids = [archive.paper_id for archive in archives]
+    pages = [page for paper_id in ordered_ids for page in pages_by_id[paper_id]]
+    pages.sort(key=lambda page: (page.paper_id, page.ordinal, page.page_id))
+    reports = [extraction_reports[paper_id] for paper_id in sorted(extraction_reports)]
+    preparation_rows = [preparation_results[paper_id] for paper_id in ordered_ids]
+    report = {
+        "mode": "crawler_archives",
+        "processing_mode": "streaming_ephemeral_unpack_extract",
+        "crawler_archives_selected": total,
+        "crawler_archives_prepared": prepared,
+        "crawler_archives_rejected": rejected,
+        "crawler_archives_failed": preparation_errors,
+        "crawler_extraction_succeeded": extraction_successes,
+        "crawler_extraction_failed": extraction_errors,
+        "crawler_input_bytes": total_bytes,
+        "crawler_completed_bytes": completed_bytes,
+        "crawler_expanded_bytes": expanded_bytes,
+        "crawler_cache_root": str(cache_root),
+        "crawler_cache_policy": "delete_each_paper_after_ast_extraction",
+        "crawler_cache_dirs_deleted": cleaned,
+        "crawler_cache_cleanup_errors": cleanup_errors,
+        "workers": workers,
+        "elapsed_seconds": time.monotonic() - phase_started,
+        "global_elapsed_seconds": time.monotonic() - global_started,
+        "selected_ids": ordered_ids,
+        "prepared_ids": [
+            paper_id
+            for paper_id in ordered_ids
+            if preparation_results[paper_id].get("status") == "prepared"
+        ],
+        "archive_stats": {
+            archive.paper_id: {
+                "input_bytes": archive.input_bytes,
+                "archive": archive.archive,
+            }
+            for archive in archives
+        },
+    }
+    _emit(
+        "crawler-stream-finish",
+        f"archives={total} prepared={prepared} rejected={rejected} "
+        f"prepare_errors={preparation_errors} extraction_successes="
+        f"{extraction_successes} extraction_errors={extraction_errors} "
+        f"candidates={len(pages)} cache_deleted={cleaned} "
+        f"cleanup_errors={cleanup_errors} elapsed="
+        f"{time.monotonic() - phase_started:.1f}s global_elapsed="
+        f"{time.monotonic() - global_started:.1f}s",
+    )
+    return (
+        pages,
+        reports,
+        extraction_errors,
+        preparation_rows,
+        report,
+    )
+
+
 def _extract_papers_parallel(
     papers: Sequence[Path],
     *,
@@ -1875,6 +2525,252 @@ def _relative_output_path(value: str | None, output: Path) -> str | None:
     return Path(value).resolve().relative_to(output.resolve()).as_posix()
 
 
+def _realtime_training_rows(
+    result: WorkerResult,
+    dataset_dir: Path,
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    if result.image is None:
+        raise PipelineError(f"accepted page missing image: {result.page_id}")
+    image = Path(
+        os.path.relpath(Path(result.image).resolve(), dataset_dir.resolve())
+    ).as_posix()
+    changes = [
+        {
+            "ocr_ans": change["ocr_ans"],
+            "origin_ans": change["origin_ans"],
+            "bbox": change["bbox"],
+        }
+        for change in result.changes
+    ]
+    sft = {
+        "messages": [
+            {"role": "user", "content": _SFT_PROMPT},
+            {"role": "assistant", "content": result.markdown},
+        ],
+        "images": [image],
+        "data_source": "chaos_document_ocr",
+        "ability": "document_ocr",
+        "extra_info": {
+            "arxiv_id": result.paper_id,
+            "pair_id": result.page_id,
+        },
+    }
+    verl = {
+        "data_source": "chaos_document_ocr",
+        "prompt": [
+            {
+                "role": "user",
+                "content": "<image>\nPlease transcribe all text in this page image faithfully, exactly as printed (including any typos).",
+            }
+        ],
+        "images": [image],
+        "reward_model": {"style": "rule", "ground_truth": result.markdown},
+        "extra_info": {
+            "arxiv_id": result.paper_id,
+            "pair_id": result.page_id,
+            "changes": changes,
+        },
+        "ability": "document_ocr",
+    }
+    return sft, verl
+
+
+def _existing_training_ids(path: Path) -> set[str]:
+    if not path.is_file():
+        return set()
+    identifiers: set[str] = set()
+    with path.open("r", encoding="utf-8") as handle:
+        for line in handle:
+            if not line.strip():
+                continue
+            try:
+                row = json.loads(line)
+                pair_id = row["extra_info"]["pair_id"]
+            except (KeyError, TypeError, json.JSONDecodeError):
+                continue
+            if isinstance(pair_id, str) and pair_id:
+                identifiers.add(pair_id)
+    return identifiers
+
+
+class _RealtimeTrainingWriter:
+    """Append accepted edited pages as soon as each source-pool job returns."""
+
+    def __init__(self, output: Path, *, target_count: int = 0) -> None:
+        self.dataset_dir = output / "realtime_training"
+        self.target_count = target_count
+        self.dataset_dir.mkdir(parents=True, exist_ok=True)
+        self.parts_dir = self.dataset_dir / "parts"
+        self.sft_path = self.dataset_dir / "sft.jsonl"
+        self.verl_path = self.dataset_dir / "verl.jsonl"
+        self.sft_ids = _existing_training_ids(self.sft_path)
+        self.verl_ids = _existing_training_ids(self.verl_path)
+        self.sft_handle = self.sft_path.open("a", encoding="utf-8", buffering=1)
+        self.verl_handle = self.verl_path.open("a", encoding="utf-8", buffering=1)
+        self.added_sft = 0
+        self.added_verl = 0
+        self.recovered_parts = 0
+        self._recover_parts()
+
+    @property
+    def complete_ids(self) -> set[str]:
+        return self.sft_ids & self.verl_ids
+
+    @staticmethod
+    def _read_part(path: Path, expected_id: str) -> dict[str, Any] | None:
+        try:
+            lines = [
+                line
+                for line in path.read_text(encoding="utf-8").splitlines()
+                if line.strip()
+            ]
+            if len(lines) != 1:
+                return None
+            row = json.loads(lines[0])
+            if row["extra_info"]["pair_id"] != expected_id:
+                return None
+        except (OSError, KeyError, TypeError, json.JSONDecodeError):
+            return None
+        return row
+
+    @staticmethod
+    def _append_row(handle: Any, row: dict[str, Any]) -> None:
+        handle.write(json.dumps(row, ensure_ascii=False) + "\n")
+        handle.flush()
+
+    def _recover_parts(self) -> None:
+        if not self.parts_dir.is_dir():
+            return
+        sft_parts = {
+            path.name.removesuffix(".sft.jsonl"): path
+            for path in self.parts_dir.glob("*.sft.jsonl")
+        }
+        verl_parts = {
+            path.name.removesuffix(".verl.jsonl"): path
+            for path in self.parts_dir.glob("*.verl.jsonl")
+        }
+        for pair_id in sorted(sft_parts.keys() & verl_parts.keys()):
+            sft_path = sft_parts[pair_id]
+            verl_path = verl_parts[pair_id]
+            sft = self._read_part(sft_path, pair_id)
+            verl = self._read_part(verl_path, pair_id)
+            if sft is None or verl is None:
+                continue
+            if pair_id not in self.sft_ids:
+                self._append_row(self.sft_handle, sft)
+                self.sft_ids.add(pair_id)
+                self.recovered_parts += 1
+            if pair_id not in self.verl_ids:
+                self._append_row(self.verl_handle, verl)
+                self.verl_ids.add(pair_id)
+                self.recovered_parts += 1
+            sft_path.unlink(missing_ok=True)
+            verl_path.unlink(missing_ok=True)
+        try:
+            self.parts_dir.rmdir()
+        except (FileNotFoundError, OSError):
+            pass
+
+    def _remove_parts(self, pair_id: str) -> None:
+        for suffix in (".sft.jsonl", ".verl.jsonl"):
+            (self.parts_dir / f"{pair_id}{suffix}").unlink(missing_ok=True)
+        try:
+            self.parts_dir.rmdir()
+        except (FileNotFoundError, OSError):
+            pass
+
+    def add(self, result: WorkerResult) -> bool:
+        if (
+            result.status != "accepted"
+            or result.variant != "confusable_edit"
+            or result.image is None
+            or not result.changes
+        ):
+            return False
+        sft, verl = _realtime_training_rows(result, self.dataset_dir)
+        if result.page_id not in self.sft_ids:
+            self._append_row(self.sft_handle, sft)
+            self.sft_ids.add(result.page_id)
+            self.added_sft += 1
+        if result.page_id not in self.verl_ids:
+            self._append_row(self.verl_handle, verl)
+            self.verl_ids.add(result.page_id)
+            self.added_verl += 1
+        if result.page_id in self.complete_ids:
+            self._remove_parts(result.page_id)
+        return True
+
+    def checkpoint(
+        self,
+        *,
+        completed_jobs: int,
+        total_jobs: int,
+        accepted: int,
+        rejected: int,
+        started: float,
+    ) -> None:
+        _atomic_json(
+            self.dataset_dir / "progress.json",
+            {
+                "pipeline_version": PIPELINE_VERSION,
+                "mode": "direct_edit",
+                "target_count": self.target_count,
+                "target_reached": (
+                    self.target_count > 0 and accepted >= self.target_count
+                ),
+                "completed_jobs": completed_jobs,
+                "total_jobs": total_jobs,
+                "accepted": accepted,
+                "rejected": rejected,
+                "sft_rows": len(self.sft_ids),
+                "verl_rows": len(self.verl_ids),
+                "elapsed_seconds": time.monotonic() - started,
+            },
+        )
+
+    def close(self) -> None:
+        self.sft_handle.close()
+        self.verl_handle.close()
+
+
+def _discard_unselected_direct_result(result: WorkerResult, output: Path) -> None:
+    """Delete a valid concurrent overrun that was not admitted to the target."""
+
+    page_dir = output / "pages" / result.page_id
+    if page_dir.is_dir():
+        shutil.rmtree(page_dir)
+    parts_dir = output / "realtime_training" / "parts"
+    for suffix in (".sft.jsonl", ".verl.jsonl"):
+        (parts_dir / f"{result.page_id}{suffix}").unlink(missing_ok=True)
+    try:
+        parts_dir.rmdir()
+    except (FileNotFoundError, OSError):
+        pass
+
+
+def _admit_direct_result(
+    result: WorkerResult,
+    *,
+    writer: _RealtimeTrainingWriter,
+    accepted_ids: set[str],
+    target_count: int,
+    output: Path,
+) -> str:
+    """Commit one valid result, deduplicate it, or discard target overrun."""
+
+    if result.page_id in accepted_ids:
+        writer.add(result)
+        return "duplicate"
+    if target_count > 0 and len(accepted_ids) >= target_count:
+        _discard_unselected_direct_result(result, output)
+        return "overrun"
+    writer.add(result)
+    if result.page_id not in writer.complete_ids:
+        raise PipelineError(f"realtime pair was not committed: {result.page_id}")
+    accepted_ids.add(result.page_id)
+    return "admitted"
+
+
 def _export(
     output: Path,
     results: Sequence[WorkerResult],
@@ -1884,6 +2780,7 @@ def _export(
     *,
     clean_results: Sequence[WorkerResult],
     mutation_config: MutationConfig | None,
+    mutation_execution: str = "clean_then_edit",
     input_report: dict[str, Any] | None = None,
 ) -> None:
     accepted = sorted(
@@ -1902,7 +2799,9 @@ def _export(
         image = _relative_output_path(result.image, output)
         pdf = _relative_output_path(result.pdf, output)
         is_mutated = result.variant == "confusable_edit"
-        data_source = "chaos_document_ocr" if is_mutated else "arxiv_canonical_reflow_v4"
+        data_source = (
+            "chaos_document_ocr" if is_mutated else "arxiv_canonical_reflow_v4"
+        )
         projected_changes = [
             {
                 "ocr_ans": change["ocr_ans"],
@@ -2019,8 +2918,7 @@ def _export(
     clean_accepted = sum(row.status == "accepted" for row in clean_results)
     clean_rejected = len(clean_results) - clean_accepted
     mutation_rejected = sum(
-        row.variant == "confusable_edit" and row.status != "accepted"
-        for row in results
+        row.variant == "confusable_edit" and row.status != "accepted" for row in results
     )
     mutation_distribution = Counter(row.mutation_count for row in accepted)
     rejection_reasons = Counter(row.reason or "unknown" for row in rejected)
@@ -2040,16 +2938,23 @@ def _export(
         "clean_stage_pages_rejected": clean_rejected,
         "clean_stage_acceptance_rate": clean_accepted / max(1, len(clean_results)),
         "mutation_mode": "confusable" if mutation_config is not None else "off",
+        "mutation_execution": mutation_execution,
         "mutation_policy_version": (
             MUTATION_POLICY_VERSION if mutation_config is not None else None
         ),
         "mutation_config": (
             asdict(mutation_config) if mutation_config is not None else None
         ),
-        "mutation_candidate_pages": clean_accepted,
+        "mutation_candidate_pages": (
+            total_terminal if mutation_execution == "direct" else clean_accepted
+        ),
         "mutation_pages_accepted": len(accepted),
         "mutation_pages_rejected": mutation_rejected,
-        "mutation_acceptance_rate": len(accepted) / max(1, clean_accepted),
+        "mutation_acceptance_rate": len(accepted)
+        / max(
+            1,
+            total_terminal if mutation_execution == "direct" else clean_accepted,
+        ),
         "mutation_count_distribution": {
             str(key): value for key, value in sorted(mutation_distribution.items())
         },
@@ -2119,18 +3024,54 @@ def _parser() -> argparse.ArgumentParser:
         type=Path,
         default=None,
         help=(
-            "Resumable safe-unpack cache for --crawler-root; defaults to "
-            "<output-dir>/_crawler_cache."
+            "Temporary safe-unpack workspace for --crawler-root; each paper "
+            "copy is deleted immediately after AST extraction."
+        ),
+    )
+    parser.add_argument(
+        "--work-dir",
+        type=Path,
+        default=None,
+        help=(
+            "Separate disposable compile/cache root. Defaults to a sibling "
+            "directory named .<output-name>_work; compiler artifacts are never "
+            "stored in the final dataset directory in direct mode."
         ),
     )
     parser.add_argument("--output-dir", type=Path, required=True)
     parser.add_argument("--paper-limit", type=int, default=5)
     parser.add_argument("--max-pages", type=int, default=30)
+    parser.add_argument(
+        "--full-corpus",
+        action="store_true",
+        help="Process every completed archive and every extracted page candidate.",
+    )
+    parser.add_argument(
+        "--target-count",
+        "--target-samples",
+        dest="target_count",
+        type=int,
+        default=0,
+        help=(
+            "Stop after exactly this many accepted edited samples exist in both "
+            "realtime SFT and VERL files. Zero means no accepted-sample target."
+        ),
+    )
+    parser.add_argument(
+        "--verbose",
+        action="store_true",
+        help="Print detailed per-stage logs instead of the compact progress display.",
+    )
+    parser.add_argument(
+        "--debug-artifacts",
+        action="store_true",
+        help="Retain diagnostic manifests, rejected rows, and extraction reports.",
+    )
     parser.add_argument("--seed", type=int, default=20260831)
     parser.add_argument(
         "--workers",
         type=int,
-        default=max(1, min(8, os.cpu_count() or 1)),
+        default=max(1, min(128, os.cpu_count() or 1)),
         help="Process workers shared by unpack, AST extraction, compile, and mutation (1-256).",
     )
     parser.add_argument("--target-weight", type=int, default=5200)
@@ -2156,6 +3097,15 @@ def _parser() -> argparse.ArgumentParser:
         help="Export recompiled confusable edits by default; use off for clean diagnostics.",
     )
     parser.add_argument(
+        "--mutation-execution",
+        choices=("direct", "clean_then_edit"),
+        default="direct",
+        help=(
+            "Compile edited pages directly by default. clean_then_edit retains "
+            "the legacy two-stage diagnostic path."
+        ),
+    )
+    parser.add_argument(
         "--mutation-seed",
         type=int,
         default=None,
@@ -2177,13 +3127,27 @@ def _parser() -> argparse.ArgumentParser:
 
 
 def main(argv: Sequence[str] | None = None) -> int:
+    global _VERBOSE_OUTPUT
+
     args = _parser().parse_args(argv)
+    _VERBOSE_OUTPUT = args.verbose
+    unbounded_input = args.full_corpus or args.target_count > 0
+    paper_limit = 0 if unbounded_input else args.paper_limit
+    max_pages = 0 if unbounded_input else args.max_pages
     if not 1 <= args.workers <= 256:
         raise SystemExit("--workers must be between 1 and 256")
     if args.paper_limit < 0:
         raise SystemExit("--paper-limit must be non-negative")
     if args.max_pages < 0:
         raise SystemExit("--max-pages must be non-negative")
+    if args.target_count < 0:
+        raise SystemExit("--target-count must be non-negative")
+    if args.target_count > 0 and (
+        args.mutation_mode != "confusable" or args.mutation_execution != "direct"
+    ):
+        raise SystemExit(
+            "--target-count requires the default direct confusable-edit mode"
+        )
     if args.target_weight < 200:
         raise SystemExit("--target-weight must be at least 200")
     if not 0.0 <= args.two_column_rate <= 1.0:
@@ -2192,11 +3156,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         raise SystemExit("fill ratios must satisfy 0 <= min-fill <= target-fill <= 1")
     if args.max_pack_attempts < 1:
         raise SystemExit("--max-pack-attempts must be positive")
-    if not (
-        1
-        <= args.min_mutations_per_page
-        <= args.max_mutations_per_page
-    ):
+    if not (1 <= args.min_mutations_per_page <= args.max_mutations_per_page):
         raise SystemExit(
             "mutation bounds must satisfy 1 <= min-mutations <= max-mutations"
         )
@@ -2207,6 +3167,12 @@ def main(argv: Sequence[str] | None = None) -> int:
     started = time.monotonic()
     output = args.output_dir.expanduser().resolve()
     output.mkdir(parents=True, exist_ok=True)
+    work_root = (
+        args.work_dir.expanduser().resolve()
+        if args.work_dir is not None
+        else output.parent / f".{output.name}_work"
+    )
+    work_root.mkdir(parents=True, exist_ok=True)
     mutation_seed = args.seed if args.mutation_seed is None else args.mutation_seed
     crawler_prepare_results: list[dict[str, Any]] = []
     if args.crawler_root is not None:
@@ -2215,7 +3181,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             raise SystemExit(f"crawler root does not exist: {input_root}")
         archives = _discover_crawler_archives(
             input_root,
-            limit=args.paper_limit,
+            limit=paper_limit,
             seed=args.seed,
         )
         selected_count = len(archives)
@@ -2224,33 +3190,40 @@ def main(argv: Sequence[str] | None = None) -> int:
         input_root = args.papers_root.expanduser().resolve()
         if not input_root.is_dir():
             raise SystemExit(f"papers root does not exist: {input_root}")
-        papers = _select_papers(input_root, args.paper_limit, args.seed)
+        papers = _select_papers(input_root, paper_limit, args.seed)
         selected_count = len(papers)
         input_mode = "normalized_papers"
     _emit(
         "start",
         f"version={PIPELINE_VERSION} input_mode={input_mode} papers={selected_count} "
-        f"workers={args.workers} "
+        f"workers={args.workers} target_count={args.target_count or 'all'} "
         f"target_weight={args.target_weight} two_column_rate={args.two_column_rate:.3f} "
         f"target_fill={args.target_fill_ratio:.3f} min_fill={args.min_fill_ratio:.3f} "
-        f"mutation_mode={args.mutation_mode} mutation_seed={mutation_seed} "
+        f"mutation_mode={args.mutation_mode} "
+        f"mutation_execution={args.mutation_execution} mutation_seed={mutation_seed} "
         f"mutations={args.min_mutations_per_page}-{args.max_mutations_per_page} "
-        f"input={input_root} output={output}",
+        f"input={input_root} output={output} work_dir={work_root}",
     )
     if args.crawler_root is not None:
         cache_root = (
             args.crawler_cache_dir.expanduser().resolve()
             if args.crawler_cache_dir is not None
-            else output / "_crawler_cache"
+            else work_root / "crawler_cache"
         )
         cache_root.mkdir(parents=True, exist_ok=True)
-        papers, crawler_prepare_results, input_report = (
-            _prepare_crawler_archives_parallel(
-                archives,
-                cache_root=cache_root,
-                workers=args.workers,
-                global_started=started,
-            )
+        (
+            pages,
+            reports,
+            extraction_errors,
+            crawler_prepare_results,
+            input_report,
+        ) = _prepare_extract_crawler_parallel(
+            archives,
+            cache_root=cache_root,
+            workers=args.workers,
+            target_weight=args.target_weight,
+            two_column_rate=args.two_column_rate,
+            global_started=started,
         )
         input_report.update(
             {
@@ -2258,11 +3231,13 @@ def main(argv: Sequence[str] | None = None) -> int:
                 "papers_selected": selected_count,
             }
         )
-        _atomic_jsonl(
-            output / "crawler_prepare_results.jsonl",
-            crawler_prepare_results,
-        )
-        _atomic_json(output / "crawler_prepare_report.json", input_report)
+        if args.debug_artifacts:
+            _atomic_jsonl(
+                output / "crawler_prepare_results.jsonl",
+                crawler_prepare_results,
+            )
+            _atomic_json(output / "crawler_prepare_report.json", input_report)
+        papers_prepared = int(input_report["crawler_archives_prepared"])
     else:
         input_report = {
             "mode": "normalized_papers",
@@ -2270,48 +3245,62 @@ def main(argv: Sequence[str] | None = None) -> int:
             "papers_selected": selected_count,
             "workers": args.workers,
         }
-
-    pages, reports, extraction_errors = _extract_papers_parallel(
-        papers,
-        workers=args.workers,
-        target_weight=args.target_weight,
-        two_column_rate=args.two_column_rate,
-        global_started=started,
-    )
-    pages = _limit_page_candidates(pages, limit=args.max_pages, seed=args.seed)
+        pages, reports, extraction_errors = _extract_papers_parallel(
+            papers,
+            workers=args.workers,
+            target_weight=args.target_weight,
+            two_column_rate=args.two_column_rate,
+            global_started=started,
+        )
+        papers_prepared = len(papers)
+    pages = _limit_page_candidates(pages, limit=max_pages, seed=args.seed)
     dense_jobs = _dense_jobs_from_pages(pages)
-    _atomic_jsonl(
-        output / "page_candidates.jsonl",
-        [
-            {
-                "page_id": page.page_id,
-                "paper_id": page.paper_id,
-                "layout": page.layout,
-                "has_table": page.has_table,
-                "block_ids": [block.block_id for block in page.blocks],
-                "source_node_ids": [block.node_id for block in page.blocks],
-            }
-            for page in pages
-        ],
+    mutation_config = (
+        MutationConfig(
+            seed=mutation_seed,
+            minimum_per_page=args.min_mutations_per_page,
+            maximum_per_page=args.max_mutations_per_page,
+            maximum_probability=args.four_mutation_probability,
+            max_vertical_shift_points=args.max_mutation_vertical_shift_points,
+        )
+        if args.mutation_mode == "confusable"
+        else None
     )
-    _atomic_jsonl(
-        output / "dense_jobs.jsonl",
-        [
-            {
-                "job_id": job.page_id,
-                "paper_id": job.paper_id,
-                "source_blocks": len(job.blocks),
-                "block_ids": [block.block_id for block in job.blocks],
-            }
-            for job in dense_jobs
-        ],
-    )
+    direct_edit = mutation_config is not None and args.mutation_execution == "direct"
+    if args.debug_artifacts:
+        _atomic_jsonl(
+            output / "page_candidates.jsonl",
+            [
+                {
+                    "page_id": page.page_id,
+                    "paper_id": page.paper_id,
+                    "layout": page.layout,
+                    "has_table": page.has_table,
+                    "block_ids": [block.block_id for block in page.blocks],
+                    "source_node_ids": [block.node_id for block in page.blocks],
+                }
+                for page in pages
+            ],
+        )
+        _atomic_jsonl(
+            output / "dense_jobs.jsonl",
+            [
+                {
+                    "job_id": job.page_id,
+                    "paper_id": job.paper_id,
+                    "source_blocks": len(job.blocks),
+                    "block_ids": [block.block_id for block in job.blocks],
+                }
+                for job in dense_jobs
+            ],
+        )
     _emit(
         "compile-start",
-        f"candidate_pages={len(pages)} max_pages={args.max_pages} "
+        f"candidate_pages={len(pages)} max_pages={max_pages} "
         f"dense_jobs={len(dense_jobs)} source_blocks="
         f"{sum(len(job.blocks) for job in dense_jobs)} "
-        f"extraction_errors={extraction_errors}",
+        f"extraction_errors={extraction_errors} "
+        f"execution={'direct_edit' if direct_edit else 'clean'}",
     )
     config = WorkerConfig(
         output_dir=str(output),
@@ -2328,50 +3317,105 @@ def main(argv: Sequence[str] | None = None) -> int:
         two_column_rate=args.two_column_rate,
         target_fill_ratio=args.target_fill_ratio,
         min_fill_ratio=args.min_fill_ratio,
+        work_dir=str(work_root / "compile") if direct_edit else None,
+        minimal_output=direct_edit and not args.debug_artifacts,
     )
-    clean_results: list[WorkerResult] = []
-    clean_accepted = clean_rejected = completed = 0
+    stage_results: list[WorkerResult] = []
+    stage_rejected = completed = discarded_overrun = cancelled_jobs = 0
+    realtime_writer = (
+        _RealtimeTrainingWriter(output, target_count=args.target_count)
+        if direct_edit
+        else None
+    )
+    accepted_ids = (
+        set(realtime_writer.complete_ids) if realtime_writer is not None else set()
+    )
+    initial_accepted = len(accepted_ids)
+    if args.target_count > 0 and initial_accepted > args.target_count:
+        if realtime_writer is not None:
+            realtime_writer.close()
+        raise SystemExit(
+            "output already contains "
+            f"{initial_accepted} complete samples, which exceeds "
+            f"--target-count={args.target_count}; use a new output directory"
+        )
+    stage_accepted = len(accepted_ids)
+    target_progress = _TargetProgress(args.target_count, initial=stage_accepted)
+    target_progress.update(
+        accepted=stage_accepted,
+        rejected=stage_rejected,
+        force=True,
+    )
     compile_iterator = iter(dense_jobs)
-    compile_max_inflight = min(
-        len(dense_jobs), max(1, args.workers * 2)
-    )
+    compile_max_inflight = min(len(dense_jobs), max(1, args.workers * 2))
+
+    def target_open() -> bool:
+        return args.target_count == 0 or stage_accepted < args.target_count
+
+    def desired_inflight() -> int:
+        if args.target_count == 0:
+            return compile_max_inflight
+        remaining = max(0, args.target_count - stage_accepted)
+        return min(compile_max_inflight, remaining)
 
     def submit_compile(
         executor: ProcessPoolExecutor,
         pending: dict[Any, CanonicalPage],
     ) -> bool:
+        if not target_open():
+            return False
         try:
             job = next(compile_iterator)
         except StopIteration:
             return False
-        pending[executor.submit(_compile_with_rescue, job, config)] = job
+        pending[
+            executor.submit(
+                _compile_with_rescue,
+                job,
+                config,
+                mutation_config=mutation_config if direct_edit else None,
+            )
+        ] = job
         return True
 
-    with ProcessPoolExecutor(max_workers=args.workers) as executor:
-        pending: dict[Any, CanonicalPage] = {}
-        while (
-            len(pending) < compile_max_inflight
-            and submit_compile(executor, pending)
-        ):
-            pass
-        while pending:
-            done, _ = wait(pending, timeout=30, return_when=FIRST_COMPLETED)
-            if not done:
-                elapsed = time.monotonic() - started
-                _emit(
-                    "compile-progress",
-                    f"completed_jobs={completed}/{len(dense_jobs)} pending={len(pending)} "
-                    f"accepted={clean_accepted} rejected={clean_rejected} "
-                    f"elapsed={elapsed:.1f}s",
-                )
-                continue
-            for future in done:
-                page = pending.pop(future)
-                try:
-                    rows = future.result()
-                except Exception as exc:  # noqa: BLE001 - isolate worker failures
-                    rows = (
-                        WorkerResult(
+    try:
+        with ProcessPoolExecutor(max_workers=args.workers) as executor:
+            pending: dict[Any, CanonicalPage] = {}
+            while len(pending) < desired_inflight() and submit_compile(
+                executor, pending
+            ):
+                pass
+            while pending:
+                done, _ = wait(pending, timeout=30, return_when=FIRST_COMPLETED)
+                if not done:
+                    target_progress.update(
+                        accepted=stage_accepted,
+                        rejected=stage_rejected,
+                        force=True,
+                    )
+                    if _VERBOSE_OUTPUT:
+                        elapsed = time.monotonic() - started
+                        _emit(
+                            "compile-progress",
+                            f"completed_jobs={completed}/{len(dense_jobs)} "
+                            f"pending={len(pending)} accepted={stage_accepted} "
+                            f"rejected={stage_rejected} elapsed={elapsed:.1f}s",
+                        )
+                    if realtime_writer is not None:
+                        realtime_writer.checkpoint(
+                            completed_jobs=completed,
+                            total_jobs=len(dense_jobs),
+                            accepted=stage_accepted,
+                            rejected=stage_rejected,
+                            started=started,
+                        )
+                    continue
+                for future in sorted(done, key=lambda item: pending[item].page_id):
+                    page = pending.pop(future)
+                    try:
+                        rows = future.result()
+                    except Exception as exc:  # noqa: BLE001 - isolate worker failures
+                        failed = WorkerResult(
                             page_id=page.page_id,
                             paper_id=page.paper_id,
                             status="rejected",
@@ -2391,38 +3435,132 @@ def main(argv: Sequence[str] | None = None) -> int:
                             column_fill_ratios=(),
                             page_signature=None,
                             elapsed_seconds=0.0,
-                        ),
-                    )
-                clean_results.extend(rows)
-                completed += 1
-                clean_accepted += sum(row.status == "accepted" for row in rows)
-                clean_rejected += sum(row.status != "accepted" for row in rows)
-                elapsed = time.monotonic() - started
-                rate = completed / max(elapsed, 1e-9)
-                eta = (len(dense_jobs) - completed) / max(rate, 1e-9)
-                _emit(
-                    "compile-unit",
-                    f"completed_jobs={completed}/{len(dense_jobs)} job={page.page_id} "
-                    f"terminal_pages={len(rows)} attempts="
-                    f"{sum(row.pack_attempts for row in rows)} "
-                    f"accepted={clean_accepted} rejected={clean_rejected} "
-                    f"rate={rate:.3f}_jobs/s elapsed={elapsed:.1f}s eta={eta:.1f}s",
-                )
-                submit_compile(executor, pending)
+                        )
+                        if direct_edit and mutation_config is not None:
+                            failed = replace(
+                                failed,
+                                page_id=_mutation_page_id(
+                                    page.page_id, mutation_config
+                                ),
+                                variant="confusable_edit",
+                            )
+                        _persist_terminal_result(failed, config)
+                        rows = (failed,)
+                    completed += 1
+                    for row in rows:
+                        if row.status != "accepted":
+                            stage_rejected += 1
+                            if args.debug_artifacts or not direct_edit:
+                                stage_results.append(row)
+                            continue
 
-    mutation_config: MutationConfig | None = None
-    if args.mutation_mode == "confusable":
-        mutation_config = MutationConfig(
-            seed=mutation_seed,
-            minimum_per_page=args.min_mutations_per_page,
-            maximum_per_page=args.max_mutations_per_page,
-            maximum_probability=args.four_mutation_probability,
-            max_vertical_shift_points=args.max_mutation_vertical_shift_points,
+                        if realtime_writer is None:
+                            stage_results.append(row)
+                            stage_accepted += 1
+                            target_progress.update(
+                                accepted=stage_accepted,
+                                rejected=stage_rejected,
+                            )
+                            continue
+
+                        admission = _admit_direct_result(
+                            row,
+                            writer=realtime_writer,
+                            accepted_ids=accepted_ids,
+                            target_count=args.target_count,
+                            output=output,
+                        )
+                        if admission == "duplicate":
+                            continue
+                        if admission == "overrun":
+                            discarded_overrun += 1
+                            continue
+                        stage_accepted = len(accepted_ids)
+                        if args.debug_artifacts:
+                            stage_results.append(row)
+                        target_progress.update(
+                            accepted=stage_accepted,
+                            rejected=stage_rejected,
+                        )
+
+                    if realtime_writer is not None:
+                        realtime_writer.checkpoint(
+                            completed_jobs=completed,
+                            total_jobs=len(dense_jobs),
+                            accepted=stage_accepted,
+                            rejected=stage_rejected,
+                            started=started,
+                        )
+                    elapsed = time.monotonic() - started
+                    rate = completed / max(elapsed, 1e-9)
+                    eta = (len(dense_jobs) - completed) / max(rate, 1e-9)
+                    _emit(
+                        "direct-edit-unit" if direct_edit else "compile-unit",
+                        f"completed_jobs={completed}/{len(dense_jobs)} "
+                        f"job={page.page_id} terminal_pages={len(rows)} attempts="
+                        f"{sum(row.pack_attempts for row in rows)} "
+                        f"accepted={stage_accepted} rejected={stage_rejected} "
+                        f"realtime_rows="
+                        f"{len(realtime_writer.sft_ids) if realtime_writer else 0} "
+                        f"rate={rate:.3f}_jobs/s elapsed={elapsed:.1f}s "
+                        f"eta={eta:.1f}s",
+                    )
+                    if not target_open():
+                        for queued in list(pending):
+                            if queued.cancel():
+                                pending.pop(queued)
+                                cancelled_jobs += 1
+                    while len(pending) < desired_inflight() and submit_compile(
+                        executor, pending
+                    ):
+                        pass
+    finally:
+        target_progress.finish(
+            accepted=stage_accepted,
+            rejected=stage_rejected,
         )
+        if realtime_writer is not None:
+            realtime_writer.checkpoint(
+                completed_jobs=completed,
+                total_jobs=len(dense_jobs),
+                accepted=stage_accepted,
+                rejected=stage_rejected,
+                started=started,
+            )
+            realtime_writer.close()
+        if direct_edit and config.work_dir is not None:
+            compile_work = Path(config.work_dir)
+            try:
+                if compile_work.exists():
+                    shutil.rmtree(compile_work)
+                _emit(
+                    "compile-cleanup",
+                    f"status=deleted path={compile_work}",
+                )
+            except OSError as error:
+                _emit(
+                    "compile-cleanup",
+                    f"status=warning path={compile_work} "
+                    f"error={type(error).__name__}:{error}",
+                )
+        for empty_directory in (
+            work_root / "crawler_cache" / "jobs",
+            work_root / "crawler_cache",
+            work_root,
+        ):
+            try:
+                empty_directory.rmdir()
+            except (FileNotFoundError, OSError):
+                pass
+    clean_results = [] if direct_edit else stage_results
+    clean_accepted = 0 if direct_edit else stage_accepted
+    clean_rejected = 0 if direct_edit else stage_rejected
+
+    if direct_edit:
+        results = stage_results
+    elif args.mutation_mode == "confusable":
         block_lookup = {
-            block.block_id: block
-            for job in dense_jobs
-            for block in job.blocks
+            block.block_id: block for job in dense_jobs for block in job.blocks
         }
         final_results: list[WorkerResult] = [
             result for result in clean_results if result.status != "accepted"
@@ -2439,8 +3577,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                     ordinal=0,
                     layout=clean_result.layout,
                     blocks=tuple(
-                        block_lookup[block_id]
-                        for block_id in clean_result.block_ids
+                        block_lookup[block_id] for block_id in clean_result.block_ids
                     ),
                 )
                 if clean_page.markdown != clean_result.markdown:
@@ -2479,9 +3616,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         mutation_changes = 0
         mutation_started = time.monotonic()
         mutation_iterator = iter(prepared)
-        mutation_max_inflight = min(
-            len(prepared), max(1, args.workers * 2)
-        )
+        mutation_max_inflight = min(len(prepared), max(1, args.workers * 2))
 
         def submit_mutation(
             executor: ProcessPoolExecutor,
@@ -2502,12 +3637,9 @@ def main(argv: Sequence[str] | None = None) -> int:
             return True
 
         with ProcessPoolExecutor(max_workers=args.workers) as executor:
-            pending_mutations: dict[
-                Any, tuple[WorkerResult, CanonicalPage]
-            ] = {}
-            while (
-                len(pending_mutations) < mutation_max_inflight
-                and submit_mutation(executor, pending_mutations)
+            pending_mutations: dict[Any, tuple[WorkerResult, CanonicalPage]] = {}
+            while len(pending_mutations) < mutation_max_inflight and submit_mutation(
+                executor, pending_mutations
             ):
                 pass
             while pending_mutations:
@@ -2571,24 +3703,73 @@ def main(argv: Sequence[str] | None = None) -> int:
     else:
         results = clean_results
 
-    accepted = sum(result.status == "accepted" for result in results)
-    rejected = len(results) - accepted
-    _export(
-        output,
-        results,
-        reports,
-        started,
-        config,
-        clean_results=clean_results,
-        mutation_config=mutation_config,
-        input_report=input_report,
+    accepted = (
+        stage_accepted
+        if direct_edit
+        else sum(result.status == "accepted" for result in results)
     )
+    rejected = stage_rejected if direct_edit else len(results) - accepted
+    if args.debug_artifacts or not direct_edit:
+        _export(
+            output,
+            results,
+            reports,
+            started,
+            config,
+            clean_results=clean_results,
+            mutation_config=mutation_config,
+            mutation_execution=(
+                args.mutation_execution if mutation_config is not None else "off"
+            ),
+            input_report=input_report,
+        )
     elapsed = time.monotonic() - started
+    target_reached = args.target_count > 0 and accepted >= args.target_count
+    if direct_edit and not args.debug_artifacts:
+        _atomic_json(
+            output / "run_summary.json",
+            {
+                "pipeline_version": PIPELINE_VERSION,
+                "status": (
+                    "target_reached"
+                    if target_reached
+                    else "source_exhausted"
+                    if args.target_count > 0
+                    else "completed"
+                ),
+                "target_count": args.target_count,
+                "accepted_count": accepted,
+                "accepted_before_run": initial_accepted,
+                "accepted_added_this_run": accepted - initial_accepted,
+                "rejected_count_this_run": rejected,
+                "discarded_concurrent_overrun": discarded_overrun,
+                "cancelled_jobs": cancelled_jobs,
+                "completed_jobs": completed,
+                "available_jobs": len(dense_jobs),
+                "clean_pages_generated": 0,
+                "final_dataset_variant": "confusable_edited_only",
+                "sft": "realtime_training/sft.jsonl",
+                "verl": "realtime_training/verl.jsonl",
+                "pages": "pages",
+                "input_mode": input_mode,
+                "papers_selected": selected_count,
+                "papers_prepared": papers_prepared,
+                "elapsed_seconds": elapsed,
+            },
+        )
+    if not _VERBOSE_OUTPUT:
+        _emit(
+            "finish",
+            f"accepted={accepted} target={args.target_count or 'all'} "
+            f"rejected={rejected} elapsed={elapsed:.1f}s output={output}",
+        )
+        return 0
     _emit(
         "finish",
         f"input_mode={input_mode} papers_selected={selected_count} "
-        f"papers_prepared={len(papers)} initial_candidates={len(pages)} "
+        f"papers_prepared={papers_prepared} initial_candidates={len(pages)} "
         f"dense_jobs={len(dense_jobs)} terminal={len(results)} "
+        f"mutation_execution={args.mutation_execution} "
         f"clean_accepted={clean_accepted} clean_rejected={clean_rejected} "
         f"final_accepted={accepted} final_rejected={rejected} "
         f"acceptance={accepted / max(1, len(results)):.2%} elapsed={elapsed:.1f}s",

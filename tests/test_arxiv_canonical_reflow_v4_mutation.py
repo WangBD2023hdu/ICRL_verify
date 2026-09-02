@@ -16,6 +16,7 @@ from arxiv_canonical_reflow_v4.mutation import (
     RenderedWord,
     apply_page_mutations,
     choose_page_mutations,
+    choose_source_page_mutations,
     markdown_diff_count,
     validate_mutated_word_geometry,
 )
@@ -128,6 +129,32 @@ def test_selection_is_deterministic_paragraph_only_and_synchronized() -> None:
     assert edited.blocks[2:] == page.blocks[2:]
 
 
+def test_source_only_selection_mutates_before_any_render() -> None:
+    page, _ = _prose_page()
+    first = choose_source_page_mutations(
+        page,
+        seed=23,
+        minimum=3,
+        maximum=4,
+        maximum_probability=1.0,
+    )
+    second = choose_source_page_mutations(
+        page,
+        seed=23,
+        minimum=3,
+        maximum=4,
+        maximum_probability=1.0,
+    )
+    assert first == second
+    assert len(first) == 4
+    assert {mutation.block_id for mutation in first} == {"body"}
+    assert all(mutation.rendered_word_index == -1 for mutation in first)
+    edited = apply_page_mutations(page, first, page_id="direct-edit")
+    assert markdown_diff_count(page.markdown, edited.markdown) == 4
+    assert markdown_diff_count(page.verifier_text, edited.verifier_text) == 4
+    assert markdown_diff_count(build_page_tex(page), build_page_tex(edited)) == 4
+
+
 def test_hidden_markdown_and_nonparagraph_text_are_not_mutated() -> None:
     markdown = (
         "planet follows ```cinder waits``` `signal grows` $hover moves$ "
@@ -214,7 +241,10 @@ def test_geometry_gate_accepts_only_declared_equal_length_edits() -> None:
     assert validation.passed
     assert validation.max_vertical_shift_points == 0.0
 
-    duplicate = (mutations[0], replace(mutations[1], rendered_word_index=mutations[0].rendered_word_index))
+    duplicate = (
+        mutations[0],
+        replace(mutations[1], rendered_word_index=mutations[0].rendered_word_index),
+    )
     assert (
         validate_mutated_word_geometry(clean, edited, duplicate).reason
         == "duplicate_rendered_word_index"
@@ -232,7 +262,7 @@ def test_geometry_gate_accepts_only_declared_equal_length_edits() -> None:
     )
 
 
-def _worker_config(output: Path) -> builder.WorkerConfig:
+def _worker_config(output: Path, work: Path | None = None) -> builder.WorkerConfig:
     return builder.WorkerConfig(
         output_dir=str(output),
         latexmk="latexmk",
@@ -248,7 +278,231 @@ def _worker_config(output: Path) -> builder.WorkerConfig:
         two_column_rate=0.0,
         target_fill_ratio=0.8,
         min_fill_ratio=0.6,
+        work_dir=str(work) if work is not None else None,
     )
+
+
+def test_direct_edit_compiles_no_clean_page_and_streams_training_rows(
+    monkeypatch,
+    tmp_path,
+) -> None:
+    output = tmp_path / "dataset"
+    work = tmp_path / "compile-work"
+    page, _ = _prose_page()
+    state: dict[str, CanonicalPage] = {}
+
+    def fake_compile(
+        mutated_page: CanonicalPage,
+        _config: builder.WorkerConfig,
+    ) -> builder.WorkerResult:
+        state["page"] = mutated_page
+        page_dir = (
+            Path(_config.work_dir or _config.output_dir)
+            / "pages"
+            / mutated_page.page_id
+        )
+        page_dir.mkdir(parents=True)
+        pdf = page_dir / "page.pdf"
+        pdf.write_bytes(b"edited")
+        image = page_dir / "page.png"
+        Image.new("RGB", (612, 792), "white").save(image)
+        (page_dir / "ground_truth.md").write_text(
+            mutated_page.markdown + "\n",
+            encoding="utf-8",
+        )
+        return builder.WorkerResult(
+            page_id=mutated_page.page_id,
+            paper_id=mutated_page.paper_id,
+            status="accepted",
+            reason=None,
+            layout=mutated_page.layout,
+            has_table=mutated_page.has_table,
+            markdown=mutated_page.markdown,
+            verifier_recall=1.0,
+            verifier_precision=1.0,
+            pdf=str(pdf),
+            image=str(image),
+            block_ids=tuple(block.block_id for block in mutated_page.blocks),
+            source_node_ids=tuple(block.node_id for block in mutated_page.blocks),
+            content_fill_ratio=0.8,
+            column_fill_ratios=(0.8,),
+            page_signature="edited-signature",
+            elapsed_seconds=0.1,
+        )
+
+    def fake_bbox(
+        pdf: Path,
+        *,
+        layout: str,
+        config: builder.WorkerConfig,
+        page_dir: Path,
+    ) -> tuple[builder.BBoxObservation, None]:
+        del pdf, layout, config, page_dir
+        words = tuple(
+            RenderedWord(word, 0, 50 + index * 20, 60, 65 + index * 20, 70)
+            for index, word in enumerate(state["page"].verifier_text.split())
+        )
+        return (
+            builder.BBoxObservation(
+                text=" ".join(word.text for word in words),
+                words=words,
+                content_fill_ratio=0.8,
+                column_fill_ratios=(0.8,),
+                page_width=612,
+                page_height=792,
+            ),
+            None,
+        )
+
+    monkeypatch.setattr(builder, "_compile_once", fake_compile)
+    monkeypatch.setattr(builder, "_bbox_text_for_verification", fake_bbox)
+    mutation_config = builder.MutationConfig(
+        seed=29,
+        minimum_per_page=3,
+        maximum_per_page=3,
+        maximum_probability=0.0,
+        max_vertical_shift_points=1.25,
+    )
+    result = builder._direct_mutate_and_compile(
+        page,
+        _worker_config(output, work),
+        mutation_config,
+    )
+
+    assert result.status == "accepted"
+    assert result.variant == "confusable_edit"
+    assert result.clean_page_id is None
+    assert result.mutation_count == 3
+    assert len(result.changes) == 3
+    assert state["page"].page_id == result.page_id
+    assert "_confusable_s29_" in result.page_id
+    assert not (output / "pages" / page.page_id).exists()
+    assert not (work / "pages" / result.page_id).exists()
+    assert result.pdf is None
+    assert result.image == str(
+        (output / "pages" / result.page_id / "page.png").resolve()
+    )
+
+    builder._persist_terminal_result(result, _worker_config(output, work))
+    parts = output / "realtime_training" / "parts"
+    sft_part = parts / f"{result.page_id}.sft.jsonl"
+    verl_part = parts / f"{result.page_id}.verl.jsonl"
+    assert sft_part.is_file()
+    assert verl_part.is_file()
+    assert json.loads(verl_part.read_text())["extra_info"]["pair_id"] == result.page_id
+
+    writer = builder._RealtimeTrainingWriter(output)
+    assert not sft_part.exists()
+    assert not verl_part.exists()
+    assert writer.add(result)
+    assert writer.add(result)
+    writer.checkpoint(
+        completed_jobs=1,
+        total_jobs=5,
+        accepted=1,
+        rejected=0,
+        started=0.0,
+    )
+    writer.close()
+    sft_rows = (output / "realtime_training" / "sft.jsonl").read_text().splitlines()
+    verl_rows = (output / "realtime_training" / "verl.jsonl").read_text().splitlines()
+    assert len(sft_rows) == len(verl_rows) == 1
+    verl = json.loads(verl_rows[0])
+    sft = json.loads(sft_rows[0])
+    assert sft["images"] == [f"../pages/{result.page_id}/page.png"]
+    assert verl["images"] == [f"../pages/{result.page_id}/page.png"]
+    assert len(verl["extra_info"]["changes"]) == 3
+    assert verl["reward_model"]["ground_truth"] == result.markdown
+    assert not (output / "pages" / result.page_id / "terminal_result.json").exists()
+
+
+def _accepted_edit_result(output: Path, page_id: str) -> builder.WorkerResult:
+    page_dir = output / "pages" / page_id
+    page_dir.mkdir(parents=True)
+    image = page_dir / "page.png"
+    image.write_bytes(b"png")
+    (page_dir / "ground_truth.md").write_text("mutated text\n", encoding="utf-8")
+    return builder.WorkerResult(
+        page_id=page_id,
+        paper_id="paper",
+        status="accepted",
+        reason=None,
+        layout="one_column",
+        has_table=False,
+        markdown="mutated text",
+        verifier_recall=1.0,
+        verifier_precision=1.0,
+        pdf=None,
+        image=str(image.resolve()),
+        block_ids=("b1",),
+        source_node_ids=("n1",),
+        content_fill_ratio=0.8,
+        column_fill_ratios=(0.8,),
+        page_signature="signature",
+        elapsed_seconds=0.1,
+        mutation_count=1,
+        changes=(
+            {
+                "ocr_ans": "tcxt",
+                "origin_ans": "text",
+                "bbox": [1, 2, 3, 4],
+            },
+        ),
+        variant="confusable_edit",
+    )
+
+
+def test_target_admission_keeps_exact_count_and_deletes_concurrent_overrun(
+    tmp_path,
+) -> None:
+    output = tmp_path / "dataset"
+    writer = builder._RealtimeTrainingWriter(output)
+    accepted_ids: set[str] = set()
+    rows = [_accepted_edit_result(output, f"edited-{index}") for index in range(1, 4)]
+
+    admissions = []
+    for row in rows:
+        builder._persist_terminal_result(row, _worker_config(output))
+        admissions.append(
+            builder._admit_direct_result(
+                row,
+                writer=writer,
+                accepted_ids=accepted_ids,
+                target_count=2,
+                output=output,
+            )
+        )
+    writer.close()
+
+    assert admissions == ["admitted", "admitted", "overrun"]
+    assert accepted_ids == {"edited-1", "edited-2"}
+    assert not (output / "pages" / "edited-3").exists()
+    assert not (output / "realtime_training" / "parts").exists()
+    assert (
+        len((output / "realtime_training" / "sft.jsonl").read_text().splitlines()) == 2
+    )
+    assert (
+        len((output / "realtime_training" / "verl.jsonl").read_text().splitlines()) == 2
+    )
+
+
+def test_minimal_rejected_edit_leaves_no_page_directory(tmp_path) -> None:
+    output = tmp_path / "dataset"
+    page_dir = output / "pages" / "rejected-edit"
+    page_dir.mkdir(parents=True)
+    (page_dir / "page.png").write_bytes(b"temporary")
+    result = replace(
+        _accepted_edit_result(output, "accepted-template"),
+        page_id="rejected-edit",
+        status="rejected",
+        reason="synthetic rejection",
+        image=None,
+        changes=(),
+    )
+
+    builder._persist_terminal_result(result, _worker_config(output))
+
+    assert not page_dir.exists()
 
 
 def test_mutation_worker_recompiles_validates_and_exports_v1_changes(

@@ -176,6 +176,52 @@ def test_cli_default_minimum_fill_ratio_is_seventy_percent() -> None:
         ["--papers-root", "papers", "--output-dir", "output"]
     )
     assert args.min_fill_ratio == 0.70
+    assert args.mutation_execution == "direct"
+    assert args.work_dir is None
+    assert not args.full_corpus
+
+
+def test_cli_full_corpus_is_one_flag_for_unlimited_input() -> None:
+    args = builder._parser().parse_args(
+        [
+            "--crawler-root",
+            "crawl",
+            "--output-dir",
+            "output",
+            "--full-corpus",
+        ]
+    )
+    assert args.full_corpus
+
+
+def test_cli_target_count_and_compact_output_defaults() -> None:
+    args = builder._parser().parse_args(
+        [
+            "--crawler-root",
+            "crawl",
+            "--output-dir",
+            "output",
+            "--target-count",
+            "40000",
+        ]
+    )
+    assert args.target_count == 40000
+    assert not args.verbose
+    assert not args.debug_artifacts
+
+
+def test_cli_target_samples_is_target_count_alias() -> None:
+    args = builder._parser().parse_args(
+        [
+            "--papers-root",
+            "papers",
+            "--output-dir",
+            "output",
+            "--target-samples",
+            "17",
+        ]
+    )
+    assert args.target_count == 17
 
 
 def test_cli_accepts_raw_crawler_root_and_128_workers() -> None:
@@ -259,6 +305,84 @@ This is source-derived text.
     second = builder._materialize_crawler_archive(discovered[0], cache)
     assert second["status"] == "prepared"
     assert second["resume_state"] == "reused"
+
+
+def test_raw_crawler_stream_deletes_unpacked_copy_after_ast_extraction(
+    tmp_path,
+) -> None:
+    crawler = tmp_path / "crawl"
+    archive = crawler / "papers" / "2601.00003v1" / "source_archive.bin"
+    _write_crawler_archive(
+        archive,
+        r"""\documentclass{article}
+\begin{document}
+This source paragraph contains enough ordinary words for canonical extraction.
+\end{document}
+""",
+    )
+    discovered = builder._discover_crawler_archives(crawler, limit=0, seed=7)
+    cache = tmp_path / "ephemeral-cache"
+    pages, reports, errors, preparation_rows, pipeline_report = (
+        builder._prepare_extract_crawler_parallel(
+            discovered,
+            cache_root=cache,
+            workers=2,
+            target_weight=5200,
+            two_column_rate=0.35,
+            global_started=time.monotonic(),
+        )
+    )
+
+    assert errors == 0
+    assert pages
+    assert reports[0]["status"] == "success"
+    assert preparation_rows[0]["cache_cleanup"] == "deleted"
+    assert pipeline_report["crawler_cache_dirs_deleted"] == 1
+    assert pipeline_report["crawler_cache_policy"] == (
+        "delete_each_paper_after_ast_extraction"
+    )
+    assert not (cache / "papers" / "2601.00003v1").exists()
+    assert archive.is_file()
+
+
+def test_raw_crawler_stream_cleanup_does_not_depend_on_extraction_success(
+    monkeypatch,
+    tmp_path,
+) -> None:
+    crawler = tmp_path / "crawl"
+    archive_path = crawler / "papers" / "2601.00004v1" / "source_archive.bin"
+    _write_crawler_archive(
+        archive_path,
+        r"\documentclass{article}\begin{document}Text\end{document}",
+    )
+    archive = builder._discover_crawler_archives(crawler, limit=0, seed=7)[0]
+    cache = tmp_path / "ephemeral-cache"
+
+    monkeypatch.setattr(
+        builder,
+        "_extract_paper_job",
+        lambda *_args: (
+            (),
+            {
+                "paper_id": archive.paper_id,
+                "status": "failed",
+                "error": "synthetic extraction failure",
+            },
+        ),
+    )
+    pages, report, preparation = builder._prepare_extract_crawler_job(
+        archive,
+        cache,
+        5200,
+        0.35,
+    )
+
+    assert not pages
+    assert report is not None and report["status"] == "failed"
+    assert preparation["cache_cleanup"] == "deleted"
+    assert preparation["paper_dir"] is None
+    assert not any((cache / "jobs").glob("**/source"))
+    assert archive_path.is_file()
 
 
 def test_crawler_discovery_accepts_direct_papers_directory_without_results(

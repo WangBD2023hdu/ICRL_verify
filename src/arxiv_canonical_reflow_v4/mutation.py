@@ -12,7 +12,7 @@ from dataclasses import dataclass, replace
 
 from .core import CanonicalBlock, CanonicalPage
 
-MUTATION_POLICY_VERSION = "canonical_reflow_confusable_v1_aligned"
+MUTATION_POLICY_VERSION = "canonical_reflow_confusable_v2_source_only"
 
 # Frozen V1-compatible lower-case, one-codepoint substitutions.  Digits,
 # Unicode homoglyphs, insertions, and deletions are intentionally excluded.
@@ -157,7 +157,9 @@ def choose_page_mutations(
         if block.kind != "paragraph":
             continue
         for word, markdown_start, markdown_end in spans:
-            if visible_counts[word] != 1 or not any(char in CONFUSABLES for char in word):
+            if visible_counts[word] != 1 or not any(
+                char in CONFUSABLES for char in word
+            ):
                 continue
             word_indices = rendered_indices.get(word, [])
             if len(word_indices) != 1:
@@ -259,6 +261,123 @@ def choose_page_mutations(
         selected_words.add(completed.original_word)
         selected_mutated_words.add(completed.mutated_word)
         selected_lines.add(line_key)
+        if len(selected) >= requested:
+            break
+    if len(selected) < minimum:
+        return ()
+    return tuple(selected[:requested])
+
+
+def choose_source_page_mutations(
+    page: CanonicalPage,
+    *,
+    seed: int,
+    minimum: int = 3,
+    maximum: int = 4,
+    maximum_probability: float = 0.6,
+) -> tuple[PageMutation, ...]:
+    """Choose deterministic mutations before any PDF has been compiled.
+
+    Candidates must be unique visible words in a prose block and must occur
+    exactly once in the block's Markdown, LaTeX, and verifier channels.  The
+    mutated word must not already occur elsewhere on the page.  This provides
+    enough identity to locate its bbox in the edited render without compiling
+    a clean reference page first.
+    """
+
+    if minimum < 1 or maximum < minimum:
+        raise ValueError("mutation bounds must satisfy 1 <= minimum <= maximum")
+    if not 0.0 <= maximum_probability <= 1.0:
+        raise ValueError("maximum_probability must be in [0, 1]")
+
+    block_offsets = _block_offsets(page)
+    visible_by_block = [_visible_word_spans(block.markdown) for block in page.blocks]
+    visible_counts = Counter(word for spans in visible_by_block for word, _, _ in spans)
+    page_vocabulary = set(visible_counts)
+    candidates: list[PageMutation] = []
+    for block_index, (block, spans) in enumerate(zip(page.blocks, visible_by_block)):
+        if block.kind != "paragraph":
+            continue
+        for word, markdown_start, markdown_end in spans:
+            if visible_counts[word] != 1 or not any(
+                char in CONFUSABLES for char in word
+            ):
+                continue
+            latex_spans = _literal_spans(block.latex, word, latex=True)
+            verifier_spans = _literal_spans(block.verifier_text, word, latex=False)
+            if len(latex_spans) != 1 or len(verifier_spans) != 1:
+                continue
+            candidates.append(
+                PageMutation(
+                    original_word=word,
+                    mutated_word="",
+                    from_char="",
+                    to_char="",
+                    char_index_in_word=-1,
+                    block_id=block.block_id,
+                    node_id=block.node_id,
+                    block_index=block_index,
+                    markdown_start=block_offsets[block_index] + markdown_start,
+                    markdown_end=block_offsets[block_index] + markdown_end,
+                    block_markdown_start=markdown_start,
+                    block_markdown_end=markdown_end,
+                    block_latex_start=latex_spans[0][0],
+                    block_latex_end=latex_spans[0][1],
+                    block_verifier_start=verifier_spans[0][0],
+                    block_verifier_end=verifier_spans[0][1],
+                    rendered_word_index=-1,
+                    clean_bbox_points=(0.0, 0.0, 0.0, 0.0),
+                    source_files=block.source_files,
+                    source_char_span=block.source_char_span,
+                )
+            )
+
+    rng = random.Random(_stable_seed(seed, page.page_id))
+    rng.shuffle(candidates)
+    requested = maximum if rng.random() < maximum_probability else minimum
+    selected: list[PageMutation] = []
+    selected_words: set[str] = set()
+    selected_mutated_words: set[str] = set()
+    for candidate in candidates:
+        if candidate.original_word in selected_words:
+            continue
+        positions = [
+            index
+            for index, character in enumerate(candidate.original_word)
+            if character in CONFUSABLES
+        ]
+        rng.shuffle(positions)
+        completed: PageMutation | None = None
+        for character_index in positions:
+            from_char = candidate.original_word[character_index]
+            targets = list(CONFUSABLES[from_char])
+            rng.shuffle(targets)
+            for to_char in targets:
+                mutated_word = (
+                    candidate.original_word[:character_index]
+                    + to_char
+                    + candidate.original_word[character_index + 1 :]
+                )
+                if (
+                    mutated_word in page_vocabulary
+                    or mutated_word in selected_mutated_words
+                ):
+                    continue
+                completed = replace(
+                    candidate,
+                    mutated_word=mutated_word,
+                    from_char=from_char,
+                    to_char=to_char,
+                    char_index_in_word=character_index,
+                )
+                break
+            if completed is not None:
+                break
+        if completed is None:
+            continue
+        selected.append(completed)
+        selected_words.add(completed.original_word)
+        selected_mutated_words.add(completed.mutated_word)
         if len(selected) >= requested:
             break
     if len(selected) < minimum:
@@ -409,7 +528,9 @@ def validate_mutated_word_geometry(
         mismatch = next(
             (
                 index
-                for index, (expected_word, actual_word) in enumerate(zip(expected, actual))
+                for index, (expected_word, actual_word) in enumerate(
+                    zip(expected, actual)
+                )
                 if expected_word != actual_word
             ),
             -1,
@@ -419,7 +540,10 @@ def validate_mutated_word_geometry(
             f"edited_word_sequence_mismatch:index={mismatch}",
             None,
         )
-    if any(clean.column != edited.column for clean, edited in zip(clean_words, edited_words)):
+    if any(
+        clean.column != edited.column
+        for clean, edited in zip(clean_words, edited_words)
+    ):
         return MutationValidation(False, "column_assignment_changed", None)
     maximum = max(
         (
@@ -451,6 +575,7 @@ __all__ = [
     "RenderedWord",
     "apply_page_mutations",
     "choose_page_mutations",
+    "choose_source_page_mutations",
     "markdown_diff_count",
     "validate_mutated_word_geometry",
 ]

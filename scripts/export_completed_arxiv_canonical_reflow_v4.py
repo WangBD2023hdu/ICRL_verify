@@ -23,7 +23,7 @@ from typing import Any
 SNAPSHOT_VERSION = "arxiv_canonical_reflow_v4_completed_snapshot_v2"
 # Kept explicit so this compile-free exporter remains standalone.  A later V4
 # producer version must be opted into with --accept-pipeline-version.
-PIPELINE_VERSION = "arxiv_canonical_reflow_v4_7"
+PIPELINE_VERSION = "arxiv_canonical_reflow_v4_8_direct_edit"
 
 _SFT_PROMPT = """<image>
 Please convert the image document into Markdown format, strictly adhering to the following requirements:
@@ -242,7 +242,11 @@ def _discover_confusable_terminals(
         for entry in entries:
             discovered += 1
             if "_confusable_s" in entry.name:
-                candidates.append(Path(entry.path) / "terminal_result.json")
+                page_dir = Path(entry.path)
+                terminal = page_dir / "terminal_result.json"
+                candidates.append(
+                    terminal if terminal.is_file() else page_dir / "result.json"
+                )
             now = time.monotonic()
             if discovered % progress_every == 0 or now - last_progress >= 30.0:
                 _emit(
@@ -420,7 +424,7 @@ def _parser() -> argparse.ArgumentParser:
         "--run-root",
         type=Path,
         required=True,
-        help="Existing V4 output root containing pages/*/terminal_result.json.",
+        help="Existing V4 output root containing accepted pages/*/result.json.",
     )
     parser.add_argument(
         "--output-dir",

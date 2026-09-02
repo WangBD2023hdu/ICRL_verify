@@ -15,6 +15,7 @@ def _write_terminal(
     variant: str = "confusable_edit",
     status: str = "accepted",
     with_image: bool = True,
+    result_name: str = "terminal_result.json",
 ) -> Path:
     page_dir = run_root / "pages" / page_id
     page_dir.mkdir(parents=True)
@@ -58,7 +59,7 @@ def _write_terminal(
         "max_mutation_vertical_shift_points": 0.0,
         "variant": variant,
     }
-    result_path = page_dir / "terminal_result.json"
+    result_path = page_dir / result_name
     result_path.write_text(json.dumps(payload), encoding="utf-8")
     return result_path
 
@@ -72,7 +73,7 @@ def test_exports_only_complete_confusable_pages_in_both_training_formats(
 ) -> None:
     run_root = tmp_path / "run"
     edited_id = "edited-page_confusable_s1_hash"
-    _write_terminal(run_root, edited_id)
+    _write_terminal(run_root, edited_id, result_name="result.json")
     _write_terminal(run_root, "clean-page", variant="clean")
     _write_terminal(
         run_root,

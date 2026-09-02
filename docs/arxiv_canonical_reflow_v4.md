@@ -27,15 +27,15 @@ It does **not** attempt to reproduce the paper's original page boundaries.
 - Rendered height comes from reject-only PDF bounding boxes. By default an
   accepted page must occupy at least 70% of the usable vertical area and the
   packer aims for 82%; two-column pages apply the threshold to both columns.
-- The default final dataset is edited-only. Each clean canonical page is used
-  as an intermediate proof target, then 3--4 ordinary-prose words receive one
-  lower-case, equal-length confusable-character substitution. Headings,
-  authors, superscripts, captions, tables, formulas, code, URLs, and numbers
-  are not mutated.
+- The default final dataset is edited-only and the default execution path never
+  compiles a clean page. Three or four ordinary-prose words receive one
+  lower-case, equal-length confusable-character substitution in the source AST
+  before compilation. Headings, authors, superscripts, captions, tables,
+  formulas, code, URLs, and numbers are not mutated.
 - Markdown, canonical LaTeX, and reject-only verifier text receive the same
-  substitutions. The edited page is recompiled and accepted only when the
-  complete word sequence differs exactly at those declared words, column
-  assignments are unchanged, and maximum vertical movement is at most 1.25pt.
+  substitutions. Only the edited page is compiled; its complete rendered text
+  and reading order must match the edited source-derived GT. Mutation boxes are
+  located from that edited render. No clean-PDF comparison is required.
 
 ## Local pilot
 
@@ -58,6 +58,7 @@ PYTHONPATH=src python scripts/experimental/build_arxiv_canonical_reflow_v4.py \
   --min-fill-ratio 0.70 \
   --two-column-rate 0.40 \
   --mutation-mode confusable \
+  --mutation-execution direct \
   --min-mutations-per-page 3 \
   --max-mutations-per-page 4
 ```
@@ -70,62 +71,87 @@ directly. `--crawler-root` accepts either the crawler root containing
 ```bash
 PYTHONPATH=src python scripts/experimental/build_arxiv_canonical_reflow_v4.py \
   --crawler-root /path/to/arxiv_sources/papers \
-  --crawler-cache-dir /path/to/work/arxiv_canonical_reflow_v4_unpack \
   --output-dir /path/to/output/arxiv_canonical_reflow_v4_confusable \
-  --paper-limit 0 \
-  --max-pages 0 \
-  --workers 128 \
-  --target-fill-ratio 0.82 \
-  --min-fill-ratio 0.70 \
-  --two-column-rate 0.40 \
-  --mutation-mode confusable
+  --target-count 40000
 ```
 
 Raw source archives are SHA-256 checked when the crawler supplied a digest,
 extracted with traversal/link/device and expanded-size protections, statically
-scanned, and atomically promoted into a resumable `metadata.json + source/`
-cache. A download does not need to be globally complete: only final non-empty
-`source_archive.bin` files are selected, and `.partial` files are ignored.
+scanned, and converted to immutable AST page candidates. Each temporary
+`metadata.json + source/` copy is deleted by the same worker immediately after
+AST extraction. A download does not need to be globally complete: only final
+non-empty `source_archive.bin` files are selected, and `.partial` files are
+ignored.
 
-`--workers` accepts 1--256. On a 128-core server, `--workers 128` applies to
-safe unpacking, source/AST extraction, clean-page compilation, and mutation
-recompilation. Every process stage uses a bounded queue of at most twice the
+The normal server command needs only input, output, and `--target-count`.
+The target is the number of accepted edited pages that have been durably
+appended to **both** the ms-swift and VERL JSONL files. A positive target also
+selects the full available input corpus, so `--full-corpus`, `--paper-limit`,
+and `--max-pages` are unnecessary. Every newly accepted sample refreshes one
+in-place progress bar. Once the target is reached, no new work is scheduled;
+any already-running worker output beyond the exact target is deleted.
+Mutation mode, direct-edit execution, 70% minimum fill, and CPU worker count are
+automatic defaults. `--work-dir` and `--crawler-cache-dir` remain optional
+advanced overrides. Temporary LaTeX source, PDFs, auxiliary files, compiler
+logs, and reject-only extracted text live outside `--output-dir` and are
+deleted as soon as their derived data is safe. The final dataset keeps only
+accepted PNGs, Markdown GT, compact result metadata, and training JSONL.
+
+Compact progress is the default. `--verbose` restores detailed stage logs.
+`--debug-artifacts` retains candidate manifests, rejected rows, per-paper
+reports, and the legacy aggregate export; omit it for production generation.
+
+`--workers` accepts 1--256 and defaults to all detected CPUs, capped at 128. On
+a 128-core server it applies to
+safe unpacking, source/AST extraction, and direct edited-page compilation.
+Every process stage uses a bounded queue of at most twice the
 worker count, so a large corpus does not enqueue every archive/page at once.
-The parent process prints per-unit aggregate progress and 30-second heartbeats
-with totals, bytes, throughput, elapsed time, ETA, and accepted/rejected/error
-counts. Existing prepared archives and page `result.json` files are reused only
-when their input fingerprints and output contracts match.
+The parent process rewrites a single compact status line for each completed
+source during preparation and each accepted sample during compilation, with a
+30-second heartbeat while workers are busy. Existing accepted page
+`result.json` files are reused only when their signatures and output contracts
+match.
 
-## Outputs
+## Production outputs
 
-- `manifest.jsonl`: page image, PDF, Markdown, layout, table flag, source node
-  IDs, actual content/column fill ratios, reject-only verifier metrics, and
-  complete mutation provenance.
-- `pairs.jsonl`: a compatibility alias of the final edited manifest.
-- `sft.jsonl`: ms-swift-style multimodal SFT rows.
-- `SFT_edited_<N>.jsonl`: V1-compatible `conversations` SFT rows.
-- `verl.jsonl`: VERL-style rows with rule ground truth and compact
+- `pages/<pair_id>/page.png`: accepted edited page image.
+- `pages/<pair_id>/ground_truth.md`: complete source-derived edited Markdown.
+- `pages/<pair_id>/result.json`: compact cache/signature and mutation metadata
+  required for safe resume; it is not a compiler artifact.
+- `realtime_training/sft.jsonl`: append-only ms-swift multimodal SFT data.
+- `realtime_training/verl.jsonl`: append-only VERL data with rule GT and
   `{ocr_ans, origin_ans, bbox}` mutation records.
-- `rejected_pages.jsonl`: terminal page rejections.
-- `clean_stage_results.jsonl`: audit-only clean-stage results; clean pages are
-  never included in the default final manifest/SFT/VERL datasets.
-- `pipeline_report.json`: strict page acceptance and scheduled source-block
-  yield, plus per-paper AST audits.
-- `crawler_prepare_results.jsonl` and `crawler_prepare_report.json`: raw-bin
-  materialization status, bytes, cache paths, failures, and resume state (only
-  when `--crawler-root` is used).
-- `pages/<pair_id>/`: complete GT, canonical TeX, PDF, PNG, logs, and result.
+- `realtime_training/progress.json`: atomic resumable row/job counts.
+- `run_summary.json`: small final status and target-count report.
 
-All exported image paths are relative to the output directory. There is no
-`server-root` path rewriting.
+Workers briefly create paired one-page files under
+`realtime_training/parts/` so an interruption cannot lose a newly accepted
+sample. The parent appends and flushes both aggregate rows, then immediately
+removes the pair; the directory is absent after a normal run. Rejected page
+directories,
+compiled PDFs, `.tex`, logs, auxiliary files, unpacked sources, and intermediate
+candidate manifests are not retained. Original crawler `source_archive.bin`
+files are never modified.
+
+Image paths inside each training JSONL are relative to that JSONL's parent
+directory, as required by the dataset reader. There is no `server-root` path
+rewriting.
+
+With `--debug-artifacts`, the program additionally writes `manifest.jsonl`,
+`pairs.jsonl`, top-level SFT/VERL compatibility files, rejected/clean-stage
+rows, candidate/job lists, crawler preparation reports, and
+`pipeline_report.json`.
 
 ## Export a snapshot before the main run finishes
 
-The compile-free snapshot exporter first filters page-directory names to the
+Production runs already update the two final training JSONL files after every
+accepted sample, so no snapshot export is required. For an older/debug run,
+the compile-free snapshot exporter first filters page-directory names to the
 V4 `_confusable_s` suffix, so it does not open clean-page results. It can run
 while the main V4 job is still active. The only export checks are that the
 producer marked the confusable page accepted, its image exists, and the
-Markdown in `terminal_result.json` exactly matches `ground_truth.md`. It does
+Markdown in `result.json` (or legacy `terminal_result.json`) exactly matches
+`ground_truth.md`. It does
 not reopen PDFs or revalidate mutation geometry. The producer's
 `{ocr_ans, origin_ans, bbox}` records are retained in VERL `extra_info.changes`.
 
