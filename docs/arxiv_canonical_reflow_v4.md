@@ -118,3 +118,26 @@ when their input fingerprints and output contracts match.
 
 All exported image paths are relative to the output directory. There is no
 `server-root` path rewriting.
+
+## Export a snapshot before the main run finishes
+
+The compile-free snapshot exporter reads only authoritative, atomically written
+`pages/*/terminal_result.json` files. It therefore can run while the main V4
+job is still active. Only accepted `confusable_edit` pages with matching GT,
+PNG/PDF artifacts, mutation counts, and in-image mutation boxes are exported;
+clean, rejected, incomplete, or malformed pages are skipped and audited.
+
+```bash
+python scripts/export_completed_arxiv_canonical_reflow_v4.py \
+  --run-root /path/to/output/arxiv_canonical_reflow_v4_confusable \
+  --workers 128
+```
+
+The default snapshot directory is
+`<run-root>/completed_training_data/`. It contains `manifest.jsonl`,
+`pairs.jsonl`, ms-swift `sft.jsonl`, V1-compatible SFT files, `verl.jsonl`,
+`skipped_terminal_results.jsonl`, and `completed_export_report.json`. Image and
+PDF paths are relative to the snapshot JSONL directory and continue to point
+at the existing `<run-root>/pages/` artifacts. Re-running the command replaces
+each snapshot file atomically with all pages completed at that time; it does not
+compile, mutate, or modify any page artifact.
