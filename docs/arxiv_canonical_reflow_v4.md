@@ -121,23 +121,25 @@ All exported image paths are relative to the output directory. There is no
 
 ## Export a snapshot before the main run finishes
 
-The compile-free snapshot exporter reads only authoritative, atomically written
-`pages/*/terminal_result.json` files. It therefore can run while the main V4
-job is still active. Only accepted `confusable_edit` pages with matching GT,
-PNG/PDF artifacts, mutation counts, and in-image mutation boxes are exported;
-clean, rejected, incomplete, or malformed pages are skipped and audited.
+The compile-free snapshot exporter first filters page-directory names to the
+V4 `_confusable_s` suffix, so it does not open clean-page results. It can run
+while the main V4 job is still active. The only export checks are that the
+producer marked the confusable page accepted, its image exists, and the
+Markdown in `terminal_result.json` exactly matches `ground_truth.md`. It does
+not reopen PDFs or revalidate mutation geometry. The producer's
+`{ocr_ans, origin_ans, bbox}` records are retained in VERL `extra_info.changes`.
 
 ```bash
 python scripts/export_completed_arxiv_canonical_reflow_v4.py \
   --run-root /path/to/output/arxiv_canonical_reflow_v4_confusable \
-  --workers 128
+  --workers 16
 ```
 
 The default snapshot directory is
-`<run-root>/completed_training_data/`. It contains `manifest.jsonl`,
-`pairs.jsonl`, ms-swift `sft.jsonl`, V1-compatible SFT files, `verl.jsonl`,
-`skipped_terminal_results.jsonl`, and `completed_export_report.json`. Image and
-PDF paths are relative to the snapshot JSONL directory and continue to point
-at the existing `<run-root>/pages/` artifacts. Re-running the command replaces
-each snapshot file atomically with all pages completed at that time; it does not
-compile, mutate, or modify any page artifact.
+`<run-root>/completed_training_data/`. It contains only ms-swift `sft.jsonl`,
+`verl.jsonl`, and `completed_export_report.json`. Image paths are relative to
+the snapshot JSONL directory and continue to point at the existing
+`<run-root>/pages/` artifacts. Both training files are written together in one
+streaming pass. Re-running the command replaces each file atomically with all
+pages completed at that time; it does not compile, mutate, or modify any page
+artifact.
