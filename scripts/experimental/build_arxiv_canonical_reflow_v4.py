@@ -24,7 +24,7 @@ import subprocess
 import sys
 import time
 import xml.etree.ElementTree as ET
-from collections import Counter
+from collections import Counter, deque
 from collections.abc import Iterable, Sequence
 from concurrent.futures import FIRST_COMPLETED, ProcessPoolExecutor, wait
 from dataclasses import asdict, dataclass, replace
@@ -124,6 +124,7 @@ class WorkerConfig:
     min_fill_ratio: float
     work_dir: str | None = None
     minimal_output: bool = True
+    stop_file: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -1645,6 +1646,8 @@ def _compile_with_rescue(
     start = 0
     output_ordinal = 1
     while start < len(bundles):
+        if config.stop_file is not None and Path(config.stop_file).is_file():
+            break
         terminal_start = len(terminal)
         attempt_results: list[WorkerResult] = []
         end = _initial_bundle_end(
@@ -2519,6 +2522,54 @@ def _dense_jobs_from_pages(
     return tuple(jobs)
 
 
+def _bounded_dense_jobs_from_pages(
+    pages: Sequence[CanonicalPage],
+    *,
+    pages_per_job: int = 4,
+) -> tuple[CanonicalPage, ...]:
+    """Create bounded paper-local source pools for responsive parallelism.
+
+    The legacy path combines an entire paper into one compile future.  Long
+    papers then serialize dozens of edited pages inside one process and delay
+    parent-side dataset admission.  The fused pipeline retains source order
+    but groups only a few extracted page candidates per compile job.
+    """
+
+    if pages_per_job < 1:
+        raise ValueError("pages_per_job must be positive")
+    by_paper: dict[str, list[CanonicalPage]] = {}
+    for page in pages:
+        by_paper.setdefault(page.paper_id, []).append(page)
+    jobs: list[CanonicalPage] = []
+    for paper_id in sorted(by_paper):
+        selected_pages = sorted(by_paper[paper_id], key=lambda item: item.ordinal)
+        for offset in range(0, len(selected_pages), pages_per_job):
+            chunk = selected_pages[offset : offset + pages_per_job]
+            seen: set[str] = set()
+            blocks: list[CanonicalBlock] = []
+            for selected in chunk:
+                for block in selected.blocks:
+                    if block.block_id in seen:
+                        continue
+                    seen.add(block.block_id)
+                    blocks.append(block)
+            if not blocks:
+                continue
+            first_ordinal = chunk[0].ordinal
+            jobs.append(
+                CanonicalPage(
+                    page_id=(
+                        f"{paper_id}_dense_source_pool_{first_ordinal:04d}"
+                    ),
+                    paper_id=paper_id,
+                    ordinal=first_ordinal,
+                    layout="one_column",
+                    blocks=tuple(blocks),
+                )
+            )
+    return tuple(jobs)
+
+
 def _relative_output_path(value: str | None, output: Path) -> str | None:
     if value is None:
         return None
@@ -2656,6 +2707,17 @@ class _RealtimeTrainingWriter:
             verl = self._read_part(verl_path, pair_id)
             if sft is None or verl is None:
                 continue
+            if (
+                pair_id not in self.complete_ids
+                and self.target_count > 0
+                and len(self.complete_ids) >= self.target_count
+            ):
+                sft_path.unlink(missing_ok=True)
+                verl_path.unlink(missing_ok=True)
+                page_dir = self.dataset_dir.parent / "pages" / pair_id
+                if page_dir.is_dir():
+                    shutil.rmtree(page_dir)
+                continue
             if pair_id not in self.sft_ids:
                 self._append_row(self.sft_handle, sft)
                 self.sft_ids.add(pair_id)
@@ -2670,6 +2732,13 @@ class _RealtimeTrainingWriter:
             self.parts_dir.rmdir()
         except (FileNotFoundError, OSError):
             pass
+
+    def recover_parts(self) -> set[str]:
+        """Admit worker-written pairs before their whole compile job returns."""
+
+        before = self.complete_ids
+        self._recover_parts()
+        return self.complete_ids - before
 
     def _remove_parts(self, pair_id: str) -> None:
         for suffix in (".sft.jsonl", ".verl.jsonl"):
@@ -2769,6 +2838,521 @@ def _admit_direct_result(
         raise PipelineError(f"realtime pair was not committed: {result.page_id}")
     accepted_ids.add(result.page_id)
     return "admitted"
+
+
+def _run_fused_crawler_direct_pipeline(
+    archives: Sequence[CrawlerArchive],
+    *,
+    cache_root: Path,
+    output: Path,
+    work_root: Path,
+    config: WorkerConfig,
+    mutation_config: MutationConfig,
+    target_count: int,
+    workers: int,
+    target_weight: int,
+    two_column_rate: float,
+    input_root: Path,
+    debug_artifacts: bool,
+    started: float,
+) -> int:
+    """Overlap parallel source extraction and edited-page compilation.
+
+    One bounded process pool is shared by both task types.  Source tasks feed
+    paper-local dense compile jobs as soon as their AST extraction completes;
+    there is no corpus-wide extraction barrier.  A small source lane keeps new
+    work flowing while compilation receives most processes.  Backpressure
+    bounds the in-memory compile queue.
+    """
+
+    total_sources = len(archives)
+    total_input_bytes = sum(archive.input_bytes for archive in archives)
+    source_lane = max(1, min(16, workers // 8 or 1))
+    max_compile_backlog = max(2, workers * 2)
+    source_index = 0
+    source_completed = source_prepared = source_rejected = 0
+    preparation_errors = extraction_successes = extraction_errors = 0
+    completed_input_bytes = expanded_bytes = 0
+    cache_deleted = cache_cleanup_errors = 0
+    candidate_pages = available_jobs = completed_jobs = 0
+    stage_rejected = discarded_overrun = 0
+    cancelled_jobs = cancelled_sources = 0
+    stage_results: list[WorkerResult] = []
+    reports: list[dict[str, Any]] = []
+    preparation_rows: list[dict[str, Any]] = []
+    compile_backlog: deque[CanonicalPage] = deque()
+    stop_file = Path(config.stop_file) if config.stop_file is not None else None
+    if stop_file is not None:
+        stop_file.unlink(missing_ok=True)
+    realtime_writer = _RealtimeTrainingWriter(output, target_count=target_count)
+    accepted_ids = set(realtime_writer.complete_ids)
+    initial_accepted = len(accepted_ids)
+    if target_count > 0 and initial_accepted > target_count:
+        realtime_writer.close()
+        raise SystemExit(
+            "output already contains "
+            f"{initial_accepted} complete samples, which exceeds "
+            f"--target-count={target_count}; use a new output directory"
+        )
+    target_progress = _TargetProgress(target_count, initial=initial_accepted)
+    target_progress.update(
+        accepted=initial_accepted,
+        rejected=stage_rejected,
+        force=True,
+    )
+    last_heartbeat = time.monotonic()
+
+    def target_open() -> bool:
+        return target_count == 0 or len(accepted_ids) < target_count
+
+    def remaining_target_jobs() -> int:
+        if target_count == 0:
+            return workers
+        return max(0, target_count - len(accepted_ids))
+
+    def count_pending(
+        pending: dict[Any, tuple[str, CrawlerArchive | CanonicalPage]],
+        kind: str,
+    ) -> int:
+        return sum(task_kind == kind for task_kind, _ in pending.values())
+
+    def submit_source(
+        executor: ProcessPoolExecutor,
+        pending: dict[Any, tuple[str, CrawlerArchive | CanonicalPage]],
+    ) -> bool:
+        nonlocal source_index
+        if source_index >= total_sources or not target_open():
+            return False
+        archive = archives[source_index]
+        source_index += 1
+        future = executor.submit(
+            _prepare_extract_crawler_job,
+            archive,
+            cache_root,
+            target_weight,
+            two_column_rate,
+        )
+        pending[future] = ("source", archive)
+        return True
+
+    def submit_compile(
+        executor: ProcessPoolExecutor,
+        pending: dict[Any, tuple[str, CrawlerArchive | CanonicalPage]],
+    ) -> bool:
+        if not compile_backlog or not target_open():
+            return False
+        job = compile_backlog.popleft()
+        future = executor.submit(
+            _compile_with_rescue,
+            job,
+            config,
+            mutation_config=mutation_config,
+        )
+        pending[future] = ("compile", job)
+        return True
+
+    def fill_worker_slots(
+        executor: ProcessPoolExecutor,
+        pending: dict[Any, tuple[str, CrawlerArchive | CanonicalPage]],
+    ) -> None:
+        if not target_open():
+            return
+        source_pending = count_pending(pending, "source")
+        compile_pending = count_pending(pending, "compile")
+        sources_remain = source_index < total_sources
+        # Stop feeding source extraction temporarily when compilation is the
+        # bottleneck.  This caps deserialized AST pages held by the parent.
+        active_source_lane = (
+            source_lane
+            if sources_remain and len(compile_backlog) < max_compile_backlog
+            else 0
+        )
+        compile_capacity = workers if not sources_remain else max(
+            1, workers - active_source_lane
+        )
+        compile_capacity = min(compile_capacity, remaining_target_jobs())
+        while (
+            compile_backlog
+            and compile_pending < compile_capacity
+            and len(pending) < workers
+            and submit_compile(executor, pending)
+        ):
+            compile_pending += 1
+
+        if not sources_remain or len(compile_backlog) >= max_compile_backlog:
+            return
+        # Before the first extract result exists, use every process to prepare
+        # sources.  Once compile work exists, retain only the small source lane.
+        desired_sources = (
+            active_source_lane
+            if compile_pending or compile_backlog
+            else workers - compile_pending
+        )
+        while (
+            source_pending < desired_sources
+            and len(pending) < workers
+            and submit_source(executor, pending)
+        ):
+            source_pending += 1
+
+    def cancel_unneeded(
+        pending: dict[Any, tuple[str, CrawlerArchive | CanonicalPage]],
+    ) -> None:
+        nonlocal cancelled_jobs, cancelled_sources
+        if stop_file is not None and not stop_file.is_file():
+            _atomic_text(stop_file, "target reached\n")
+        compile_backlog.clear()
+        for future, (kind, _) in list(pending.items()):
+            if not future.cancel():
+                continue
+            pending.pop(future)
+            if kind == "compile":
+                cancelled_jobs += 1
+            else:
+                cancelled_sources += 1
+
+    _emit(
+        "fused-start",
+        f"sources={total_sources} workers={workers} source_lane={source_lane} "
+        f"compile_lane={max(1, workers - source_lane)} "
+        f"max_compile_backlog={max_compile_backlog} target={target_count or 'all'}",
+    )
+    pending: dict[Any, tuple[str, CrawlerArchive | CanonicalPage]] = {}
+    try:
+        if target_open() and total_sources:
+            with ProcessPoolExecutor(max_workers=workers) as executor:
+                fill_worker_slots(executor, pending)
+                while pending or compile_backlog or (
+                    source_index < total_sources and target_open()
+                ):
+                    if not pending:
+                        fill_worker_slots(executor, pending)
+                        if not pending:
+                            break
+                    done, _ = wait(
+                        pending,
+                        timeout=2,
+                        return_when=FIRST_COMPLETED,
+                    )
+                    recovered = realtime_writer.recover_parts()
+                    if recovered:
+                        accepted_ids.update(recovered)
+                        target_progress.update(
+                            accepted=len(accepted_ids),
+                            rejected=stage_rejected,
+                        )
+                    if not target_open():
+                        cancel_unneeded(pending)
+                    if not done:
+                        now = time.monotonic()
+                        if now - last_heartbeat >= 30:
+                            target_progress.update(
+                                accepted=len(accepted_ids),
+                                rejected=stage_rejected,
+                                force=True,
+                            )
+                            realtime_writer.checkpoint(
+                                completed_jobs=completed_jobs,
+                                total_jobs=available_jobs,
+                                accepted=len(accepted_ids),
+                                rejected=stage_rejected,
+                                started=started,
+                            )
+                            _emit(
+                                "fused-progress",
+                                f"sources={source_completed}/{total_sources} "
+                                f"source_pending={count_pending(pending, 'source')} "
+                                f"compile_completed={completed_jobs}/{available_jobs} "
+                                f"compile_pending={count_pending(pending, 'compile')} "
+                                f"compile_backlog={len(compile_backlog)} "
+                                f"accepted={len(accepted_ids)} "
+                                f"rejected={stage_rejected} "
+                                f"elapsed={time.monotonic() - started:.1f}s",
+                            )
+                            last_heartbeat = now
+                        continue
+
+                    ordered_done = sorted(
+                        done,
+                        key=lambda future: (
+                            pending[future][0],
+                            pending[future][1].paper_id,
+                        ),
+                    )
+                    for future in ordered_done:
+                        kind, item = pending.pop(future)
+                        if kind == "source":
+                            archive = item
+                            assert isinstance(archive, CrawlerArchive)
+                            try:
+                                paper_pages, extraction_report, preparation = (
+                                    future.result()
+                                )
+                            except Exception as error:  # noqa: BLE001
+                                paper_pages = ()
+                                extraction_report = None
+                                preparation = {
+                                    "paper_id": archive.paper_id,
+                                    "status": "failed",
+                                    "paper_dir": None,
+                                    "archive": archive.archive,
+                                    "input_bytes": archive.input_bytes,
+                                    "error": (
+                                        "worker_error:"
+                                        f"{type(error).__name__}:{error}"
+                                    ),
+                                    "cache_cleanup": "unknown_after_worker_error",
+                                    "elapsed_seconds": 0.0,
+                                }
+                            source_completed += 1
+                            completed_input_bytes += archive.input_bytes
+                            expanded_bytes += int(
+                                preparation.get("expanded_bytes", 0)
+                            )
+                            source_prepared += preparation.get("status") == "prepared"
+                            source_rejected += preparation.get("status") == "rejected"
+                            preparation_errors += (
+                                preparation.get("status") == "failed"
+                            )
+                            cache_deleted += preparation.get("cache_cleanup") in {
+                                "deleted",
+                                "already_absent",
+                            }
+                            cache_cleanup_errors += (
+                                preparation.get("cache_cleanup") == "failed"
+                            )
+                            if extraction_report is not None:
+                                extraction_successes += (
+                                    extraction_report.get("status") == "success"
+                                )
+                                extraction_errors += (
+                                    extraction_report.get("status") != "success"
+                                )
+                                if debug_artifacts:
+                                    reports.append(extraction_report)
+                            if debug_artifacts:
+                                preparation_rows.append(preparation)
+                            candidate_pages += len(paper_pages)
+                            new_jobs = (
+                                _bounded_dense_jobs_from_pages(paper_pages)
+                                if target_open()
+                                else ()
+                            )
+                            available_jobs += len(new_jobs)
+                            compile_backlog.extend(new_jobs)
+                            _emit(
+                                "fused-source-unit",
+                                f"completed={source_completed}/{total_sources} "
+                                f"current={archive.paper_id} "
+                                f"status={preparation.get('status')} "
+                                f"candidates={len(paper_pages)} jobs={len(new_jobs)} "
+                                f"compile_backlog={len(compile_backlog)} "
+                                f"accepted={len(accepted_ids)} "
+                                f"errors={preparation_errors + extraction_errors}",
+                            )
+                            continue
+
+                        job = item
+                        assert isinstance(job, CanonicalPage)
+                        try:
+                            rows = future.result()
+                        except Exception as error:  # noqa: BLE001
+                            failed = WorkerResult(
+                                page_id=_mutation_page_id(
+                                    job.page_id, mutation_config
+                                ),
+                                paper_id=job.paper_id,
+                                status="rejected",
+                                reason=(
+                                    "worker_error:"
+                                    f"{type(error).__name__}:{error}"
+                                ),
+                                layout=job.layout,
+                                has_table=job.has_table,
+                                markdown=job.markdown,
+                                verifier_recall=None,
+                                verifier_precision=None,
+                                pdf=None,
+                                image=None,
+                                block_ids=tuple(
+                                    block.block_id for block in job.blocks
+                                ),
+                                source_node_ids=tuple(
+                                    block.node_id for block in job.blocks
+                                ),
+                                content_fill_ratio=None,
+                                column_fill_ratios=(),
+                                page_signature=None,
+                                elapsed_seconds=0.0,
+                                variant="confusable_edit",
+                            )
+                            _persist_terminal_result(failed, config)
+                            rows = (failed,)
+                        completed_jobs += 1
+                        for row in rows:
+                            if row.status != "accepted":
+                                stage_rejected += 1
+                                if debug_artifacts:
+                                    stage_results.append(row)
+                                continue
+                            admission = _admit_direct_result(
+                                row,
+                                writer=realtime_writer,
+                                accepted_ids=accepted_ids,
+                                target_count=target_count,
+                                output=output,
+                            )
+                            if admission == "overrun":
+                                discarded_overrun += 1
+                            elif admission == "admitted":
+                                if debug_artifacts:
+                                    stage_results.append(row)
+                                target_progress.update(
+                                    accepted=len(accepted_ids),
+                                    rejected=stage_rejected,
+                                )
+                        realtime_writer.checkpoint(
+                            completed_jobs=completed_jobs,
+                            total_jobs=available_jobs,
+                            accepted=len(accepted_ids),
+                            rejected=stage_rejected,
+                            started=started,
+                        )
+                        _emit(
+                            "fused-compile-unit",
+                            f"completed={completed_jobs}/{available_jobs} "
+                            f"current={job.page_id} terminal_pages={len(rows)} "
+                            f"accepted={len(accepted_ids)} rejected={stage_rejected} "
+                            f"compile_backlog={len(compile_backlog)}",
+                        )
+
+                    if not target_open():
+                        cancel_unneeded(pending)
+                    fill_worker_slots(executor, pending)
+    finally:
+        accepted_ids.update(realtime_writer.recover_parts())
+        target_progress.finish(
+            accepted=len(accepted_ids),
+            rejected=stage_rejected,
+        )
+        realtime_writer.checkpoint(
+            completed_jobs=completed_jobs,
+            total_jobs=available_jobs,
+            accepted=len(accepted_ids),
+            rejected=stage_rejected,
+            started=started,
+        )
+        realtime_writer.close()
+        if stop_file is not None:
+            stop_file.unlink(missing_ok=True)
+        if config.work_dir is not None:
+            compile_work = Path(config.work_dir)
+            try:
+                if compile_work.exists():
+                    shutil.rmtree(compile_work)
+            except OSError as error:
+                _emit(
+                    "compile-cleanup",
+                    f"status=warning path={compile_work} "
+                    f"error={type(error).__name__}:{error}",
+                )
+        for empty_directory in (
+            cache_root / "jobs",
+            cache_root,
+            work_root,
+        ):
+            try:
+                empty_directory.rmdir()
+            except (FileNotFoundError, OSError):
+                pass
+
+    input_report = {
+        "mode": "crawler_archives",
+        "processing_mode": "concurrent_source_extract_and_direct_edit_compile",
+        "input_root": str(input_root),
+        "papers_selected": total_sources,
+        "crawler_archives_selected": total_sources,
+        "crawler_archives_completed": source_completed,
+        "crawler_archives_prepared": source_prepared,
+        "crawler_archives_rejected": source_rejected,
+        "crawler_archives_failed": preparation_errors,
+        "crawler_extraction_succeeded": extraction_successes,
+        "crawler_extraction_failed": extraction_errors,
+        "crawler_input_bytes": total_input_bytes,
+        "crawler_completed_bytes": completed_input_bytes,
+        "crawler_expanded_bytes": expanded_bytes,
+        "crawler_cache_root": str(cache_root),
+        "crawler_cache_policy": "delete_each_paper_after_ast_extraction",
+        "crawler_cache_dirs_deleted": cache_deleted,
+        "crawler_cache_cleanup_errors": cache_cleanup_errors,
+        "workers": workers,
+        "source_lane": source_lane,
+        "candidate_pages": candidate_pages,
+        "compile_jobs_discovered": available_jobs,
+        "elapsed_seconds": time.monotonic() - started,
+    }
+    if debug_artifacts:
+        _atomic_jsonl(output / "crawler_prepare_results.jsonl", preparation_rows)
+        _atomic_json(output / "crawler_prepare_report.json", input_report)
+        _export(
+            output,
+            stage_results,
+            sorted(reports, key=lambda row: str(row.get("paper_id", ""))),
+            started,
+            config,
+            clean_results=(),
+            mutation_config=mutation_config,
+            mutation_execution="direct",
+            input_report=input_report,
+        )
+
+    accepted = len(accepted_ids)
+    target_reached = target_count > 0 and accepted >= target_count
+    elapsed = time.monotonic() - started
+    if not debug_artifacts:
+        _atomic_json(
+            output / "run_summary.json",
+            {
+                "pipeline_version": PIPELINE_VERSION,
+                "status": (
+                    "target_reached"
+                    if target_reached
+                    else "source_exhausted"
+                    if target_count > 0
+                    else "completed"
+                ),
+                "processing_mode": input_report["processing_mode"],
+                "target_count": target_count,
+                "accepted_count": accepted,
+                "accepted_before_run": initial_accepted,
+                "accepted_added_this_run": accepted - initial_accepted,
+                "rejected_count_this_run": stage_rejected,
+                "discarded_concurrent_overrun": discarded_overrun,
+                "cancelled_jobs": cancelled_jobs,
+                "cancelled_source_tasks": cancelled_sources,
+                "completed_jobs": completed_jobs,
+                "available_jobs": available_jobs,
+                "clean_pages_generated": 0,
+                "final_dataset_variant": "confusable_edited_only",
+                "sft": "realtime_training/sft.jsonl",
+                "verl": "realtime_training/verl.jsonl",
+                "pages": "pages",
+                "input_mode": "crawler_archives",
+                "papers_selected": total_sources,
+                "papers_completed": source_completed,
+                "papers_prepared": source_prepared,
+                "source_lane": source_lane,
+                "elapsed_seconds": elapsed,
+            },
+        )
+    _emit(
+        "finish",
+        f"accepted={accepted} target={target_count or 'all'} "
+        f"rejected={stage_rejected} sources={source_completed}/{total_sources} "
+        f"compile_jobs={completed_jobs}/{available_jobs} elapsed={elapsed:.1f}s "
+        f"output={output}",
+    )
+    return 0
 
 
 def _export(
@@ -3204,6 +3788,66 @@ def main(argv: Sequence[str] | None = None) -> int:
         f"mutations={args.min_mutations_per_page}-{args.max_mutations_per_page} "
         f"input={input_root} output={output} work_dir={work_root}",
     )
+    mutation_config = (
+        MutationConfig(
+            seed=mutation_seed,
+            minimum_per_page=args.min_mutations_per_page,
+            maximum_per_page=args.max_mutations_per_page,
+            maximum_probability=args.four_mutation_probability,
+            max_vertical_shift_points=args.max_mutation_vertical_shift_points,
+        )
+        if args.mutation_mode == "confusable"
+        else None
+    )
+    direct_edit = mutation_config is not None and args.mutation_execution == "direct"
+    config = WorkerConfig(
+        output_dir=str(output),
+        latexmk=str(Path(args.latexmk).expanduser().resolve()),
+        pdftoppm=str(Path(args.pdftoppm).expanduser().resolve()),
+        pdftotext=str(Path(args.pdftotext).expanduser().resolve()),
+        pdfinfo=str(Path(args.pdfinfo).expanduser().resolve()),
+        compile_timeout=args.compile_timeout,
+        render_timeout=args.render_timeout,
+        dpi=args.dpi,
+        max_pack_attempts=args.max_pack_attempts,
+        min_page_chars=args.min_page_chars,
+        target_weight=args.target_weight,
+        two_column_rate=args.two_column_rate,
+        target_fill_ratio=args.target_fill_ratio,
+        min_fill_ratio=args.min_fill_ratio,
+        work_dir=str(work_root / "compile") if direct_edit else None,
+        minimal_output=direct_edit and not args.debug_artifacts,
+        stop_file=(
+            str(output / "realtime_training" / ".target_reached")
+            if args.crawler_root is not None
+            and direct_edit
+            and args.target_count > 0
+            else None
+        ),
+    )
+    if args.crawler_root is not None and direct_edit and args.target_count > 0:
+        cache_root = (
+            args.crawler_cache_dir.expanduser().resolve()
+            if args.crawler_cache_dir is not None
+            else work_root / "crawler_cache"
+        )
+        cache_root.mkdir(parents=True, exist_ok=True)
+        assert mutation_config is not None
+        return _run_fused_crawler_direct_pipeline(
+            archives,
+            cache_root=cache_root,
+            output=output,
+            work_root=work_root,
+            config=config,
+            mutation_config=mutation_config,
+            target_count=args.target_count,
+            workers=args.workers,
+            target_weight=args.target_weight,
+            two_column_rate=args.two_column_rate,
+            input_root=input_root,
+            debug_artifacts=args.debug_artifacts,
+            started=started,
+        )
     if args.crawler_root is not None:
         cache_root = (
             args.crawler_cache_dir.expanduser().resolve()
@@ -3255,18 +3899,6 @@ def main(argv: Sequence[str] | None = None) -> int:
         papers_prepared = len(papers)
     pages = _limit_page_candidates(pages, limit=max_pages, seed=args.seed)
     dense_jobs = _dense_jobs_from_pages(pages)
-    mutation_config = (
-        MutationConfig(
-            seed=mutation_seed,
-            minimum_per_page=args.min_mutations_per_page,
-            maximum_per_page=args.max_mutations_per_page,
-            maximum_probability=args.four_mutation_probability,
-            max_vertical_shift_points=args.max_mutation_vertical_shift_points,
-        )
-        if args.mutation_mode == "confusable"
-        else None
-    )
-    direct_edit = mutation_config is not None and args.mutation_execution == "direct"
     if args.debug_artifacts:
         _atomic_jsonl(
             output / "page_candidates.jsonl",
@@ -3301,24 +3933,6 @@ def main(argv: Sequence[str] | None = None) -> int:
         f"{sum(len(job.blocks) for job in dense_jobs)} "
         f"extraction_errors={extraction_errors} "
         f"execution={'direct_edit' if direct_edit else 'clean'}",
-    )
-    config = WorkerConfig(
-        output_dir=str(output),
-        latexmk=str(Path(args.latexmk).expanduser().resolve()),
-        pdftoppm=str(Path(args.pdftoppm).expanduser().resolve()),
-        pdftotext=str(Path(args.pdftotext).expanduser().resolve()),
-        pdfinfo=str(Path(args.pdfinfo).expanduser().resolve()),
-        compile_timeout=args.compile_timeout,
-        render_timeout=args.render_timeout,
-        dpi=args.dpi,
-        max_pack_attempts=args.max_pack_attempts,
-        min_page_chars=args.min_page_chars,
-        target_weight=args.target_weight,
-        two_column_rate=args.two_column_rate,
-        target_fill_ratio=args.target_fill_ratio,
-        min_fill_ratio=args.min_fill_ratio,
-        work_dir=str(work_root / "compile") if direct_edit else None,
-        minimal_output=direct_edit and not args.debug_artifacts,
     )
     stage_results: list[WorkerResult] = []
     stage_rejected = completed = discarded_overrun = cancelled_jobs = 0

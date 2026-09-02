@@ -23,7 +23,7 @@ from typing import Any
 SNAPSHOT_VERSION = "arxiv_canonical_reflow_v4_completed_snapshot_v2"
 # Kept explicit so this compile-free exporter remains standalone.  A later V4
 # producer version must be opted into with --accept-pipeline-version.
-PIPELINE_VERSION = "arxiv_canonical_reflow_v4_8_direct_edit"
+PIPELINE_VERSION = "arxiv_canonical_reflow_v4_9_fused_parallel"
 
 _SFT_PROMPT = """<image>
 Please convert the image document into Markdown format, strictly adhering to the following requirements:

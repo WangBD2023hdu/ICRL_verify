@@ -486,6 +486,28 @@ def test_target_admission_keeps_exact_count_and_deletes_concurrent_overrun(
     )
 
 
+def test_realtime_part_recovery_honors_exact_target_and_deletes_overrun(
+    tmp_path,
+) -> None:
+    output = tmp_path / "dataset"
+    rows = [_accepted_edit_result(output, f"edited-{index}") for index in range(1, 4)]
+    for row in rows:
+        builder._persist_terminal_result(row, _worker_config(output))
+
+    writer = builder._RealtimeTrainingWriter(output, target_count=2)
+    assert writer.complete_ids == {"edited-1", "edited-2"}
+    writer.close()
+
+    assert not (output / "pages" / "edited-3").exists()
+    assert not (output / "realtime_training" / "parts").exists()
+    assert (
+        len((output / "realtime_training" / "sft.jsonl").read_text().splitlines()) == 2
+    )
+    assert (
+        len((output / "realtime_training" / "verl.jsonl").read_text().splitlines()) == 2
+    )
+
+
 def test_minimal_rejected_edit_leaves_no_page_directory(tmp_path) -> None:
     output = tmp_path / "dataset"
     page_dir = output / "pages" / "rejected-edit"

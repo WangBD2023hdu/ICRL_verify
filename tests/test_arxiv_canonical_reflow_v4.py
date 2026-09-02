@@ -156,6 +156,25 @@ def test_bundle_blocks_keeps_heading_caption_and_table_together() -> None:
     assert pages[0].layout == "one_column"
 
 
+def test_bounded_dense_jobs_split_long_paper_without_losing_blocks() -> None:
+    pages = tuple(
+        CanonicalPage(
+            page_id=f"candidate_{index}",
+            paper_id="paper",
+            ordinal=index,
+            layout="one_column",
+            blocks=(_block(index),),
+        )
+        for index in range(9)
+    )
+    jobs = builder._bounded_dense_jobs_from_pages(pages, pages_per_job=4)
+    assert [len(job.blocks) for job in jobs] == [4, 4, 1]
+    assert [job.ordinal for job in jobs] == [0, 4, 8]
+    assert [block.block_id for job in jobs for block in job.blocks] == [
+        f"b{index}" for index in range(9)
+    ]
+
+
 def test_bbox_parser_reports_bottom_fill_and_two_column_minimum() -> None:
     xml = """<doc><page width="612" height="792"><flow><block>
       <line xMin="55" yMin="60" xMax="580" yMax="650"><word xMin="55" yMin="60" xMax="75" yMax="70">Left</word></line>
@@ -428,6 +447,183 @@ def test_crawler_discovery_accepts_completed_archive_not_yet_in_results(
     assert {item.paper_id for item in discovered} == {"listed", "unlisted"}
 
 
+def test_target_crawler_pipeline_submits_compile_before_all_sources_finish(
+    monkeypatch,
+    tmp_path,
+) -> None:
+    events: list[str] = []
+
+    class LazyFuture:
+        def __init__(self, kind, fn, args, kwargs):
+            self.kind = kind
+            self.fn = fn
+            self.args = args
+            self.kwargs = kwargs
+            self.cancelled = False
+
+        def result(self):
+            events.append(f"run_{self.kind}")
+            return self.fn(*self.args, **self.kwargs)
+
+        def cancel(self):
+            self.cancelled = True
+            return True
+
+    class FakeExecutor:
+        def __init__(self, max_workers):
+            assert max_workers == 2
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return False
+
+        def submit(self, fn, *args, **kwargs):
+            kind = (
+                "source"
+                if fn is builder._prepare_extract_crawler_job
+                else "compile"
+            )
+            events.append(f"submit_{kind}")
+            return LazyFuture(kind, fn, args, kwargs)
+
+    def fake_wait(futures, **_kwargs):
+        active = [future for future in futures if not future.cancelled]
+        # Once compilation is available, finish it before the remaining
+        # source task.  This proves that the scheduler overlaps both stages
+        # instead of waiting for the full source corpus.
+        chosen = next(
+            (future for future in active if future.kind == "compile"),
+            active[0],
+        )
+        return {chosen}, set(active) - {chosen}
+
+    def fake_extract(archive, *_args):
+        page = builder.CanonicalPage(
+            page_id=f"{archive.paper_id}_candidate",
+            paper_id=archive.paper_id,
+            ordinal=1,
+            layout="one_column",
+            blocks=(_block(1),),
+        )
+        return (
+            (page,),
+            {"paper_id": archive.paper_id, "status": "success"},
+            {
+                "paper_id": archive.paper_id,
+                "status": "prepared",
+                "input_bytes": archive.input_bytes,
+                "expanded_bytes": 10,
+                "cache_cleanup": "deleted",
+            },
+        )
+
+    def fake_compile(page, _config, *, mutation_config):
+        del mutation_config
+        return (
+            builder.WorkerResult(
+                page_id=f"{page.page_id}_edited",
+                paper_id=page.paper_id,
+                status="accepted",
+                reason=None,
+                layout=page.layout,
+                has_table=False,
+                markdown="mutatcd text",
+                verifier_recall=1.0,
+                verifier_precision=1.0,
+                pdf=None,
+                image=str(tmp_path / "page.png"),
+                block_ids=("b1",),
+                source_node_ids=("n1",),
+                content_fill_ratio=0.8,
+                column_fill_ratios=(0.8,),
+                page_signature="signature",
+                elapsed_seconds=0.1,
+                mutation_count=1,
+                changes=(
+                    {
+                        "ocr_ans": "mutatcd",
+                        "origin_ans": "mutated",
+                        "bbox": [1, 2, 3, 4],
+                    },
+                ),
+                variant="confusable_edit",
+            ),
+        )
+
+    monkeypatch.setattr(builder, "ProcessPoolExecutor", FakeExecutor)
+    monkeypatch.setattr(builder, "wait", fake_wait)
+    monkeypatch.setattr(builder, "_prepare_extract_crawler_job", fake_extract)
+    monkeypatch.setattr(builder, "_compile_with_rescue", fake_compile)
+    archives = tuple(
+        builder.CrawlerArchive(
+            paper_id=f"paper{index}",
+            archive=str(tmp_path / f"paper{index}.bin"),
+            row={},
+            expected_sha256=None,
+            input_bytes=10,
+            input_mtime_ns=0,
+        )
+        for index in range(3)
+    )
+    output = tmp_path / "output"
+    work_root = tmp_path / "work"
+    config = builder.WorkerConfig(
+        output_dir=str(output),
+        latexmk="latexmk",
+        pdftoppm="pdftoppm",
+        pdftotext="pdftotext",
+        pdfinfo="pdfinfo",
+        compile_timeout=1,
+        render_timeout=1,
+        dpi=72,
+        max_pack_attempts=1,
+        min_page_chars=0,
+        target_weight=1000,
+        two_column_rate=0.0,
+        target_fill_ratio=0.8,
+        min_fill_ratio=0.7,
+        work_dir=str(work_root / "compile"),
+    )
+    mutation_config = builder.MutationConfig(
+        seed=1,
+        minimum_per_page=1,
+        maximum_per_page=1,
+        maximum_probability=1.0,
+        max_vertical_shift_points=1.0,
+    )
+
+    result = builder._run_fused_crawler_direct_pipeline(
+        archives,
+        cache_root=work_root / "crawler_cache",
+        output=output,
+        work_root=work_root,
+        config=config,
+        mutation_config=mutation_config,
+        target_count=1,
+        workers=2,
+        target_weight=1000,
+        two_column_rate=0.0,
+        input_root=tmp_path,
+        debug_artifacts=False,
+        started=time.monotonic(),
+    )
+
+    assert result == 0
+    assert events.index("submit_compile") < events.index("run_compile")
+    assert events.index("run_compile") < len(events)
+    assert events.count("run_source") == 1
+    summary = json.loads((output / "run_summary.json").read_text())
+    assert summary["processing_mode"] == (
+        "concurrent_source_extract_and_direct_edit_compile"
+    )
+    assert summary["accepted_count"] == 1
+    assert summary["papers_completed"] == 1
+    assert len((output / "realtime_training" / "sft.jsonl").read_text().splitlines()) == 1
+    assert len((output / "realtime_training" / "verl.jsonl").read_text().splitlines()) == 1
+
+
 def test_dense_compile_backoff_keeps_maximal_verified_prefix(
     monkeypatch, tmp_path
 ) -> None:
@@ -550,6 +746,71 @@ def test_dense_compile_skips_proven_bad_bundle_and_continues_filling(
     assert results[0].block_ids == ("b2",)
     assert results[1].block_ids == ("b0", "b1", "b3", "b4")
     assert results[1].content_fill_ratio == 0.8
+
+
+def test_dense_compile_stops_between_pages_after_target_signal(
+    monkeypatch,
+    tmp_path,
+) -> None:
+    stop_file = tmp_path / "target-reached"
+    page = CanonicalPage(
+        page_id="source_pool",
+        paper_id="paper",
+        ordinal=1,
+        layout="one_column",
+        blocks=tuple(_block(index) for index in range(8)),
+    )
+    config = builder.WorkerConfig(
+        output_dir=str(tmp_path / "output"),
+        latexmk="latexmk",
+        pdftoppm="pdftoppm",
+        pdftotext="pdftotext",
+        pdfinfo="pdfinfo",
+        compile_timeout=1,
+        render_timeout=1,
+        dpi=72,
+        max_pack_attempts=12,
+        min_page_chars=0,
+        target_weight=2000,
+        two_column_rate=0.0,
+        target_fill_ratio=0.8,
+        min_fill_ratio=0.7,
+        stop_file=str(stop_file),
+    )
+
+    def fake_compile(candidate, _config):
+        fill = len(candidate.blocks) / 4
+        return builder.WorkerResult(
+            page_id=candidate.page_id,
+            paper_id=candidate.paper_id,
+            status="accepted",
+            reason=None,
+            layout=candidate.layout,
+            has_table=False,
+            markdown=candidate.markdown,
+            verifier_recall=1.0,
+            verifier_precision=1.0,
+            pdf="page.pdf",
+            image="page.png",
+            block_ids=tuple(block.block_id for block in candidate.blocks),
+            source_node_ids=tuple(block.node_id for block in candidate.blocks),
+            content_fill_ratio=fill,
+            column_fill_ratios=(fill,),
+            page_signature="signature",
+            elapsed_seconds=0.1,
+        )
+
+    def fake_persist(result, _config):
+        if result.status == "accepted":
+            stop_file.write_text("stop\n", encoding="utf-8")
+
+    monkeypatch.setattr(builder, "_compile_once", fake_compile)
+    monkeypatch.setattr(builder, "_persist_terminal_result", fake_persist)
+
+    results = builder._compile_with_rescue(page, config)
+    assert len(results) == 1
+    assert results[0].status == "accepted"
+    assert results[0].block_ids == ("b0", "b1", "b2", "b3")
 
 
 def test_page_tex_and_reject_only_verifier() -> None:

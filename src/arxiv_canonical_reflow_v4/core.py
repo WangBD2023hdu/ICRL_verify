@@ -24,7 +24,7 @@ from arxiv_source_first_v3.ast_ir import SourceAtom, reconstruct_markdown
 from arxiv_source_first_v3.document_ast import DocumentAst, DocumentBlockNode
 from arxiv_source_first_v3.table_ast import is_serializable_table_metadata
 
-PIPELINE_VERSION = "arxiv_canonical_reflow_v4_8_direct_edit"
+PIPELINE_VERSION = "arxiv_canonical_reflow_v4_9_fused_parallel"
 
 
 class CanonicalReflowError(ValueError):

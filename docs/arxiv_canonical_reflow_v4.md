@@ -83,6 +83,16 @@ AST extraction. A download does not need to be globally complete: only final
 non-empty `source_archive.bin` files are selected, and `.partial` files are
 ignored.
 
+With a positive `--target-count`, source unpacking/AST parsing and edited-page
+LaTeX compilation run concurrently in one shared process pool. The first paper
+that finishes parsing is submitted for compilation immediately; the program
+does not wait for the remaining corpus to finish parsing. On a 128-worker run,
+up to 16 process slots keep source parsing active while the other slots compile,
+and compilation takes all slots after input is exhausted. Backpressure pauses
+new parsing when the bounded compile queue is full. Long papers are split into
+small, order-preserving source pools so one process does not serialize an
+entire paper before accepted samples reach the parent.
+
 The normal server command needs only input, output, and `--target-count`.
 The target is the number of accepted edited pages that have been durably
 appended to **both** the ms-swift and VERL JSONL files. A positive target also
@@ -102,10 +112,11 @@ Compact progress is the default. `--verbose` restores detailed stage logs.
 reports, and the legacy aggregate export; omit it for production generation.
 
 `--workers` accepts 1--256 and defaults to all detected CPUs, capped at 128. On
-a 128-core server it applies to
-safe unpacking, source/AST extraction, and direct edited-page compilation.
-Every process stage uses a bounded queue of at most twice the
-worker count, so a large corpus does not enqueue every archive/page at once.
+a 128-core server the same bounded pool is shared by safe unpacking, source/AST
+extraction, and direct edited-page compilation; it does not create 128 source
+processes plus another 128 compiler processes. The in-memory compile backlog is
+bounded to twice the worker count, so a large corpus does not enqueue every
+archive/page at once.
 The parent process rewrites a single compact status line for each completed
 source during preparation and each accepted sample during compilation, with a
 30-second heartbeat while workers are busy. Existing accepted page
