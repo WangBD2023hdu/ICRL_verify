@@ -256,6 +256,80 @@ def test_load_release_samples_resolves_release_paths(tmp_path: Path) -> None:
     assert samples[0].image_path == (data / "page.png").resolve()
 
 
+@pytest.fixture
+def table_filter_release(tmp_path: Path) -> Path:
+    (tmp_path / "page.png").write_bytes(b"image")
+    records = []
+    for index, gt in enumerate(
+        [
+            "Plain text mentioning table, <tablet> and &lt;table&gt;.",
+            "<table><tr><td>first</td></tr></table>",
+            "Another paragraph",
+            '<TABLE class="data">\n<tr><td>second</td></tr></TABLE>',
+        ],
+        start=1,
+    ):
+        (tmp_path / f"p{index}.md").write_text(gt, encoding="utf-8")
+        records.append(
+            {"pair_id": f"p{index}", "edited_image": "page.png", "edited_markdown": f"p{index}.md"}
+        )
+    (tmp_path / "pairs.jsonl").write_text(
+        "\n\n".join(json.dumps(record) for record in records) + "\n",
+        encoding="utf-8",
+    )
+    return tmp_path
+
+
+def test_require_table_filters_before_limit_and_preserves_ordinals(
+    table_filter_release: Path,
+) -> None:
+    samples = probe.load_release_samples(table_filter_release, require_table=True, limit=1)
+    assert [(sample.pair_id, sample.ordinal) for sample in samples] == [("p2", 2)]
+    samples = probe.load_release_samples(table_filter_release, require_table=True)
+    assert [(sample.pair_id, sample.ordinal) for sample in samples] == [("p2", 2), ("p4", 4)]
+
+
+def test_require_table_default_keeps_non_table_samples(table_filter_release: Path) -> None:
+    samples = probe.load_release_samples(table_filter_release, limit=2)
+    assert [(sample.pair_id, sample.ordinal) for sample in samples] == [("p1", 1), ("p2", 2)]
+
+
+def test_require_table_no_matches_fails_before_loading_model(
+    table_filter_release: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    for name in ("p2.md", "p4.md"):
+        (table_filter_release / name).write_text("No table", encoding="utf-8")
+
+    def unexpected_model_load(*args: object, **kwargs: object) -> None:
+        pytest.fail("model must not load when no table samples match")
+
+    monkeypatch.setattr(probe, "load_model_bundle", unexpected_model_load)
+    with pytest.raises(RuntimeError, match="no samples with HTML tables"):
+        probe.run_privileged_probe(
+            model_id="unused", dataset_root=table_filter_release,
+            output_dir=table_filter_release / "output", require_table=True,
+        )
+
+
+def test_cli_passes_require_table_and_limit(monkeypatch: pytest.MonkeyPatch) -> None:
+    received = {}
+
+    def fake_run(**kwargs: object) -> probe.PrivilegedProbeSummary:
+        received.update(kwargs)
+        return probe.PrivilegedProbeSummary(Path("output"), 10, 10, 0, 0, False)
+
+    monkeypatch.setattr(probe, "run_privileged_probe", fake_run)
+    assert probe.main([
+        "--dataset-root", "dataset", "--output-dir", "output",
+        "--require-table", "--limit", "10",
+    ]) == 0
+    assert received["require_table"] is True
+    assert received["limit"] == 10
+    assert received["prompt"] == probe.DEFAULT_PROMPT
+    assert received["privileged_instruction"] == probe.DEFAULT_PRIVILEGED_INSTRUCTION
+    assert probe._build_parser().parse_args(["--output-dir", "output"]).require_table is False
+
+
 def test_text_teacher_prompt_is_text_only_and_verbatim() -> None:
     bundle = _bundle()
     ground_truth = "\n# 标题\n\n- 保留 Markdown 的尾部空格  \n"

@@ -85,6 +85,15 @@ directly. It contains no aggregate statistics or filtered token analysis. Each
 sample report keeps the complete Ground Truth and model Response visible side by
 side, followed by every generated response token in its original ID order.
 
+To infer only the first 10 table-containing samples, add `--require-table --limit 10`
+to the inference command. Selection uses HTML `<table>` opening tags in the GT
+(case-insensitive, including tags with attributes), before applying the limit.
+The original manifest order, sample ordinals and per-sample seeds are preserved.
+Without `--require-table`, selection is unchanged. This does not change either
+prompt or restrict the response to table content: the full page is still evaluated
+and visualized. Use a separate output directory for a table-only report so that
+previously saved non-table results are not included by the report rebuild.
+
 Teacher-signal quality statistics are written to a separate page so the existing
 sample browser and per-token visualization remain unchanged:
 

@@ -7,6 +7,7 @@ import html
 import inspect
 import json
 import math
+import re
 import shutil
 import statistics
 from bisect import bisect_left
@@ -51,6 +52,7 @@ PRIVILEGED_PROMPT_TEMPLATE = (
 )
 DEFAULT_TEACHER_SIGNAL_THRESHOLD = 0.05
 TEACHER_SIGNAL_THRESHOLDS = (0.0, 0.01, 0.05, 0.1, 0.2, 0.5)
+_HTML_TABLE_RE = re.compile(r"<table(?=[\s>])[^>]*>", re.IGNORECASE)
 TOKEN_TEACHER_SIGNAL_ERROR_LABELS = frozenset(
     {
         "hallucinated_insertion",
@@ -84,6 +86,7 @@ def load_release_samples(
     dataset_root: str | Path,
     *,
     limit: int | None = None,
+    require_table: bool = False,
 ) -> list[PrivilegedProbeSample]:
     root = Path(dataset_root).expanduser().resolve()
     pairs_path = root / "pairs.jsonl"
@@ -93,10 +96,12 @@ def load_release_samples(
         raise ValueError("limit must be positive")
 
     samples: list[PrivilegedProbeSample] = []
+    ordinal = 0
     with pairs_path.open(encoding="utf-8") as handle:
         for line_number, line in enumerate(handle, start=1):
             if not line.strip():
                 continue
+            ordinal += 1
             record = json.loads(line)
             pair_id = str(record.get("pair_id", "")).strip()
             if not pair_id:
@@ -115,10 +120,14 @@ def load_release_samples(
                 raise FileNotFoundError(
                     f"edited Markdown GT is missing for {pair_id}: {gt_path}"
                 )
+            if require_table and not _HTML_TABLE_RE.search(
+                gt_path.read_text(encoding="utf-8")
+            ):
+                continue
             changes = tuple(dict(item) for item in record.get("changes", []))
             samples.append(
                 PrivilegedProbeSample(
-                    ordinal=len(samples) + 1,
+                    ordinal=ordinal,
                     pair_id=pair_id,
                     image_path=image_path,
                     ground_truth_path=gt_path,
@@ -128,6 +137,8 @@ def load_release_samples(
             if limit is not None and len(samples) >= limit:
                 break
     if not samples:
+        if require_table:
+            raise RuntimeError(f"dataset contains no samples with HTML tables in GT: {pairs_path}")
         raise RuntimeError(f"dataset contains no samples: {pairs_path}")
     return samples
 
@@ -153,6 +164,7 @@ def run_privileged_probe(
     resume: bool = True,
     fail_fast: bool = False,
     limit: int | None = None,
+    require_table: bool = False,
     heartbeat_seconds: float = 30.0,
     teacher_signal_threshold: float = DEFAULT_TEACHER_SIGNAL_THRESHOLD,
     student_response_min_probability: float | None = None,
@@ -193,7 +205,9 @@ def run_privileged_probe(
     output_root = Path(output_dir).expanduser().resolve()
     samples_root = output_root / "samples"
     samples_root.mkdir(parents=True, exist_ok=True)
-    samples = load_release_samples(dataset_path, limit=limit)
+    samples = load_release_samples(
+        dataset_path, limit=limit, require_table=require_table
+    )
     config = {
         "schema_version": SCHEMA_VERSION,
         "created_at": _utc_now(),
@@ -225,6 +239,7 @@ def run_privileged_probe(
         "seed": seed,
         "resume": resume,
         "limit": limit,
+        "require_table": require_table,
         "teacher_signal_threshold": teacher_signal_threshold,
         "student_response_min_probability": student_response_min_probability,
         "student_response_max_probability": student_response_max_probability,
@@ -4628,6 +4643,11 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--image-patch-size", type=int, default=16)
     parser.add_argument("--seed", type=int, default=7)
     parser.add_argument("--limit", type=int)
+    parser.add_argument(
+        "--require-table",
+        action="store_true",
+        help="Only infer samples whose GT contains an HTML <table> tag; filter before --limit.",
+    )
     parser.add_argument("--heartbeat-seconds", type=float, default=30.0)
     parser.add_argument(
         "--teacher-signal-threshold",
@@ -4714,6 +4734,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         resume=not args.no_resume,
         fail_fast=args.fail_fast,
         limit=args.limit,
+        require_table=args.require_table,
         heartbeat_seconds=args.heartbeat_seconds,
         teacher_signal_threshold=args.teacher_signal_threshold,
         student_response_min_probability=args.student_response_min_probability,
