@@ -3,6 +3,24 @@
 Entry: `scripts/build_arxiv_confusable_text_sft.py`.
 This text-only task is separate from multimodal V5 synthesis.
 
+## Downloaded source input
+
+`--input-root` points to the crawler output root, not its `papers/` child.
+When `results.jsonl` exists, the script keeps using it. When it is absent,
+the script reads `papers/*/download.json` instead, using `--workers` processes
+for checkpoint discovery and archive checks. The crawler writes these
+per-paper records immediately after each download, so the corpus does not
+need to finish downloading before synthesis starts.
+
+Only successful (`passed`/`success`) records with a nonempty archive are used.
+Failed downloads, missing/malformed checkpoints and incomplete archives with
+only a `.partial` file are skipped and counted in the discovery progress.
+No replacement `results.jsonl` is created and no download files are modified.
+The existing license filter is unchanged; `--allow-all-licenses` remains an
+explicit opt-in, not an automatic fallback.
+
+## A/B transformation
+
 The existing source extraction, window selection and approximately 10% word
 mutation policy produce input document **A**, which is inserted between
 `<<<DOCUMENT_START>>>` and `<<<DOCUMENT_END>>>` without an added code fence.

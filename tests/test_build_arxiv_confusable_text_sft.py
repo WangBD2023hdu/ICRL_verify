@@ -7,6 +7,8 @@ import importlib.util
 import json
 from pathlib import Path
 import random
+import shutil
+import subprocess
 import sys
 import tarfile
 import tempfile
@@ -405,6 +407,295 @@ This is a \textbf{carefully written} paragraph with $x_i$ and prior work
             "categories": ["cs.CL"],
         }
         (root / "results.jsonl").write_text(json.dumps(row) + "\n", encoding="utf-8")
+        checkpoint = root / "papers" / stem / "download.json"
+        checkpoint.write_text(
+            json.dumps({**row, "bytes": archive.stat().st_size, "attempts": 1}) + "\n",
+            encoding="utf-8",
+        )
+
+    def _write_download_checkpoint(
+        self,
+        root: Path,
+        stem: str,
+        *,
+        status: str = "passed",
+        license_name: str = "CC-BY-4.0",
+        archive_state: str = "valid",
+        malformed: bool = False,
+        arxiv_id: str | None = None,
+    ) -> dict[str, object]:
+        paper_dir = root / "papers" / stem
+        paper_dir.mkdir(parents=True, exist_ok=True)
+        archive = paper_dir / "source_archive.bin"
+        partial = paper_dir / "source_archive.bin.partial"
+        if archive_state == "valid":
+            archive.write_bytes((stem + "\nsource archive\n").encode("utf-8"))
+        elif archive_state == "empty":
+            archive.write_bytes(b"")
+        elif archive_state == "partial":
+            partial.write_bytes(b"partial source archive")
+        elif archive_state != "missing":
+            raise AssertionError(f"unknown archive fixture state: {archive_state}")
+        row: dict[str, object] = {
+            "arxiv_id": arxiv_id or stem.removesuffix("v1"),
+            "version": "v1",
+            "stem": stem,
+            "status": status,
+            "license_name": license_name,
+            "license_url": "https://example.test/license",
+            "archive": f"papers/{stem}/source_archive.bin",
+            "categories": ["cs.CL"],
+        }
+        if archive.is_file():
+            row["bytes"] = archive.stat().st_size
+            row["sha256"] = hashlib.sha256(archive.read_bytes()).hexdigest()
+        checkpoint = paper_dir / "download.json"
+        checkpoint.write_text(
+            "{malformed checkpoint\n" if malformed else json.dumps(row) + "\n",
+            encoding="utf-8",
+        )
+        return row
+
+    def _clone_download_paper(self, root: Path, source_stem: str, target_stem: str) -> None:
+        source_dir = root / "papers" / source_stem
+        target_dir = root / "papers" / target_stem
+        target_dir.mkdir(parents=True, exist_ok=True)
+        shutil.copyfile(
+            source_dir / "source_archive.bin",
+            target_dir / "source_archive.bin",
+        )
+        metadata = json.loads((source_dir / "download.json").read_text(encoding="utf-8"))
+        metadata.update(
+            {
+                "arxiv_id": target_stem.removesuffix("v1"),
+                "stem": target_stem,
+                "archive": f"papers/{target_stem}/source_archive.bin",
+            }
+        )
+        (target_dir / "download.json").write_text(
+            json.dumps(metadata) + "\n",
+            encoding="utf-8",
+        )
+
+    def _pipeline_args(self, input_root: Path, output_dir: Path, **overrides: object) -> argparse.Namespace:
+        values: dict[str, object] = {
+            "input_root": input_root,
+            "output_dir": output_dir,
+            "tokenizer": "simple",
+            "workers": 1,
+            "max_papers": 0,
+            "paper_ids": [],
+            "max_samples": 100,
+            "max_samples_per_paper": 0,
+            "min_response_tokens": 1_000,
+            "max_response_tokens": 1_100,
+            "mutation_word_ratio": 0.10,
+            "min_mutations": 3,
+            "max_mutations": 0,
+            "shard_size": 3,
+            "write_merged_jsonl": True,
+            "val_fraction": 0.0,
+            "seed": 83,
+            "split_seed": 42,
+            "temp_root": None,
+            "allow_all_licenses": False,
+            "allow_tokenizer_download": False,
+            "trust_remote_code": False,
+            "resume": True,
+            "retry_failed": False,
+        }
+        values.update(overrides)
+        return argparse.Namespace(**values)
+
+    def test_select_input_rows_falls_back_to_download_checkpoints_and_counts_rejections(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            self._write_download_checkpoint(root, "2601.00001v1", status="passed")
+            self._write_download_checkpoint(root, "2601.00002v1", status="success")
+            self._write_download_checkpoint(root, "2601.00003v1", status="failed")
+            self._write_download_checkpoint(
+                root, "2601.00004v1", archive_state="partial"
+            )
+            self._write_download_checkpoint(
+                root, "2601.00005v1", archive_state="missing"
+            )
+            self._write_download_checkpoint(
+                root, "2601.00006v1", malformed=True
+            )
+            self._write_download_checkpoint(
+                root, "2601.00007v1", archive_state="empty"
+            )
+            self._write_download_checkpoint(
+                root,
+                "2601.00008v1",
+                license_name="MIT",
+            )
+
+            selected, rejected = MODULE.select_input_rows(
+                root,
+                max_papers=0,
+                paper_ids=set(),
+                allow_all_licenses=False,
+                workers=1,
+            )
+            self.assertFalse((root / "results.jsonl").exists())
+            self.assertEqual(
+                {row["stem"] for row, _archive in selected},
+                {"2601.00001v1", "2601.00002v1"},
+            )
+            self.assertTrue(all(archive.is_file() and archive.stat().st_size for _, archive in selected))
+            self.assertEqual(sum(rejected.values()), 6)
+
+            selected_all, rejected_all = MODULE.select_input_rows(
+                root,
+                max_papers=0,
+                paper_ids=set(),
+                allow_all_licenses=True,
+                workers=1,
+            )
+            self.assertEqual(
+                {row["stem"] for row, _archive in selected_all},
+                {"2601.00001v1", "2601.00002v1", "2601.00008v1"},
+            )
+            self.assertEqual(sum(rejected_all.values()), 5)
+
+    def test_select_input_rows_keeps_results_mode_and_honors_limits_and_ids(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            self._write_input(root)
+            self._write_download_checkpoint(root, "2601.00002v1", status="passed")
+
+            selected, rejected = MODULE.select_input_rows(
+                root,
+                max_papers=0,
+                paper_ids=set(),
+                allow_all_licenses=False,
+                workers=2,
+            )
+            self.assertEqual([row["stem"] for row, _archive in selected], ["2601.00001v1"])
+            self.assertEqual(sum(rejected.values()), 0)
+
+            (root / "results.jsonl").unlink()
+            selected_limited, _rejected = MODULE.select_input_rows(
+                root,
+                max_papers=1,
+                paper_ids=set(),
+                allow_all_licenses=False,
+                workers=1,
+            )
+            self.assertEqual(len(selected_limited), 1)
+
+            selected_by_stem, _rejected = MODULE.select_input_rows(
+                root,
+                max_papers=0,
+                paper_ids={"2601.00002v1"},
+                allow_all_licenses=False,
+                workers=1,
+            )
+            self.assertEqual([row["stem"] for row, _archive in selected_by_stem], ["2601.00002v1"])
+
+            selected_by_id, _rejected = MODULE.select_input_rows(
+                root,
+                max_papers=0,
+                paper_ids={"2601.00001"},
+                allow_all_licenses=False,
+                workers=1,
+            )
+            self.assertEqual([row["stem"] for row, _archive in selected_by_id], ["2601.00001v1"])
+
+    def test_pipeline_uses_download_checkpoints_without_results_jsonl(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            input_root = root / "input"
+            output_dir = root / "output"
+            input_root.mkdir()
+            self._write_input(input_root)
+            (input_root / "results.jsonl").unlink()
+
+            summary = MODULE.run_pipeline(
+                self._pipeline_args(input_root, output_dir)
+            )
+            self.assertEqual(summary["status"], "passed")
+            self.assertGreater(summary["papers"]["selected"], 0)
+            self.assertGreater(summary["merge"]["written_samples"], 0)
+            self.assertFalse((input_root / "results.jsonl").exists())
+            rows = []
+            for path in sorted((output_dir / "train").glob("part-*.jsonl")):
+                rows.extend(MODULE.read_jsonl(path))
+            self.assertEqual(len(rows), summary["merge"]["written_samples"])
+            for row in rows:
+                answer = row["messages"][1]["content"]
+                self.assertTrue(answer.startswith(MODULE.RESPONSE_PREFIX))
+                self.assertTrue(answer.endswith(MODULE.RESPONSE_SUFFIX))
+                self.assertIsInstance(row["extra_info"]["heading_changes"], list)
+                MODULE.validate_sample(row, max_response_tokens=1_100)
+
+    def test_cli_workers_two_processes_download_checkpoint_input(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            input_root = root / "input"
+            output_dir = root / "output"
+            input_root.mkdir()
+            self._write_input(input_root)
+            self._clone_download_paper(input_root, "2601.00001v1", "2601.00002v1")
+            (input_root / "results.jsonl").unlink()
+
+            command = [
+                sys.executable,
+                str(SCRIPT),
+                "--input-root",
+                str(input_root),
+                "--output-dir",
+                str(output_dir),
+                "--tokenizer",
+                "simple",
+                "--workers",
+                "2",
+                "--max-papers",
+                "2",
+                "--max-samples",
+                "2",
+                "--max-samples-per-paper",
+                "1",
+                "--min-response-tokens",
+                "1000",
+                "--max-response-tokens",
+                "1100",
+                "--mutation-word-ratio",
+                "0.10",
+                "--min-mutations",
+                "3",
+                "--shard-size",
+                "2",
+                "--write-merged-jsonl",
+                "--val-fraction",
+                "0",
+                "--seed",
+                "83",
+                "--split-seed",
+                "42",
+            ]
+            completed = subprocess.run(
+                command,
+                check=False,
+                capture_output=True,
+                text=True,
+                timeout=120,
+            )
+            self.assertEqual(
+                completed.returncode,
+                0,
+                msg=f"stdout:\n{completed.stdout}\nstderr:\n{completed.stderr}",
+            )
+            self.assertFalse((input_root / "results.jsonl").exists())
+            manifest = json.loads((output_dir / "manifest.json").read_text(encoding="utf-8"))
+            self.assertEqual(manifest["configuration"]["workers"], 2)
+            self.assertEqual(manifest["papers"]["selected"], 2)
+            self.assertGreater(manifest["merge"]["written_samples"], 0)
+            rows = list(MODULE.read_jsonl(output_dir / "train.jsonl"))
+            self.assertEqual(len(rows), manifest["merge"]["written_samples"])
+            for row in rows:
+                MODULE.validate_sample(row, max_response_tokens=1_100)
 
     def test_pipeline_outputs_available_rows_without_forcing_target(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

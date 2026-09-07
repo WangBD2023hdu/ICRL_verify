@@ -2,7 +2,8 @@
 """Build long, text-only confusable-rewrite SFT data from arXiv sources.
 
 The input is the directory produced by ``crawl_arxiv_sources.py`` and contains
-``results.jsonl`` plus ``papers/<stem>/source_archive.bin``.  The script safely
+``papers/<stem>/source_archive.bin`` plus either ``results.jsonl`` or per-paper
+``download.json`` checkpoints. The script safely
 extracts each source archive, conservatively converts visible LaTeX prose to
 Markdown, creates deterministic same-length character confusions, and writes
 MS-Swift ``messages`` JSONL shards. The input document A remains unchanged;
@@ -1928,20 +1929,134 @@ def merge_checkpoints(
     }
 
 
+def _read_download_checkpoint(
+    task: tuple[Path, Path],
+) -> tuple[dict[str, Any] | None, Path | None, str | None, int]:
+    input_root, checkpoint = task
+    try:
+        payload = checkpoint.read_bytes()
+    except FileNotFoundError:
+        return None, None, "missing_download_checkpoint", 0
+    except OSError:
+        return None, None, "unreadable_download_checkpoint", 0
+    try:
+        row = json.loads(payload)
+    except (json.JSONDecodeError, UnicodeDecodeError):
+        return None, None, "invalid_download_checkpoint", len(payload)
+    if not isinstance(row, dict):
+        return None, None, "invalid_download_checkpoint", len(payload)
+    row.setdefault("stem", checkpoint.parent.name)
+    try:
+        paper_stem(row)
+    except ValueError:
+        return None, None, "unsafe_or_missing_stem", len(payload)
+    if row.get("status") not in {"passed", "success"}:
+        return None, None, "crawler_status_not_passed", len(payload)
+    try:
+        archive = resolve_archive(input_root, row)
+    except (OSError, ValueError):
+        return None, None, "archive_missing_or_empty", len(payload)
+    return row, archive, None, len(payload)
+
+
+def _discover_download_checkpoints(
+    input_root: Path, *, workers: int,
+) -> tuple[list[tuple[dict[str, Any], Path]], Counter[str]]:
+    """Read completed downloads without waiting for the final crawler manifest."""
+    papers_root = input_root / "papers"
+    if not papers_root.is_dir():
+        raise FileNotFoundError(
+            f"neither {input_root / 'results.jsonl'} nor {papers_root} exists"
+        )
+    started = last_log = time.monotonic()
+    print(
+        f"[start] phase=input_discovery mode=download_checkpoints "
+        f"directory={papers_root} workers={workers}",
+        flush=True,
+    )
+    checkpoints: list[Path] = []
+    with os.scandir(papers_root) as entries:
+        for entry in entries:
+            if entry.is_dir():
+                checkpoints.append(Path(entry.path) / "download.json")
+            if time.monotonic() - last_log >= HEARTBEAT_SECONDS:
+                last_log = time.monotonic()
+                print(
+                    f"[progress] phase=input_discovery scanned={len(checkpoints)} "
+                    f"total=unknown current={entry.name} "
+                    f"elapsed={elapsed_text(last_log - started)}",
+                    flush=True,
+                )
+    checkpoints.sort()
+    total = len(checkpoints)
+    print(f"[start] phase=input_checkpoints total={total} workers={workers}", flush=True)
+    tasks = [(input_root, path) for path in checkpoints]
+    executor = (
+        concurrent.futures.ProcessPoolExecutor(max_workers=min(workers, total))
+        if workers > 1 and total > 1 else None
+    )
+    results = (
+        executor.map(_read_download_checkpoint, tasks, chunksize=16)
+        if executor is not None else map(_read_download_checkpoint, tasks)
+    )
+    ready: list[tuple[dict[str, Any], Path]] = []
+    rejected: Counter[str] = Counter()
+    metadata_bytes = 0
+    completed = 0
+    try:
+        for completed, (row, archive, reason, size) in enumerate(results, start=1):
+            metadata_bytes += size
+            if reason is not None:
+                rejected[reason] += 1
+            elif row is not None and archive is not None:
+                ready.append((row, archive))
+            now = time.monotonic()
+            if completed % 1000 == 0 or completed == total or now - last_log >= HEARTBEAT_SECONDS:
+                last_log = now
+                elapsed = max(now - started, 1e-9)
+                rate = completed / elapsed
+                errors = sum(rejected[key] for key in (
+                    "invalid_download_checkpoint", "unreadable_download_checkpoint",
+                ))
+                print(
+                    f"[unit-done] phase=input_checkpoints completed={completed}/{total} "
+                    f"pct={100 * completed / max(total, 1):.2f}% "
+                    f"current={checkpoints[completed - 1].parent.name} "
+                    f"ready={len(ready)} rejected={sum(rejected.values())} errors={errors} "
+                    f"metadata_bytes={metadata_bytes} throughput={rate:.3f}_papers/s "
+                    f"elapsed={elapsed_text(elapsed)} eta={elapsed_text((total - completed) / rate)}",
+                    flush=True,
+                )
+    finally:
+        if executor is not None:
+            executor.shutdown()
+    print(
+        f"[finish] phase=input_discovery completed={completed}/{total} "
+        f"ready={len(ready)} rejected={sum(rejected.values())} "
+        f"metadata_bytes={metadata_bytes} elapsed={elapsed_text(time.monotonic() - started)}",
+        flush=True,
+    )
+    return ready, rejected
+
+
 def select_input_rows(
     input_root: Path,
     *,
     max_papers: int,
     paper_ids: set[str],
     allow_all_licenses: bool,
+    workers: int = 1,
 ) -> tuple[list[tuple[dict[str, Any], Path]], Counter[str]]:
     results_path = input_root / "results.jsonl"
-    if not results_path.is_file():
-        raise FileNotFoundError(results_path)
     selected: list[tuple[dict[str, Any], Path]] = []
     rejected: Counter[str] = Counter()
+    if results_path.is_file():
+        candidates = ((row, None) for row in read_jsonl(results_path))
+    else:
+        downloaded, rejected = _discover_download_checkpoints(input_root, workers=workers)
+        candidates = iter(downloaded)
     seen: set[str] = set()
-    for row in read_jsonl(results_path):
+    for row, discovered_archive in candidates:
         try:
             stem = paper_stem(row)
         except ValueError:
@@ -1961,7 +2076,7 @@ def select_input_rows(
             rejected["not_requested"] += 1
             continue
         try:
-            archive = resolve_archive(input_root, row)
+            archive = discovered_archive or resolve_archive(input_root, row)
         except (OSError, ValueError):
             rejected["archive_missing_or_empty"] += 1
             continue
@@ -1969,7 +2084,10 @@ def select_input_rows(
         if max_papers and len(selected) >= max_papers:
             break
     if not selected:
-        raise ValueError("no eligible downloaded source archives were selected")
+        detail = f"no eligible downloaded source archives were selected; reasons={dict(rejected)}"
+        if rejected["license_not_allowed"]:
+            detail += "; use --allow-all-licenses only if you intend to include those licenses"
+        raise ValueError(detail)
     return selected, rejected
 
 
@@ -2047,6 +2165,7 @@ def run_pipeline(args: argparse.Namespace) -> dict[str, Any]:
         max_papers=args.max_papers,
         paper_ids=set(args.paper_ids),
         allow_all_licenses=args.allow_all_licenses,
+        workers=args.workers,
     )
     rng = random.Random(args.seed)
     rng.shuffle(selected)
@@ -2302,7 +2421,10 @@ def run_pipeline(args: argparse.Namespace) -> dict[str, Any]:
 
 def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--input-root", type=Path, required=True)
+    parser.add_argument(
+        "--input-root", type=Path, required=True,
+        help="Crawler root containing results.jsonl or papers/*/download.json and source_archive.bin",
+    )
     parser.add_argument("--output-dir", type=Path, required=True)
     parser.add_argument(
         "--tokenizer",
