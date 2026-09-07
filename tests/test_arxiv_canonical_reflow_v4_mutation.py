@@ -409,8 +409,11 @@ def test_direct_edit_compiles_no_clean_page_and_streams_training_rows(
     assert len(sft_rows) == len(verl_rows) == 1
     verl = json.loads(verl_rows[0])
     sft = json.loads(sft_rows[0])
-    assert sft["images"] == [f"../pages/{result.page_id}/page.png"]
-    assert verl["images"] == [f"../pages/{result.page_id}/page.png"]
+    expected_image = f"images/shard_00000/{result.page_id}.png"
+    assert sft["images"] == [expected_image]
+    assert verl["images"] == [expected_image]
+    assert (output / "realtime_training" / expected_image).is_file()
+    assert not (output / "pages" / result.page_id).exists()
     assert len(verl["extra_info"]["changes"]) == 3
     assert verl["reward_model"]["ground_truth"] == result.markdown
     assert not (output / "pages" / result.page_id / "terminal_result.json").exists()
@@ -484,6 +487,43 @@ def test_target_admission_keeps_exact_count_and_deletes_concurrent_overrun(
     assert (
         len((output / "realtime_training" / "verl.jsonl").read_text().splitlines()) == 2
     )
+
+
+def test_realtime_images_roll_over_to_a_new_shard_at_capacity(tmp_path) -> None:
+    output = tmp_path / "dataset"
+    writer = builder._RealtimeTrainingWriter(output, images_per_shard=2)
+    accepted_ids: set[str] = set()
+    rows = [_accepted_edit_result(output, f"edited-{index}") for index in range(3)]
+
+    for row in rows:
+        assert (
+            builder._admit_direct_result(
+                row,
+                writer=writer,
+                accepted_ids=accepted_ids,
+                target_count=0,
+                output=output,
+            )
+            == "admitted"
+        )
+    writer.close()
+
+    sft = [
+        json.loads(line)
+        for line in (output / "realtime_training" / "sft.jsonl")
+        .read_text(encoding="utf-8")
+        .splitlines()
+    ]
+    assert [row["images"][0] for row in sft] == [
+        "images/shard_00000/edited-0.png",
+        "images/shard_00000/edited-1.png",
+        "images/shard_00001/edited-2.png",
+    ]
+    assert all(
+        (output / "realtime_training" / row["images"][0]).is_file()
+        for row in sft
+    )
+    assert not (output / "pages").exists()
 
 
 def test_realtime_part_recovery_honors_exact_target_and_deletes_overrun(

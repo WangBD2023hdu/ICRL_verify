@@ -11,6 +11,7 @@ can never create or repair Markdown GT.
 from __future__ import annotations
 
 import argparse
+import errno
 import hashlib
 import json
 import math
@@ -52,6 +53,7 @@ from build_arxiv_latex_recompile_pilot import (
     scan_source as scan_archive_source,
 )
 
+from arxiv_canonical_reflow_v4 import weighted_mutation
 from arxiv_canonical_reflow_v4.core import (
     PIPELINE_VERSION,
     CanonicalBlock,
@@ -71,6 +73,11 @@ from arxiv_canonical_reflow_v4.mutation import (
     choose_source_page_mutations,
     markdown_diff_count,
     validate_mutated_word_geometry,
+)
+from arxiv_canonical_reflow_v4.prompts import (
+    DOC2MD_PROMPT,
+    DOC2MD_PROMPT_STYLE,
+    DOC2MD_SFT_PROMPT,
 )
 from arxiv_source_first_v3.document_ast import parse_document_ast
 from arxiv_source_first_v3.semantic_declarations import (
@@ -98,6 +105,7 @@ Please convert the image document into Markdown format, strictly adhering to the
 _PAGE_MARGIN_PT = 0.72 * 72.0
 _SAFE_PAPER_STEM_RE = re.compile(r"^[A-Za-z0-9._-]+$")
 _CRAWLER_CACHE_SCHEMA_VERSION = 1
+_IMAGES_PER_SHARD = 20_000
 _VERBOSE_OUTPUT = False
 _STATUS_LINE_WIDTH = 0
 
@@ -125,6 +133,7 @@ class WorkerConfig:
     work_dir: str | None = None
     minimal_output: bool = True
     stop_file: str | None = None
+    prompt_style: str = "legacy"
 
 
 @dataclass(frozen=True, slots=True)
@@ -134,6 +143,15 @@ class MutationConfig:
     maximum_per_page: int
     maximum_probability: float
     max_vertical_shift_points: float
+    policy: str = "v4"
+
+    @property
+    def policy_version(self) -> str:
+        return (
+            weighted_mutation.POLICY_VERSION
+            if self.policy == weighted_mutation.POLICY_NAME
+            else MUTATION_POLICY_VERSION
+        )
 
 
 @dataclass(frozen=True, slots=True)
@@ -162,6 +180,7 @@ class WorkerResult:
     clean_page_id: str | None = None
     max_mutation_vertical_shift_points: float | None = None
     variant: str = "clean"
+    prompt_style: str = "legacy"
 
 
 @dataclass(frozen=True, slots=True)
@@ -927,8 +946,14 @@ def _compile_once(page: CanonicalPage, config: WorkerConfig) -> WorkerResult:
 
 
 def _mutation_page_id(clean_page_id: str, config: MutationConfig) -> str:
+    identity = asdict(config)
+    if config.policy == "v4":
+        identity.pop("policy")  # Preserve existing V4 IDs and resume behavior.
+    else:
+        identity["policy_version"] = config.policy_version
+        identity["policy_fingerprint"] = weighted_mutation.POLICY_FINGERPRINT
     payload = json.dumps(
-        asdict(config),
+        identity,
         sort_keys=True,
         separators=(",", ":"),
     ).encode("utf-8")
@@ -1127,7 +1152,12 @@ def _direct_mutate_and_compile(
 
     started = time.monotonic()
     page_id = _mutation_page_id(page.page_id, mutation_config)
-    mutations = choose_source_page_mutations(
+    choose_mutations = (
+        weighted_mutation.choose_weighted_source_page_mutations
+        if mutation_config.policy == weighted_mutation.POLICY_NAME
+        else choose_source_page_mutations
+    )
+    mutations = choose_mutations(
         page,
         seed=mutation_config.seed,
         minimum=mutation_config.minimum_per_page,
@@ -1148,7 +1178,7 @@ def _direct_mutate_and_compile(
     mutated_page = apply_page_mutations(page, mutations, page_id=page_id)
     cached = _direct_result_cache(mutated_page, config)
     if cached is not None:
-        return cached
+        return replace(cached, prompt_style=config.prompt_style)
     expected_differences = len(mutations)
     channel_differences = {
         "markdown": markdown_diff_count(page.markdown, mutated_page.markdown),
@@ -1273,6 +1303,7 @@ def _direct_mutate_and_compile(
         clean_page_id=None,
         max_mutation_vertical_shift_points=None,
         variant="confusable_edit",
+        prompt_style=config.prompt_style,
     )
     return _finish_direct_compile(result, config)
 
@@ -2576,12 +2607,25 @@ def _relative_output_path(value: str | None, output: Path) -> str | None:
     return Path(value).resolve().relative_to(output.resolve()).as_posix()
 
 
+def _training_prompts(style: str) -> tuple[str, str]:
+    if style == DOC2MD_PROMPT_STYLE:
+        return DOC2MD_SFT_PROMPT, DOC2MD_PROMPT
+    return (
+        _SFT_PROMPT,
+        (
+            "<image>\nPlease transcribe all text in this page image faithfully, "
+            "exactly as printed (including any typos)."
+        ),
+    )
+
+
 def _realtime_training_rows(
     result: WorkerResult,
     dataset_dir: Path,
 ) -> tuple[dict[str, Any], dict[str, Any]]:
     if result.image is None:
         raise PipelineError(f"accepted page missing image: {result.page_id}")
+    sft_prompt, verl_prompt = _training_prompts(result.prompt_style)
     image = Path(
         os.path.relpath(Path(result.image).resolve(), dataset_dir.resolve())
     ).as_posix()
@@ -2595,7 +2639,7 @@ def _realtime_training_rows(
     ]
     sft = {
         "messages": [
-            {"role": "user", "content": _SFT_PROMPT},
+            {"role": "user", "content": sft_prompt},
             {"role": "assistant", "content": result.markdown},
         ],
         "images": [image],
@@ -2611,7 +2655,7 @@ def _realtime_training_rows(
         "prompt": [
             {
                 "role": "user",
-                "content": "<image>\nPlease transcribe all text in this page image faithfully, exactly as printed (including any typos).",
+                "content": verl_prompt,
             }
         ],
         "images": [image],
@@ -2626,7 +2670,9 @@ def _realtime_training_rows(
     return sft, verl
 
 
-def _existing_training_ids(path: Path) -> set[str]:
+def _existing_training_ids(
+    path: Path, *, mutation_counts: Counter[str] | None = None,
+) -> set[str]:
     if not path.is_file():
         return set()
     identifiers: set[str] = set()
@@ -2640,22 +2686,85 @@ def _existing_training_ids(path: Path) -> set[str]:
             except (KeyError, TypeError, json.JSONDecodeError):
                 continue
             if isinstance(pair_id, str) and pair_id:
+                if mutation_counts is not None and pair_id not in identifiers:
+                    weighted_mutation.count_changes(
+                        row["extra_info"].get("changes", []), mutation_counts,
+                    )
                 identifiers.add(pair_id)
     return identifiers
+
+
+def _existing_training_image_paths(
+    path: Path,
+    *,
+    pair_ids: set[str],
+) -> dict[str, str]:
+    """Read image paths only for incomplete rows that need crash recovery."""
+
+    if not pair_ids or not path.is_file():
+        return {}
+    images: dict[str, str] = {}
+    with path.open("r", encoding="utf-8") as handle:
+        for line in handle:
+            if not line.strip():
+                continue
+            try:
+                row = json.loads(line)
+                pair_id = row["extra_info"]["pair_id"]
+                row_images = row["images"]
+                image = row_images[0]
+            except (KeyError, IndexError, TypeError, json.JSONDecodeError):
+                continue
+            if pair_id in pair_ids and isinstance(image, str) and image:
+                images[pair_id] = image
+    return images
 
 
 class _RealtimeTrainingWriter:
     """Append accepted edited pages as soon as each source-pool job returns."""
 
-    def __init__(self, output: Path, *, target_count: int = 0) -> None:
+    def __init__(
+        self,
+        output: Path,
+        *,
+        target_count: int = 0,
+        images_per_shard: int = _IMAGES_PER_SHARD,
+        mutation_policy: str = "v4",
+        prompt_style: str = "legacy",
+    ) -> None:
+        if images_per_shard < 1:
+            raise ValueError("images_per_shard must be positive")
         self.dataset_dir = output / "realtime_training"
         self.target_count = target_count
+        self.images_per_shard = images_per_shard
+        self.mutation_policy = mutation_policy
+        self.prompt_style = prompt_style
+        self.mutation_counts: Counter[str] = Counter()
         self.dataset_dir.mkdir(parents=True, exist_ok=True)
+        self.images_dir = self.dataset_dir / "images"
         self.parts_dir = self.dataset_dir / "parts"
         self.sft_path = self.dataset_dir / "sft.jsonl"
         self.verl_path = self.dataset_dir / "verl.jsonl"
         self.sft_ids = _existing_training_ids(self.sft_path)
-        self.verl_ids = _existing_training_ids(self.verl_path)
+        self.verl_ids = _existing_training_ids(
+            self.verl_path,
+            mutation_counts=(
+                self.mutation_counts
+                if mutation_policy == weighted_mutation.POLICY_NAME else None
+            ),
+        )
+        partial_ids = self.sft_ids ^ self.verl_ids
+        self.partial_image_paths = _existing_training_image_paths(
+            self.sft_path,
+            pair_ids=partial_ids,
+        )
+        self.partial_image_paths.update(
+            _existing_training_image_paths(
+                self.verl_path,
+                pair_ids=partial_ids,
+            )
+        )
+        self.committed_image_paths: dict[str, str] = {}
         self.sft_handle = self.sft_path.open("a", encoding="utf-8", buffering=1)
         self.verl_handle = self.verl_path.open("a", encoding="utf-8", buffering=1)
         self.added_sft = 0
@@ -2663,9 +2772,104 @@ class _RealtimeTrainingWriter:
         self.recovered_parts = 0
         self._recover_parts()
 
+    def _record_mutations(self, verl: dict[str, Any]) -> None:
+        if self.mutation_policy == weighted_mutation.POLICY_NAME:
+            weighted_mutation.count_changes(
+                verl["extra_info"]["changes"], self.mutation_counts,
+            )
+
+    def _sync_training_pair(self) -> None:
+        if self.mutation_policy == weighted_mutation.POLICY_NAME:
+            os.fsync(self.sft_handle.fileno())
+            os.fsync(self.verl_handle.fileno())
+
     @property
     def complete_ids(self) -> set[str]:
         return self.sft_ids & self.verl_ids
+
+    def _new_image_relative_path(self, pair_id: str) -> str:
+        ordinal = len(self.sft_ids | self.verl_ids)
+        shard_id = ordinal // self.images_per_shard
+        return f"images/shard_{shard_id:05d}/{pair_id}.png"
+
+    def _promote_image(
+        self,
+        *,
+        pair_id: str,
+        source_image: Path,
+    ) -> str:
+        relative = self.partial_image_paths.get(pair_id)
+        if relative is None:
+            relative = self._new_image_relative_path(pair_id)
+        destination = (self.dataset_dir / relative).resolve()
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        source = source_image.resolve()
+        if source != destination:
+            try:
+                source.replace(destination)
+            except OSError as error:
+                if error.errno != errno.EXDEV:
+                    raise
+                temporary = destination.with_name(
+                    f".{destination.name}.tmp.{os.getpid()}"
+                )
+                shutil.copy2(source, temporary)
+                temporary.replace(destination)
+                source.unlink(missing_ok=True)
+        self.committed_image_paths[pair_id] = relative
+        page_dir = self.dataset_dir.parent / "pages" / pair_id
+        if page_dir.is_dir() and not destination.is_relative_to(page_dir.resolve()):
+            shutil.rmtree(page_dir)
+            try:
+                page_dir.parent.rmdir()
+            except OSError:
+                pass
+        return relative
+
+    def _promote_part_rows(
+        self,
+        *,
+        pair_id: str,
+        sft: dict[str, Any],
+        verl: dict[str, Any],
+    ) -> tuple[dict[str, Any], dict[str, Any]] | None:
+        relative_candidates: list[str] = []
+        try:
+            for row in (sft, verl):
+                raw_image = row["images"][0]
+                if isinstance(raw_image, str) and raw_image:
+                    relative_candidates.append(raw_image)
+        except (KeyError, IndexError, TypeError):
+            return None
+        partial_image = self.partial_image_paths.get(pair_id)
+        if partial_image is not None:
+            relative_candidates.append(partial_image)
+        relative_candidates.extend(
+            (
+                f"../pages/{pair_id}/page.png",
+                self._new_image_relative_path(pair_id),
+            )
+        )
+        source_image = next(
+            (
+                (self.dataset_dir / relative).resolve()
+                for relative in dict.fromkeys(relative_candidates)
+                if (self.dataset_dir / relative).resolve().is_file()
+            ),
+            None,
+        )
+        if source_image is None:
+            return None
+        relative = self._promote_image(
+            pair_id=pair_id,
+            source_image=source_image,
+        )
+        sft["images"] = [relative]
+        verl["images"] = [relative]
+        if self.prompt_style == DOC2MD_PROMPT_STYLE:
+            sft["messages"][0]["content"] = DOC2MD_SFT_PROMPT
+            verl["prompt"][0]["content"] = DOC2MD_PROMPT
+        return sft, verl
 
     @staticmethod
     def _read_part(path: Path, expected_id: str) -> dict[str, Any] | None:
@@ -2718,6 +2922,14 @@ class _RealtimeTrainingWriter:
                 if page_dir.is_dir():
                     shutil.rmtree(page_dir)
                 continue
+            promoted = self._promote_part_rows(
+                pair_id=pair_id,
+                sft=sft,
+                verl=verl,
+            )
+            if promoted is None:
+                continue
+            sft, verl = promoted
             if pair_id not in self.sft_ids:
                 self._append_row(self.sft_handle, sft)
                 self.sft_ids.add(pair_id)
@@ -2725,7 +2937,9 @@ class _RealtimeTrainingWriter:
             if pair_id not in self.verl_ids:
                 self._append_row(self.verl_handle, verl)
                 self.verl_ids.add(pair_id)
+                self._record_mutations(verl)
                 self.recovered_parts += 1
+            self._sync_training_pair()
             sft_path.unlink(missing_ok=True)
             verl_path.unlink(missing_ok=True)
         try:
@@ -2756,7 +2970,18 @@ class _RealtimeTrainingWriter:
             or not result.changes
         ):
             return False
-        sft, verl = _realtime_training_rows(result, self.dataset_dir)
+        if result.page_id in self.complete_ids:
+            return True
+        relative = self._promote_image(
+            pair_id=result.page_id,
+            source_image=Path(result.image),
+        )
+        promoted_result = replace(
+            result,
+            image=str((self.dataset_dir / relative).resolve()),
+            prompt_style=self.prompt_style,
+        )
+        sft, verl = _realtime_training_rows(promoted_result, self.dataset_dir)
         if result.page_id not in self.sft_ids:
             self._append_row(self.sft_handle, sft)
             self.sft_ids.add(result.page_id)
@@ -2764,10 +2989,21 @@ class _RealtimeTrainingWriter:
         if result.page_id not in self.verl_ids:
             self._append_row(self.verl_handle, verl)
             self.verl_ids.add(result.page_id)
+            self._record_mutations(verl)
             self.added_verl += 1
+        self._sync_training_pair()
         if result.page_id in self.complete_ids:
             self._remove_parts(result.page_id)
         return True
+
+    def result_for_output(self, result: WorkerResult) -> WorkerResult:
+        relative = self.committed_image_paths.get(result.page_id)
+        if relative is None:
+            return result
+        return replace(
+            result,
+            image=str((self.dataset_dir / relative).resolve()),
+        )
 
     def checkpoint(
         self,
@@ -2778,11 +3014,17 @@ class _RealtimeTrainingWriter:
         rejected: int,
         started: float,
     ) -> None:
+        if self.mutation_policy == weighted_mutation.POLICY_NAME:
+            _atomic_json(
+                self.dataset_dir / "mutation_distribution.json",
+                weighted_mutation.distribution_report(self.mutation_counts),
+            )
         _atomic_json(
             self.dataset_dir / "progress.json",
             {
                 "pipeline_version": PIPELINE_VERSION,
                 "mode": "direct_edit",
+                "prompt_style": self.prompt_style,
                 "target_count": self.target_count,
                 "target_reached": (
                     self.target_count > 0 and accepted >= self.target_count
@@ -2793,11 +3035,24 @@ class _RealtimeTrainingWriter:
                 "rejected": rejected,
                 "sft_rows": len(self.sft_ids),
                 "verl_rows": len(self.verl_ids),
+                "images_per_shard": self.images_per_shard,
+                "image_shards": (
+                    (len(self.sft_ids | self.verl_ids) - 1)
+                    // self.images_per_shard
+                    + 1
+                    if self.sft_ids or self.verl_ids
+                    else 0
+                ),
                 "elapsed_seconds": time.monotonic() - started,
             },
         )
 
     def close(self) -> None:
+        if self.mutation_policy == weighted_mutation.POLICY_NAME:
+            _atomic_json(
+                self.dataset_dir / "mutation_distribution.json",
+                weighted_mutation.distribution_report(self.mutation_counts),
+            )
         self.sft_handle.close()
         self.verl_handle.close()
 
@@ -2808,6 +3063,10 @@ def _discard_unselected_direct_result(result: WorkerResult, output: Path) -> Non
     page_dir = output / "pages" / result.page_id
     if page_dir.is_dir():
         shutil.rmtree(page_dir)
+        try:
+            page_dir.parent.rmdir()
+        except OSError:
+            pass
     parts_dir = output / "realtime_training" / "parts"
     for suffix in (".sft.jsonl", ".verl.jsonl"):
         (parts_dir / f"{result.page_id}{suffix}").unlink(missing_ok=True)
@@ -2828,7 +3087,7 @@ def _admit_direct_result(
     """Commit one valid result, deduplicate it, or discard target overrun."""
 
     if result.page_id in accepted_ids:
-        writer.add(result)
+        _discard_unselected_direct_result(result, output)
         return "duplicate"
     if target_count > 0 and len(accepted_ids) >= target_count:
         _discard_unselected_direct_result(result, output)
@@ -2884,7 +3143,10 @@ def _run_fused_crawler_direct_pipeline(
     stop_file = Path(config.stop_file) if config.stop_file is not None else None
     if stop_file is not None:
         stop_file.unlink(missing_ok=True)
-    realtime_writer = _RealtimeTrainingWriter(output, target_count=target_count)
+    realtime_writer = _RealtimeTrainingWriter(
+        output, target_count=target_count, mutation_policy=mutation_config.policy,
+        prompt_style=config.prompt_style,
+    )
     accepted_ids = set(realtime_writer.complete_ids)
     initial_accepted = len(accepted_ids)
     if target_count > 0 and initial_accepted > target_count:
@@ -3206,7 +3468,9 @@ def _run_fused_crawler_direct_pipeline(
                                 discarded_overrun += 1
                             elif admission == "admitted":
                                 if debug_artifacts:
-                                    stage_results.append(row)
+                                    stage_results.append(
+                                        realtime_writer.result_for_output(row)
+                                    )
                                 target_progress.update(
                                     accepted=len(accepted_ids),
                                     rejected=stage_rejected,
@@ -3333,10 +3597,14 @@ def _run_fused_crawler_direct_pipeline(
                 "completed_jobs": completed_jobs,
                 "available_jobs": available_jobs,
                 "clean_pages_generated": 0,
+                "mutation_policy_version": mutation_config.policy_version,
+                "mutation_config": asdict(mutation_config),
+                "prompt_style": config.prompt_style,
                 "final_dataset_variant": "confusable_edited_only",
                 "sft": "realtime_training/sft.jsonl",
                 "verl": "realtime_training/verl.jsonl",
-                "pages": "pages",
+                "images": "realtime_training/images",
+                "images_per_shard": _IMAGES_PER_SHARD,
                 "input_mode": "crawler_archives",
                 "papers_selected": total_sources,
                 "papers_completed": source_completed,
@@ -3367,6 +3635,7 @@ def _export(
     mutation_execution: str = "clean_then_edit",
     input_report: dict[str, Any] | None = None,
 ) -> None:
+    sft_prompt, verl_prompt = _training_prompts(config.prompt_style)
     accepted = sorted(
         (result for result in results if result.status == "accepted"),
         key=lambda row: row.page_id,
@@ -3417,7 +3686,8 @@ def _export(
                 result.max_mutation_vertical_shift_points
             ),
             "mutation_policy_version": (
-                MUTATION_POLICY_VERSION if result.mutation_count else None
+                mutation_config.policy_version
+                if result.mutation_count and mutation_config is not None else None
             ),
             "ground_truth_source": (
                 "latex_ast_confusable_edit" if is_mutated else "latex_ast_only"
@@ -3428,7 +3698,7 @@ def _export(
         sft.append(
             {
                 "messages": [
-                    {"role": "user", "content": _SFT_PROMPT},
+                    {"role": "user", "content": sft_prompt},
                     {"role": "assistant", "content": result.markdown},
                 ],
                 "images": [image],
@@ -3448,7 +3718,7 @@ def _export(
             {
                 "images": [image],
                 "conversations": [
-                    {"from": "human", "value": _SFT_PROMPT},
+                    {"from": "human", "value": sft_prompt},
                     {"from": "gpt", "value": result.markdown},
                 ],
             }
@@ -3459,7 +3729,7 @@ def _export(
                 "prompt": [
                     {
                         "role": "user",
-                        "content": "<image>\nPlease transcribe all text in this page image faithfully, exactly as printed (including any typos).",
+                        "content": verl_prompt,
                     }
                 ],
                 "images": [image],
@@ -3524,7 +3794,7 @@ def _export(
         "mutation_mode": "confusable" if mutation_config is not None else "off",
         "mutation_execution": mutation_execution,
         "mutation_policy_version": (
-            MUTATION_POLICY_VERSION if mutation_config is not None else None
+            mutation_config.policy_version if mutation_config is not None else None
         ),
         "mutation_config": (
             asdict(mutation_config) if mutation_config is not None else None
@@ -3585,8 +3855,12 @@ def _export(
     _atomic_json(output / "pipeline_report.json", report)
 
 
-def _parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(description=__doc__)
+def _parser(*, default_mutation_policy: str = "v4") -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(description=(
+        "V5 multimodal arXiv synthesis: pair-weighted 1012-letter mutations, "
+        "parallel edited compilation, and streaming SFT/VERL export."
+        if default_mutation_policy == weighted_mutation.POLICY_NAME else __doc__
+    ))
     inputs = parser.add_mutually_exclusive_group(required=True)
     inputs.add_argument(
         "--papers-root",
@@ -3699,6 +3973,11 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--max-mutations-per-page", type=int, default=4)
     parser.add_argument("--four-mutation-probability", type=float, default=0.6)
     parser.add_argument(
+        "--mutation-policy", choices=("v4", weighted_mutation.POLICY_NAME),
+        default=default_mutation_policy,
+        help="Character sampling policy; V5 defaults to the 1012 observed letter-pair weights.",
+    )
+    parser.add_argument(
         "--max-mutation-vertical-shift-points",
         type=float,
         default=1.25,
@@ -3710,10 +3989,13 @@ def _parser() -> argparse.ArgumentParser:
     return parser
 
 
-def main(argv: Sequence[str] | None = None) -> int:
+def main(
+    argv: Sequence[str] | None = None, *, default_mutation_policy: str = "v4",
+    default_prompt_style: str = "legacy",
+) -> int:
     global _VERBOSE_OUTPUT
 
-    args = _parser().parse_args(argv)
+    args = _parser(default_mutation_policy=default_mutation_policy).parse_args(argv)
     _VERBOSE_OUTPUT = args.verbose
     unbounded_input = args.full_corpus or args.target_count > 0
     paper_limit = 0 if unbounded_input else args.paper_limit
@@ -3726,6 +4008,10 @@ def main(argv: Sequence[str] | None = None) -> int:
         raise SystemExit("--max-pages must be non-negative")
     if args.target_count < 0:
         raise SystemExit("--target-count must be non-negative")
+    if args.mutation_policy == weighted_mutation.POLICY_NAME and (
+        args.mutation_mode != "confusable" or args.mutation_execution != "direct"
+    ):
+        raise SystemExit("empirical_1012 requires direct confusable mutation")
     if args.target_count > 0 and (
         args.mutation_mode != "confusable" or args.mutation_execution != "direct"
     ):
@@ -3785,7 +4071,10 @@ def main(argv: Sequence[str] | None = None) -> int:
         f"target_fill={args.target_fill_ratio:.3f} min_fill={args.min_fill_ratio:.3f} "
         f"mutation_mode={args.mutation_mode} "
         f"mutation_execution={args.mutation_execution} mutation_seed={mutation_seed} "
+        f"mutation_policy={args.mutation_policy} "
+        f"prompt_style={default_prompt_style} "
         f"mutations={args.min_mutations_per_page}-{args.max_mutations_per_page} "
+        f"images_per_shard={_IMAGES_PER_SHARD} "
         f"input={input_root} output={output} work_dir={work_root}",
     )
     mutation_config = (
@@ -3795,6 +4084,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             maximum_per_page=args.max_mutations_per_page,
             maximum_probability=args.four_mutation_probability,
             max_vertical_shift_points=args.max_mutation_vertical_shift_points,
+            policy=args.mutation_policy,
         )
         if args.mutation_mode == "confusable"
         else None
@@ -3817,9 +4107,11 @@ def main(argv: Sequence[str] | None = None) -> int:
         min_fill_ratio=args.min_fill_ratio,
         work_dir=str(work_root / "compile") if direct_edit else None,
         minimal_output=direct_edit and not args.debug_artifacts,
+        prompt_style=default_prompt_style,
         stop_file=(
             str(output / "realtime_training" / ".target_reached")
-            if args.crawler_root is not None
+            if (args.crawler_root is not None
+                or args.mutation_policy == weighted_mutation.POLICY_NAME)
             and direct_edit
             and args.target_count > 0
             else None
@@ -3898,7 +4190,14 @@ def main(argv: Sequence[str] | None = None) -> int:
         )
         papers_prepared = len(papers)
     pages = _limit_page_candidates(pages, limit=max_pages, seed=args.seed)
-    dense_jobs = _dense_jobs_from_pages(pages)
+    weighted_direct = direct_edit and args.mutation_policy == weighted_mutation.POLICY_NAME
+    dense_jobs = (
+        _bounded_dense_jobs_from_pages(pages)
+        if weighted_direct else _dense_jobs_from_pages(pages)
+    )
+    weighted_stop = Path(config.stop_file) if weighted_direct and config.stop_file else None
+    if weighted_stop is not None:
+        weighted_stop.unlink(missing_ok=True)
     if args.debug_artifacts:
         _atomic_jsonl(
             output / "page_candidates.jsonl",
@@ -3937,7 +4236,10 @@ def main(argv: Sequence[str] | None = None) -> int:
     stage_results: list[WorkerResult] = []
     stage_rejected = completed = discarded_overrun = cancelled_jobs = 0
     realtime_writer = (
-        _RealtimeTrainingWriter(output, target_count=args.target_count)
+        _RealtimeTrainingWriter(
+            output, target_count=args.target_count, mutation_policy=args.mutation_policy,
+            prompt_style=config.prompt_style,
+        )
         if direct_edit
         else None
     )
@@ -3992,6 +4294,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         ] = job
         return True
 
+    last_compile_progress = time.monotonic()
     try:
         with ProcessPoolExecutor(max_workers=args.workers) as executor:
             pending: dict[Any, CanonicalPage] = {}
@@ -4000,8 +4303,32 @@ def main(argv: Sequence[str] | None = None) -> int:
             ):
                 pass
             while pending:
-                done, _ = wait(pending, timeout=30, return_when=FIRST_COMPLETED)
+                done, _ = wait(
+                    pending, timeout=1 if weighted_direct else 30,
+                    return_when=FIRST_COMPLETED,
+                )
+                if weighted_direct and realtime_writer is not None and not args.debug_artifacts:
+                    recovered = realtime_writer.recover_parts()
+                    if recovered:
+                        accepted_ids.update(recovered)
+                        stage_accepted = len(accepted_ids)
+                        target_progress.update(accepted=stage_accepted, rejected=stage_rejected)
+                        realtime_writer.checkpoint(
+                            completed_jobs=completed, total_jobs=len(dense_jobs),
+                            accepted=stage_accepted, rejected=stage_rejected, started=started,
+                        )
+                if weighted_stop is not None and not target_open():
+                    if not weighted_stop.is_file():
+                        _atomic_text(weighted_stop, "target reached\n")
+                    for queued in list(pending):
+                        if queued.cancel():
+                            pending.pop(queued)
+                            done.discard(queued)
+                            cancelled_jobs += 1
                 if not done:
+                    if weighted_direct and time.monotonic() - last_compile_progress < 30:
+                        continue
+                    last_compile_progress = time.monotonic()
                     target_progress.update(
                         accepted=stage_accepted,
                         rejected=stage_rejected,
@@ -4091,7 +4418,9 @@ def main(argv: Sequence[str] | None = None) -> int:
                             continue
                         stage_accepted = len(accepted_ids)
                         if args.debug_artifacts:
-                            stage_results.append(row)
+                            stage_results.append(
+                                realtime_writer.result_for_output(row)
+                            )
                         target_progress.update(
                             accepted=stage_accepted,
                             rejected=stage_rejected,
@@ -4129,6 +4458,8 @@ def main(argv: Sequence[str] | None = None) -> int:
                     ):
                         pass
     finally:
+        if weighted_stop is not None:
+            weighted_stop.unlink(missing_ok=True)
         target_progress.finish(
             accepted=stage_accepted,
             rejected=stage_rejected,
@@ -4361,10 +4692,14 @@ def main(argv: Sequence[str] | None = None) -> int:
                 "completed_jobs": completed,
                 "available_jobs": len(dense_jobs),
                 "clean_pages_generated": 0,
+                "mutation_policy_version": mutation_config.policy_version,
+                "mutation_config": asdict(mutation_config),
+                "prompt_style": config.prompt_style,
                 "final_dataset_variant": "confusable_edited_only",
                 "sft": "realtime_training/sft.jsonl",
                 "verl": "realtime_training/verl.jsonl",
-                "pages": "pages",
+                "images": "realtime_training/images",
+                "images_per_shard": _IMAGES_PER_SHARD,
                 "input_mode": input_mode,
                 "papers_selected": selected_count,
                 "papers_prepared": papers_prepared,
@@ -4386,7 +4721,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         f"mutation_execution={args.mutation_execution} "
         f"clean_accepted={clean_accepted} clean_rejected={clean_rejected} "
         f"final_accepted={accepted} final_rejected={rejected} "
-        f"acceptance={accepted / max(1, len(results)):.2%} elapsed={elapsed:.1f}s",
+        f"acceptance_this_run={max(0, accepted - initial_accepted) / max(1, accepted - initial_accepted + rejected):.2%} "
+        f"elapsed={elapsed:.1f}s",
     )
     return 0
 

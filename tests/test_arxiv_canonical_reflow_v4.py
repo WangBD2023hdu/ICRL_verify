@@ -521,6 +521,7 @@ def test_target_crawler_pipeline_submits_compile_before_all_sources_finish(
 
     def fake_compile(page, _config, *, mutation_config):
         del mutation_config
+        (tmp_path / "page.png").write_bytes(b"png")
         return (
             builder.WorkerResult(
                 page_id=f"{page.page_id}_edited",
