@@ -22,7 +22,7 @@ from .ast_ir import (
     parse_source_ir,
 )
 
-TABLE_AST_VERSION = "source_first_v3_table_ast_v2"
+TABLE_AST_VERSION = "source_first_v3_table_ast_v3"
 
 _SUPPORTED_ENVIRONMENTS = frozenset({"tabular", "tabular*", "tabularx", "array"})
 _SUPPORTED_CELL_ENVIRONMENTS = frozenset({"enumerate", "itemize"})
@@ -40,11 +40,37 @@ _ENVIRONMENT_TOKEN = re.compile(
 _PAR_COMMAND = re.compile(r"\\par(?![A-Za-z@])")
 _ITEM_COMMAND = re.compile(r"\\item(?![A-Za-z@])")
 _POSITIVE_INTEGER = re.compile(r"[1-9][0-9]*")
-_LITERAL_COLUMN_SPEC = re.compile(r"[A-Za-z0-9*{}@.<>|!+\-/:;=, \t\\]+")
+_COLUMN_WIDTH = re.compile(
+    r"(?:"
+    r"[+\-]?(?:(?:\d+(?:\.\d*)?|\.\d+)[ \t]*)?"
+    r"\\(?:linewidth|columnwidth|textwidth|hsize)"
+    r"|"
+    r"[+\-]?(?:\d+(?:\.\d*)?|\.\d+)"
+    r"(?:pt|pc|in|bp|cm|mm|dd|cc|sp|ex|em)"
+    r")[ \t]*"
+)
 _LITERAL_DIMENSION_OR_STAR = re.compile(
     r"(?:\*|[+\-]?(?:(?:\d+(?:\.\d*)?)|(?:\.\d+))"
     r"(?:pt|pc|in|bp|cm|mm|dd|cc|sp|ex|em))"
 )
+_FORMAT_BARE_COMMANDS = frozenset(
+    {
+        "arraybackslash",
+        "centering",
+        "fill",
+        "hfill",
+        "hfil",
+        "hss",
+        "raggedleft",
+        "raggedright",
+        "strut",
+    }
+)
+_FORMAT_ARGUMENT_COMMANDS = frozenset(
+    {"extracolsep", "hspace", "hspace*", "hskip", "kern", "vspace", "vspace*"}
+)
+_FORMAT_CONTROL_SYMBOLS = frozenset(",;:!. ")
+_MAX_COLUMN_SPEC_DEPTH = 16
 
 
 class TableAstError(ValueError):
@@ -243,11 +269,108 @@ def _command_end(source: str, cursor: int, limit: int) -> tuple[str, int]:
     return source[cursor + 1 : end], end
 
 
+def _column_group(source: str, cursor: int) -> tuple[int, int, int]:
+    """Read one required column-preamble group without accepting comments."""
+
+    while cursor < len(source) and source[cursor].isspace():
+        cursor += 1
+    if cursor >= len(source) or source[cursor] != "{":
+        raise TableAstError("expected balanced column-preamble group")
+    end = _balanced_end(source, cursor, len(source))
+    return cursor + 1, end - 1, end
+
+
+def _is_safe_column_width(value: str) -> bool:
+    return _COLUMN_WIDTH.fullmatch(value.strip()) is not None
+
+
+def _validate_column_modifier(value: str) -> None:
+    """Allow only non-visible, known formatting material in a preamble."""
+
+    cursor = 0
+    while cursor < len(value):
+        if value[cursor].isspace():
+            cursor += 1
+            continue
+        if value[cursor] != "\\":
+            raise TableAstError("column modifier contains visible or unsafe text")
+        if cursor + 1 >= len(value):
+            raise TableAstError("column modifier has a trailing escape")
+        if not (value[cursor + 1].isalpha() or value[cursor + 1] == "@"):
+            if value[cursor + 1] not in _FORMAT_CONTROL_SYMBOLS:
+                raise TableAstError("column modifier contains an unsafe control symbol")
+            cursor += 2
+            continue
+        name, command_end = _command_end(value, cursor, len(value))
+        if name in _FORMAT_BARE_COMMANDS:
+            cursor = command_end
+            continue
+        if name not in _FORMAT_ARGUMENT_COMMANDS:
+            raise TableAstError(f"unknown column modifier command: \\{name}")
+        argument_start, argument_end, cursor = _column_group(value, command_end)
+        argument = value[argument_start:argument_end].strip()
+        if name == "extracolsep":
+            if argument != r"\fill" and not _is_safe_column_width(argument):
+                raise TableAstError("unsafe extracolsep column modifier")
+        elif not _is_safe_column_width(argument):
+            raise TableAstError(f"unsafe {name} column modifier")
+
+
+def _column_spec_count(spec: str, *, _depth: int = 0) -> int:
+    """Count columns in a conservative literal LaTeX column preamble."""
+
+    if _depth > _MAX_COLUMN_SPEC_DEPTH:
+        raise TableAstError("column preamble nesting is too deep")
+    cursor = 0
+    count = 0
+    while True:
+        while cursor < len(spec) and spec[cursor].isspace():
+            cursor += 1
+        if cursor >= len(spec):
+            break
+        token = spec[cursor]
+        if token == "|":
+            cursor += 1
+            continue
+        if token in "lcrX":
+            count += 1
+            cursor += 1
+            continue
+        if token in "pmb":
+            cursor += 1
+            width_start, width_end, cursor = _column_group(spec, cursor)
+            if not _is_safe_column_width(spec[width_start:width_end]):
+                raise TableAstError("unsafe p/m/b column width")
+            count += 1
+            continue
+        if token == "*":
+            cursor += 1
+            repeat_start, repeat_end, cursor = _column_group(spec, cursor)
+            repeat_text = spec[repeat_start:repeat_end].strip()
+            if _POSITIVE_INTEGER.fullmatch(repeat_text) is None:
+                raise TableAstError("column repetition count is not positive")
+            nested_start, nested_end, cursor = _column_group(spec, cursor)
+            nested_count = _column_spec_count(
+                spec[nested_start:nested_end], _depth=_depth + 1
+            )
+            count += int(repeat_text) * nested_count
+            continue
+        if token in "@!<>":
+            cursor += 1
+            modifier_start, modifier_end, cursor = _column_group(spec, cursor)
+            _validate_column_modifier(spec[modifier_start:modifier_end])
+            continue
+        raise TableAstError(f"unknown or unsafe column-preamble token: {token!r}")
+    if count < 1:
+        raise TableAstError("column preamble has no columns")
+    return count
+
+
 def _find_environment_body(
     source: str,
     start: int,
     end: int,
-) -> tuple[str, int, int]:
+) -> tuple[str, int, int, int]:
     match = _BEGIN.match(source, start, end)
     if match is None:
         raise TableAstError("table source does not begin with a literal environment")
@@ -264,8 +387,7 @@ def _find_environment_body(
         body_start, body_end, cursor = _required_group(source, cursor, end)
         arguments.append(source[body_start:body_end].strip())
     column_spec = arguments[-1]
-    if not column_spec or _LITERAL_COLUMN_SPEC.fullmatch(column_spec) is None:
-        raise TableAstError("table column specification is not a safe literal")
+    column_count = _column_spec_count(column_spec)
     body_start = cursor
     closing_pattern = re.compile(
         r"\\end\s*\{\s*" + re.escape(environment) + r"\s*\}"
@@ -288,7 +410,7 @@ def _find_environment_body(
         raise TableAstError("unterminated nested table cell environment")
     if source[closing[0].end() : end].strip():
         raise TableAstError("visible or control source follows the table environment")
-    return environment, body_start, closing[0].start()
+    return environment, body_start, closing[0].start(), column_count
 
 
 def _split_top_level(
@@ -459,7 +581,7 @@ def _unwrap_span_commands(
             body_start, body_end, cursor = _required_group(source, cursor, cursor_end)
             if (
                 _POSITIVE_INTEGER.fullmatch(count) is None
-                or _LITERAL_COLUMN_SPEC.fullmatch(spec) is None
+                or _column_spec_count(spec) < 1
                 or _skip_ignored(source, cursor, cursor_end) != cursor_end
             ):
                 raise TableAstError("unsafe or nonliteral multicolumn cell")
@@ -920,15 +1042,25 @@ def _parse_cell(
     )
 
 
-def _validate_grid(rows: list[list[TableCellAst]]) -> int:
-    coverages: list[set[int]] = []
+def _validate_grid(
+    rows: list[list[TableCellAst]],
+    *,
+    declared_columns: int,
+    header_break: int | None,
+) -> tuple[tuple[TableCellAst, ...], ...]:
+    """Validate source spans and return cells safe to serialize per row."""
+
+    if declared_columns < 1:
+        raise TableAstError("table has no declared columns")
+    expected = set(range(declared_columns))
     active_until: dict[int, int] = {}
-    max_column = 0
+    rendered_rows: list[tuple[TableCellAst, ...]] = []
     for row_index, cells in enumerate(rows):
         occupied = {
             column for column, until in active_until.items() if until >= row_index
         }
         column = 0
+        rendered: list[TableCellAst] = []
         for cell in cells:
             if (
                 column in occupied
@@ -938,24 +1070,37 @@ def _validate_grid(rows: list[list[TableCellAst]]) -> int:
             ):
                 column += 1
                 continue
-            while column in occupied:
-                column += 1
+            if column in occupied:
+                raise TableAstError("table row omits a rowspan placeholder")
             cell_columns = set(range(column, column + cell.colspan))
+            if not cell_columns.issubset(expected):
+                raise TableAstError("table cell exceeds declared column count")
             if occupied.intersection(cell_columns):
                 raise TableAstError("table cell spans overlap")
             occupied.update(cell_columns)
             if cell.rowspan > 1:
                 for target in cell_columns:
                     active_until[target] = row_index + cell.rowspan - 1
+            rendered.append(cell)
             column += cell.colspan
         if not occupied:
             raise TableAstError("table row has no cells")
-        max_column = max(max_column, max(occupied) + 1)
-        coverages.append(occupied)
-    expected = set(range(max_column))
-    if any(coverage != expected for coverage in coverages):
-        raise TableAstError("table rows do not form one complete rectangular grid")
-    return max_column
+        if occupied != expected:
+            raise TableAstError("table row does not cover declared column grid")
+        rendered_rows.append(tuple(rendered))
+    if any(until >= len(rows) for until in active_until.values()):
+        raise TableAstError("rowspan extends past the final table row")
+    if header_break is not None:
+        for row_index, cells in enumerate(rows):
+            if row_index >= header_break:
+                break
+            if any(
+                row_index + cell.rowspan > header_break
+                for cell in cells
+                if cell.rowspan > 1
+            ):
+                raise TableAstError("rowspan crosses the table section boundary")
+    return tuple(rendered_rows)
 
 
 def parse_strict_table(
@@ -971,7 +1116,9 @@ def parse_strict_table(
 
     if not (0 <= start < end <= len(source)):
         raise TableAstError("table source span is invalid")
-    environment, body_start, body_end = _find_environment_body(source, start, end)
+    environment, body_start, body_end, column_count = _find_environment_body(
+        source, start, end
+    )
     row_spans = _split_top_level(source, body_start, body_end, delimiter=r"\\")
     rows: list[list[TableCellAst]] = []
     row_source_spans: list[tuple[int, int]] = []
@@ -981,12 +1128,11 @@ def parse_strict_table(
         row_start, row_end = _trim(source, raw_start, raw_end)
         row_start, rules = _consume_rule_prefix(source, row_start, row_end)
         saw_toprule = saw_toprule or "toprule" in rules
-        if "midrule" in rules:
+        if "midrule" in rules and header_break is None and saw_toprule and rows:
             # The first midrule following a top rule proves the header/body
             # boundary.  Later midrules are ordinary body separators and do
             # not make that already-proven boundary ambiguous.
-            if header_break is None and saw_toprule and rows:
-                header_break = len(rows)
+            header_break = len(rows)
         row_start, row_end = _trim(source, row_start, row_end)
         if row_start == row_end:
             continue
@@ -1008,7 +1154,11 @@ def parse_strict_table(
         raise TableAstError("table has no visible source-derived cell content")
     if header_break == len(rows):
         raise TableAstError("table header boundary has no body rows")
-    column_count = _validate_grid(rows)
+    rendered_rows = _validate_grid(
+        rows,
+        declared_columns=column_count,
+        header_break=header_break,
+    )
     row_asts = tuple(
         TableRowAst(
             cells=tuple(cells),
@@ -1018,20 +1168,30 @@ def parse_strict_table(
         for index, cells in enumerate(rows)
     )
     lines = ["<table>"]
-    sections: list[tuple[str, tuple[TableRowAst, ...]]] = []
+    sections: list[
+        tuple[
+            str,
+            tuple[TableRowAst, ...],
+            tuple[tuple[TableCellAst, ...], ...],
+        ]
+    ] = []
     if header_break is not None:
-        sections.append(("thead", row_asts[:header_break]))
-        sections.append(("tbody", row_asts[header_break:]))
+        sections.append(
+            ("thead", row_asts[:header_break], rendered_rows[:header_break])
+        )
+        sections.append(
+            ("tbody", row_asts[header_break:], rendered_rows[header_break:])
+        )
     else:
-        sections.append(("tbody", row_asts))
-    for section_name, section_rows in sections:
+        sections.append(("tbody", row_asts, rendered_rows))
+    for section_name, section_rows, rendered_section_rows in sections:
         if not section_rows:
             continue
         lines.append(f"  <{section_name}>")
-        for row in section_rows:
+        for _row, rendered_cells in zip(section_rows, rendered_section_rows):
             lines.append("    <tr>")
             tag = "th" if section_name == "thead" else "td"
-            for cell in row.cells:
+            for cell in rendered_cells:
                 attributes: list[str] = []
                 if cell.colspan > 1:
                     attributes.append(f'colspan="{cell.colspan}"')

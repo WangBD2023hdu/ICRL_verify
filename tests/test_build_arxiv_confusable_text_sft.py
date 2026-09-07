@@ -5,15 +5,16 @@ import copy
 import hashlib
 import importlib.util
 import json
-from pathlib import Path
 import random
+import re
 import shutil
 import subprocess
 import sys
 import tarfile
 import tempfile
 import unittest
-
+from pathlib import Path
+from unittest import mock
 
 SCRIPT = Path(__file__).resolve().parents[1] / "scripts" / "build_arxiv_confusable_text_sft.py"
 SPEC = importlib.util.spec_from_file_location("build_arxiv_confusable_text_sft", SCRIPT)
@@ -25,6 +26,10 @@ SPEC.loader.exec_module(MODULE)
 
 class ArxivConfusableTextSftTests(unittest.TestCase):
     def test_english_prompt_and_sample_are_exact_text_copy(self) -> None:
+        self.assertEqual(
+            MODULE.sha256_text(MODULE.PROMPT_PREFIX + "{A}" + MODULE.PROMPT_SUFFIX),
+            "d0cb3fc514819601449d1413774e7b86d1618de97a25ba81739b7f60a923520a",
+        )
         markdown = "The availobility evidence remains **important**."
         prompt = MODULE.build_prompt(markdown)
         self.assertTrue(prompt.startswith("Please rewrite the document enclosed"))
@@ -79,7 +84,7 @@ This is a \textbf{carefully written} paragraph with $x_i$ and prior work
             self.assertEqual(edited[start:end], change["ocr_ans"])
             self.assertEqual(len(change["origin_ans"]), len(change["ocr_ans"]))
 
-    def _text_block(self, markdown: str, *, source_start: int = 0) -> object:
+    def _text_block(self, markdown: str, *, source_start: int = 0, kind: str = "text") -> object:
         return MODULE.TextBlock(
             source_file="main.tex",
             source_start=source_start,
@@ -87,7 +92,118 @@ This is a \textbf{carefully written} paragraph with $x_i$ and prior work
             line_start=1,
             line_end=markdown.count("\n") + 1,
             markdown=markdown,
+            kind=kind,
         )
+
+    def test_extracts_source_tables_without_flattening_or_splitting_them(self) -> None:
+        raw = r"""\documentclass{article}
+\begin{document}
+\section{Evaluation}
+
+Visible prose before the source table remains here.
+\begin{table}[t]
+\centering
+\caption{Comparison}
+\begin{tabular}{lcc}
+\toprule
+Method & Score & Formula \\
+\midrule
+\multirow{2}{*}{\textbf{Baseline}} & 81 & $x_i + 1$ \\
+
+ & \multicolumn{2}{c}{\textit{shared result}} \\
+\bottomrule
+\end{tabular}
+\label{tab:comparison}
+\end{table}
+Visible prose after the source table remains here.
+
+\begin{tabularx}{\linewidth}{lX}
+Research & observation \\
+\end{tabularx}
+\end{document}
+"""
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            path = root / "main.tex"
+            path.write_text(raw, encoding="utf-8")
+            blocks, reasons = MODULE.extract_blocks(path, root)
+        self.assertFalse(reasons, reasons)
+        tables = [block for block in blocks if block.kind == "table"]
+        self.assertEqual(len(tables), 2)
+        self.assertEqual(tables[0].markdown.count("<table>"), 1)
+        self.assertIn('rowspan="2"', tables[0].markdown)
+        self.assertIn('colspan="2"', tables[0].markdown)
+        self.assertIn("<strong>Baseline</strong>", tables[0].markdown)
+        self.assertIn("$x_i + 1$", tables[0].markdown)
+        self.assertNotIn("<td></td>", tables[0].markdown)
+        self.assertNotIn("Comparison", tables[0].markdown)
+        self.assertNotIn("data-", tables[0].markdown)
+        self.assertEqual([b.markdown for b in blocks if b.kind == "caption"], ["Comparison"])
+        self.assertEqual(
+            [block.kind for block in blocks],
+            ["text", "text", "caption", "table", "text", "table"],
+        )
+        for block in tables:
+            self.assertIn(r"\begin{tabular", raw.splitlines()[block.line_start - 1])
+        self.assertNotIn("Table 1", "\n".join(b.markdown for b in blocks))
+
+    def test_rejected_table_and_figure_contents_never_leak_as_prose(self) -> None:
+        raw = r"""Ordinary research text before the excluded blocks.
+\begin{table}
+\caption{Rejected caption must not survive}
+\begin{tabular}{cc}
+\unknownmacro{LeakOne} & LeakTwo \\
+\end{tabular}
+\end{table}
+\begin{longtable}{cc}
+LeakThree & LeakFour \\
+\end{longtable}
+\begin{figure}
+\begin{tabular}{c}LeakFive\end{tabular}
+\end{figure}
+Ordinary research text after the excluded blocks.
+\begin{table}
+\begin{tabular}{c} Unclosed table content must not leak.
+"""
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            path = root / "main.tex"
+            path.write_text(raw, encoding="utf-8")
+            blocks, reasons = MODULE.extract_blocks(path, root)
+        self.assertEqual(len(blocks), 2)
+        self.assertTrue(all(b.kind == "text" for b in blocks))
+        self.assertEqual(sum(reasons.values()), 3, reasons)
+        self.assertNotIn("Leak", "\n".join(b.markdown for b in blocks))
+
+    def test_mutation_keeps_html_tags_attributes_entities_and_math_exact(self) -> None:
+        table = (
+            '<table><tbody><tr><td colspan="2">'
+            + "availability observation " * 20
+            + '&quot; &nbsp; &amp; &#123; &#xAB; $availability$'
+            + '</td></tr></tbody></table>'
+        )
+        edited, changes = MODULE.mutate_markdown(
+            table, response_tokens=1500, rng=random.Random(83),
+            mutation_word_ratio=0.5, min_mutations=3,
+        )
+        protected = r"<[^>]+>|&[^;]+;|\$[^$]+\$"
+        self.assertEqual(re.findall(protected, table), re.findall(protected, edited))
+        self.assertGreater(len(changes), 3)
+        self.assertEqual(len(table), len(edited))
+
+    def test_table_html_is_identical_between_a_and_fenced_b(self) -> None:
+        table = "<table>\n<tbody><tr><td>###  table heading</td></tr></tbody>\n</table>"
+        blocks = [
+            self._text_block("#  Heading"),
+            self._text_block(table, source_start=100, kind="table"),
+            self._text_block("## literal caption", source_start=200, kind="caption"),
+        ]
+        a = "\n\n".join(b.markdown for b in blocks)
+        b, changes = MODULE.rewrite_heading_levels(a, blocks=blocks, rng=random.Random(83))
+        self.assertEqual(len(changes), 1)
+        self.assertTrue(b.endswith("## literal caption"))
+        self.assertEqual(re.search(r"<table>.*</table>", a, re.DOTALL).group(),
+                         re.search(r"<table>.*</table>", b, re.DOTALL).group())
 
     def test_rewrite_heading_levels_covers_levels_spaces_and_only_block_starts(self) -> None:
         blocks = []
@@ -379,6 +495,17 @@ This is a \textbf{carefully written} paragraph with $x_i$ and prior work
         for paragraph_index in range(35):
             words = [vocabulary[(paragraph_index + offset) % len(vocabulary)] for offset in range(45)]
             paragraphs.append(" ".join(words).capitalize() + ".")
+        paragraphs.insert(2, r"""\begin{table}
+\caption{Research comparison}
+\begin{tabular}{lc}
+\toprule
+Method & Accuracy \\
+\midrule
+\textbf{Baseline} & $x_i + 1$ \\
+Observation & 93.5 \\
+\bottomrule
+\end{tabular}
+\end{table}""")
         tex = (
             "\\documentclass{article}\n"
             "\\begin{document}\n"
@@ -623,12 +750,72 @@ This is a \textbf{carefully written} paragraph with $x_i$ and prior work
             for path in sorted((output_dir / "train").glob("part-*.jsonl")):
                 rows.extend(MODULE.read_jsonl(path))
             self.assertEqual(len(rows), summary["merge"]["written_samples"])
+            table_rows = [row for row in rows if row["extra_info"]["table_count"]]
+            self.assertTrue(table_rows)
+            self.assertEqual(len(table_rows), summary["merge"]["table_samples"])
             for row in rows:
                 answer = row["messages"][1]["content"]
                 self.assertTrue(answer.startswith(MODULE.RESPONSE_PREFIX))
                 self.assertTrue(answer.endswith(MODULE.RESPONSE_SUFFIX))
                 self.assertIsInstance(row["extra_info"]["heading_changes"], list)
+                document_a = row["messages"][0]["content"][len(MODULE.PROMPT_PREFIX):-len(MODULE.PROMPT_SUFFIX)]
+                self.assertEqual(
+                    re.findall(r"<table>.*?</table>", document_a, re.DOTALL),
+                    re.findall(r"<table>.*?</table>", answer, re.DOTALL),
+                )
+                self.assertNotIn("<html>", answer)
                 MODULE.validate_sample(row, max_response_tokens=1_100)
+
+    def test_checkpoint_persists_each_final_row_and_resumes_partial_paper(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            rows_path = Path(directory) / "paper.jsonl"
+            metadata_path = rows_path.with_suffix(".json")
+            state = {"config_fingerprint": "test-v3", "archive_sha256": "sha"}
+            sample = {
+                "messages": [{"role": "user", "content": "A"}, {"role": "assistant", "content": "B"}],
+                "extra_info": {"sample_id": "one", "clean_text_sha256": "a", "edited_text_sha256": "b"},
+            }
+            writer = MODULE.SampleCheckpoint(rows_path, metadata_path, state, resume=True)
+            self.assertTrue(writer.write(sample))
+            self.assertEqual(list(MODULE.read_jsonl(rows_path)), [sample])
+            self.assertEqual(json.loads(metadata_path.read_text())["status"], "running")
+            # Simulate termination while the next record is being written.
+            with rows_path.open("ab") as stream:
+                stream.write(b'{"messages":')
+            resumed = MODULE.SampleCheckpoint(rows_path, metadata_path, state, resume=True)
+            self.assertFalse(resumed.write(sample))
+            self.assertEqual(list(MODULE.read_jsonl(rows_path)), [sample])
+            self.assertEqual(resumed.ids, {"one"})
+
+    def test_pipeline_interrupt_keeps_first_sample_and_resume_deduplicates(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            input_root, output_dir = root / "input", root / "output"
+            input_root.mkdir()
+            self._write_input(input_root)
+            args = self._pipeline_args(input_root, output_dir)
+            original_make_sample = MODULE.make_sample
+            first_sample = None
+
+            def interrupt_next_sample(**kwargs: object) -> dict[str, object]:
+                nonlocal first_sample
+                if first_sample is not None:
+                    checkpoints = list((output_dir / "checkpoints").glob("*/*/*.jsonl"))
+                    self.assertEqual(len(checkpoints), 1)
+                    self.assertEqual(list(MODULE.read_jsonl(checkpoints[0])), [first_sample])
+                    raise KeyboardInterrupt
+                first_sample = original_make_sample(**kwargs)
+                return first_sample
+
+            with mock.patch.object(MODULE, "make_sample", side_effect=interrupt_next_sample):
+                with self.assertRaises(KeyboardInterrupt):
+                    MODULE.run_pipeline(args)
+            summary = MODULE.run_pipeline(args)
+            self.assertEqual(summary["status"], "passed")
+            rows = list(MODULE.read_jsonl(output_dir / "train.jsonl"))
+            ids = [row["extra_info"]["sample_id"] for row in rows]
+            self.assertEqual(len(ids), len(set(ids)))
+            self.assertIn(first_sample["extra_info"]["sample_id"], ids)
 
     def test_cli_workers_two_processes_download_checkpoint_input(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

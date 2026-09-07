@@ -18,26 +18,34 @@ eligible samples are written and the shortfall is reported.
 from __future__ import annotations
 
 import argparse
-from collections import Counter, defaultdict
 import concurrent.futures
-from dataclasses import asdict, dataclass
 import gzip
 import hashlib
 import json
 import math
 import os
-from pathlib import Path, PurePosixPath
 import random
 import re
+import sys
 import tarfile
 import tempfile
 import time
-from typing import Any, BinaryIO, Iterable, Iterator, Sequence
 import unicodedata
+from collections import Counter, defaultdict
+from collections.abc import Iterable, Iterator, Sequence
+from dataclasses import asdict, dataclass
+from pathlib import Path, PurePosixPath
+from typing import Any, BinaryIO
 
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
+from arxiv_source_first_v3.table_ast import (
+    TABLE_AST_VERSION,
+    TableAstError,
+    parse_strict_table,
+)
 
 SCHEMA_VERSION = 2
-PIPELINE_VERSION = "arxiv_confusable_text_sft_v2"
+PIPELINE_VERSION = "arxiv_confusable_text_sft_v3_html_tables"
 PROMPT_VERSION = "heading_rewrite_boundary_en_v2"
 HEADING_POLICY_VERSION = "block_start_heading_levels_1_to_4_v1"
 MUTATION_POLICY_VERSION = "chaos_text_word_ratio_v2"
@@ -66,6 +74,9 @@ PROMPT_SUFFIX = "\n<<<DOCUMENT_END>>>"
 RESPONSE_PREFIX = "```markdown\n"
 RESPONSE_SUFFIX = "\n```"
 HEADING_PREFIX_RE = re.compile(r"^(#{1,6})(?!#)")
+TABLE_ENVIRONMENTS = {"tabular", "tabular*", "tabularx"}
+TABLE_FLOAT_ENVIRONMENTS = {"table", "table*"}
+ENVIRONMENT_TOKEN_RE = re.compile(r"\\(begin|end)\s*\{\s*([A-Za-z*]+)\s*\}")
 
 ALLOWED_LICENSES = {"CC-BY-4.0", "CC-BY-SA-4.0", "CC0-1.0"}
 SAFE_STEM_RE = re.compile(r"^[A-Za-z0-9._-]+$")
@@ -311,6 +322,7 @@ class TextBlock:
     line_start: int
     line_end: int
     markdown: str
+    kind: str = "text"
 
 
 @dataclass(frozen=True)
@@ -862,6 +874,80 @@ def convert_fragment(raw: str) -> str:
     return markdown
 
 
+def excluded_regions(
+    text: str, names: set[str],
+) -> Iterator[tuple[str, int, int, bool]]:
+    """Yield outer environment spans, without exposing nested excluded content."""
+    stack: list[str] = []
+    start = 0
+    name = ""
+    balanced = True
+    for token in ENVIRONMENT_TOKEN_RE.finditer(text):
+        command, environment = token.groups()
+        if not stack:
+            if command != "begin" or environment not in names:
+                continue
+            start, name, balanced = token.start(), environment, True
+            stack.append(environment)
+        elif command == "begin":
+            stack.append(environment)
+        elif environment == stack[-1]:
+            stack.pop()
+            if not stack:
+                yield name, start, token.end(), balanced
+        elif environment == name:
+            # Drop a malformed outer block as a whole, not its cell text.
+            stack.clear()
+            yield name, start, token.end(), False
+        else:
+            balanced = False
+    if stack:
+        yield name, start, len(text), False
+
+
+def source_table_blocks(
+    fragment: str, *, source_file: str,
+) -> tuple[list[tuple[int, int, str, str]], Counter[str]]:
+    """Convert complete source tables; keep captions outside the HTML table."""
+    output: list[tuple[int, int, str, str]] = []
+    reasons: Counter[str] = Counter()
+    spans = list(excluded_regions(fragment, TABLE_ENVIRONMENTS | {"longtable"}))
+    if not spans:
+        reasons["table:no_supported_tabular"] += 1
+        return output, reasons
+    for environment, start, end, balanced in spans:
+        if not balanced or environment not in TABLE_ENVIRONMENTS:
+            reasons["table:unsupported_or_unbalanced_environment"] += 1
+            continue
+        try:
+            table = parse_strict_table(
+                fragment, start=start, end=end, source_id=source_file,
+            )
+        except TableAstError as exc:
+            reasons[f"table:{exc}"] += 1
+            continue
+        output.append((start, end, table.html, "table"))
+    # A caption alone must not survive an entirely rejected table float.
+    if not output:
+        return output, reasons
+    for match in re.finditer(r"\\caption\*?(?![A-Za-z@])", fragment):
+        if any(start <= match.start() < end for _, start, end, _ in spans):
+            continue
+        parser = LatexMarkdownParser(fragment)
+        parser.position = match.end()
+        try:
+            parser._optional_raw()
+            raw = parser._required_raw()
+            caption = normalize_markdown(LatexMarkdownParser(raw).parse())
+            if not caption or "<<<DOCUMENT_" in caption:
+                raise RejectedSource("empty_or_unsafe_caption")
+        except RejectedSource as exc:
+            reasons[f"table_caption:{exc}"] += 1
+            continue
+        output.append((match.start(), parser.position, caption, "caption"))
+    return sorted(output), reasons
+
+
 def extract_blocks(path: Path, source_root: Path) -> tuple[list[TextBlock], Counter[str]]:
     reasons: Counter[str] = Counter()
     if path.stat().st_size > MAX_TEX_FILE_BYTES:
@@ -871,23 +957,11 @@ def extract_blocks(path: Path, source_root: Path) -> tuple[list[TextBlock], Coun
     if "\ufffd" in raw:
         reasons["decode_replacement_character"] += 1
         return [], reasons
-    text, line_offset = document_body(
-        remove_excluded_environments(remove_bibliography_tail(strip_tex_comments(raw)))
-    )
+    text, line_offset = document_body(remove_bibliography_tail(strip_tex_comments(raw)))
     blocks: list[TextBlock] = []
     relative = path.relative_to(source_root).as_posix()
-    for match in re.finditer(r"\S(?:.*?)(?=\n[ \t]*\n|\Z)", text, re.DOTALL):
-        fragment = match.group(0)
-        if len(fragment) > 2_000_000:
-            reasons["source_fragment_too_large"] += 1
-            continue
-        try:
-            markdown = convert_fragment(fragment)
-        except RejectedSource as exc:
-            reasons[str(exc)] += 1
-            continue
-        start = match.start()
-        end = match.end()
+
+    def add(start: int, end: int, markdown: str, kind: str = "text") -> None:
         blocks.append(
             TextBlock(
                 source_file=relative,
@@ -896,8 +970,37 @@ def extract_blocks(path: Path, source_root: Path) -> tuple[list[TextBlock], Coun
                 line_start=line_offset + text.count("\n", 0, start) + 1,
                 line_end=line_offset + text.count("\n", 0, end) + 1,
                 markdown=markdown,
+                kind=kind,
             )
         )
+
+    def add_prose(start: int, end: int) -> None:
+        for match in re.finditer(r"\S(?:.*?)(?=\n[ \t]*\n|\Z)", text[start:end], re.DOTALL):
+            fragment = match.group(0)
+            if len(fragment) > 2_000_000:
+                reasons["source_fragment_too_large"] += 1
+                continue
+            try:
+                markdown = convert_fragment(fragment)
+            except RejectedSource as exc:
+                reasons[str(exc)] += 1
+                continue
+            add(start + match.start(), start + match.end(), markdown)
+
+    cursor = 0
+    for environment, start, end, balanced in excluded_regions(text, EXCLUDED_ENVIRONMENTS):
+        add_prose(cursor, start)
+        if environment in TABLE_ENVIRONMENTS | TABLE_FLOAT_ENVIRONMENTS | {"longtable"}:
+            if not balanced:
+                reasons["table:unbalanced_environment"] += 1
+            else:
+                tables, table_reasons = source_table_blocks(text[start:end], source_file=relative)
+                reasons.update(table_reasons)
+                for local_start, local_end, markdown, kind in tables:
+                    add(start + local_start, start + local_end, markdown, kind)
+        cursor = end
+    add_prose(cursor, len(text))
+    blocks.sort(key=lambda block: block.source_start)
     return blocks, reasons
 
 
@@ -1027,6 +1130,7 @@ def protected_spans(markdown: str) -> list[tuple[int, int]]:
         re.compile(r"\$\$.*?\$\$", re.DOTALL),
         re.compile(r"(?<!\\)\$(?!\$).*?(?<!\\)\$", re.DOTALL),
         re.compile(r"<[^>]+>"),
+        re.compile(r"&(?:#[0-9]+|#x[0-9A-Fa-f]+|[A-Za-z][A-Za-z0-9]+);"),
         re.compile(r"\]\([^)]*\)"),
         re.compile(r"https?://\S+|\b\S+@\S+\.\S+"),
     ]
@@ -1187,7 +1291,7 @@ def rewrite_heading_levels(
     changes: list[dict[str, int]] = []
     offset = 0
     for block in blocks:
-        match = HEADING_PREFIX_RE.match(block.markdown)
+        match = HEADING_PREFIX_RE.match(block.markdown) if block.kind == "text" else None
         if match:
             old_level = len(match[1])
             new_level = rng.choice([level for level in range(1, 5) if level != old_level])
@@ -1362,6 +1466,7 @@ def make_sample(
             "source_file": block.source_file,
             "normalized_source_span": [block.source_start, block.source_end],
             "source_lines": [block.line_start, block.line_end],
+            "kind": block.kind,
         }
         for block in blocks
     ]
@@ -1397,6 +1502,8 @@ def make_sample(
             "edited_text_sha256": sha256_text(edited),
             "response_text_sha256": sha256_text(answer),
             "source_spans": source_spans,
+            "table_count": sum(block.kind == "table" for block in blocks),
+            "table_ast_version": TABLE_AST_VERSION,
             "changes": changes,
         },
     }
@@ -1427,6 +1534,8 @@ def reusable_checkpoint(
         return None
     if metadata.get("archive_sha256") != archive_sha256:
         return None
+    if metadata.get("status") == "running":
+        return None
     if metadata.get("status") not in {"success", "rejected"}:
         if not config.retry_failed:
             return metadata
@@ -1437,6 +1546,51 @@ def reusable_checkpoint(
     if samples == 0 and rows_path.exists() and rows_path.stat().st_size:
         return None
     return metadata
+
+
+class SampleCheckpoint:
+    """One paper, one writer: each row is a durable, directly usable SFT record."""
+
+    def __init__(self, path: Path, metadata_path: Path, state: dict[str, Any], *, resume: bool) -> None:
+        self.path = path
+        self.ids: set[str] = set()
+        self.clean_hashes: set[str] = set()
+        self.edited_hashes: set[str] = set()
+        previous: dict[str, Any] = {}
+        if resume and metadata_path.is_file():
+            previous = json.loads(metadata_path.read_text(encoding="utf-8"))
+        matching = all(previous.get(key) == state[key] for key in ("config_fingerprint", "archive_sha256"))
+        if not (resume and matching and path.is_file()):
+            atomic_write_jsonl(path, [])
+        # A terminated write may leave only the last record incomplete. Keep
+        # all earlier completed samples and regenerate the unfinished one.
+        with path.open("r+b") as stream:
+            while line := stream.readline():
+                if not line.endswith(b"\n"):
+                    stream.seek(-len(line), os.SEEK_CUR)
+                    stream.truncate()
+                    stream.flush()
+                    os.fsync(stream.fileno())
+                    break
+                extra = json.loads(line)["extra_info"]
+                self.ids.add(extra["sample_id"])
+                self.clean_hashes.add(extra["clean_text_sha256"])
+                self.edited_hashes.add(extra["edited_text_sha256"])
+        atomic_write_json(metadata_path, {**state, "status": "running", "samples": len(self.ids)})
+
+    def write(self, sample: dict[str, Any]) -> bool:
+        extra = sample["extra_info"]
+        if extra["sample_id"] in self.ids:
+            return False
+        encoded = (json.dumps(sample, ensure_ascii=False, separators=(",", ":")) + "\n").encode("utf-8")
+        with self.path.open("ab") as stream:
+            stream.write(encoded)
+            stream.flush()
+            os.fsync(stream.fileno())
+        self.ids.add(extra["sample_id"])
+        self.clean_hashes.add(extra["clean_text_sha256"])
+        self.edited_hashes.add(extra["edited_text_sha256"])
+        return True
 
 
 def process_paper(task: dict[str, Any]) -> PaperResult:
@@ -1464,6 +1618,7 @@ def process_paper(task: dict[str, Any]) -> PaperResult:
     )
     started = time.monotonic()
     archive_sha256: str | None = None
+    checkpoint: SampleCheckpoint | None = None
     try:
         archive_sha256 = sha256_file(archive)
         expected = row.get("sha256")
@@ -1521,9 +1676,14 @@ def process_paper(task: dict[str, Any]) -> PaperResult:
                 raise RejectedSource("no_safe_markdown_blocks")
             counter = get_token_counter(config)
             windows = chunk_windows(blocks, counter=counter, config=config, stem=stem)
-            samples: list[dict[str, Any]] = []
-            seen_clean: set[str] = set()
-            seen_edited: set[str] = set()
+            checkpoint = SampleCheckpoint(
+                rows_path, metadata_path,
+                {"config_fingerprint": config.fingerprint, "archive_sha256": archive_sha256},
+                resume=config.resume,
+            )
+            # Shuffle candidates before generating them, rather than retaining
+            # completed SFT records in memory until the entire paper finishes.
+            random.Random(stable_seed(config.seed, stem, "checkpoint-order")).shuffle(windows)
             for markdown, tokens, selected_blocks in windows:
                 try:
                     sample = make_sample(
@@ -1541,16 +1701,14 @@ def process_paper(task: dict[str, Any]) -> PaperResult:
                 extra = sample["extra_info"]
                 clean_hash = str(extra["clean_text_sha256"])
                 edited_hash = str(extra["edited_text_sha256"])
-                if clean_hash in seen_clean or edited_hash in seen_edited:
+                if extra["sample_id"] in checkpoint.ids:
+                    continue
+                if clean_hash in checkpoint.clean_hashes or edited_hash in checkpoint.edited_hashes:
                     rejection_reasons["duplicate_within_paper"] += 1
                     continue
-                seen_clean.add(clean_hash)
-                seen_edited.add(edited_hash)
-                samples.append(sample)
-            rng = random.Random(stable_seed(config.seed, stem, "checkpoint-order"))
-            rng.shuffle(samples)
-            atomic_write_jsonl(rows_path, samples)
-            status = "success" if samples else "rejected"
+                checkpoint.write(sample)
+            sample_count = len(checkpoint.ids)
+            status = "success" if sample_count else "rejected"
             metadata = {
                 "status": status,
                 "pipeline_version": PIPELINE_VERSION,
@@ -1558,7 +1716,7 @@ def process_paper(task: dict[str, Any]) -> PaperResult:
                 "stem": stem,
                 "archive": str(archive),
                 "archive_sha256": archive_sha256,
-                "samples": len(samples),
+                "samples": sample_count,
                 "candidate_chunks": len(windows),
                 "tex_files": len(tex_paths),
                 "blocks": len(blocks),
@@ -1571,8 +1729,8 @@ def process_paper(task: dict[str, Any]) -> PaperResult:
             return PaperResult(
                 stem=stem,
                 status=status,
-                checkpoint=str(rows_path) if samples else None,
-                samples=len(samples),
+                checkpoint=str(rows_path) if sample_count else None,
+                samples=sample_count,
                 candidate_chunks=len(windows),
                 tex_files=len(tex_paths),
                 blocks=len(blocks),
@@ -1585,6 +1743,7 @@ def process_paper(task: dict[str, Any]) -> PaperResult:
     except Exception as exc:  # noqa: BLE001 - one bad archive must not stop the corpus
         error = f"{type(exc).__name__}: {exc}"
         status = "failed"
+    sample_count = len(checkpoint.ids) if checkpoint else 0
     metadata = {
         "status": status,
         "pipeline_version": PIPELINE_VERSION,
@@ -1592,7 +1751,7 @@ def process_paper(task: dict[str, Any]) -> PaperResult:
         "stem": stem,
         "archive": str(archive),
         "archive_sha256": archive_sha256,
-        "samples": 0,
+        "samples": sample_count,
         "candidate_chunks": 0,
         "tex_files": 0,
         "blocks": 0,
@@ -1603,12 +1762,13 @@ def process_paper(task: dict[str, Any]) -> PaperResult:
         "completed_at": utc_now(),
     }
     atomic_write_json(metadata_path, metadata)
-    atomic_write_jsonl(rows_path, [])
+    if not rows_path.exists():
+        atomic_write_jsonl(rows_path, [])
     return PaperResult(
         stem=stem,
         status=status,
-        checkpoint=None,
-        samples=0,
+        checkpoint=str(rows_path) if sample_count else None,
+        samples=sample_count,
         candidate_chunks=0,
         tex_files=0,
         blocks=0,
@@ -1816,6 +1976,7 @@ def merge_checkpoints(
     last_log = started
     token_histogram: Counter[str] = Counter()
     mutation_histogram: Counter[int] = Counter()
+    table_histogram: Counter[int] = Counter()
     paper_counts: Counter[str] = Counter()
 
     selected_clean: set[str] = set()
@@ -1840,6 +2001,7 @@ def merge_checkpoints(
         else:
             token_histogram["6000-7800"] += 1
         mutation_histogram[len(extra["changes"])] += 1
+        table_histogram[int(extra.get("table_count", 0))] += 1
 
     for paper_index, result in enumerate(successful, start=1):
         assert result.checkpoint is not None
@@ -1925,6 +2087,8 @@ def merge_checkpoints(
         "val": {"rows": writers["val"].total_rows, "bytes": writers["val"].total_bytes, "parts": writers["val"].parts},
         "response_token_histogram": dict(token_histogram),
         "mutation_count_histogram": {str(key): value for key, value in sorted(mutation_histogram.items())},
+        "table_samples": sum(count for tables, count in table_histogram.items() if tables),
+        "tables_written": sum(tables * count for tables, count in table_histogram.items()),
         "elapsed_seconds": round(time.monotonic() - started, 3),
     }
 
@@ -2094,6 +2258,7 @@ def select_input_rows(
 def config_fingerprint(args: argparse.Namespace, buckets: Sequence[LengthBucket]) -> str:
     value = {
         "pipeline_version": PIPELINE_VERSION,
+        "table_ast_version": TABLE_AST_VERSION,
         "prompt_version": PROMPT_VERSION,
         "mutation_policy_version": MUTATION_POLICY_VERSION,
         "heading_policy_version": HEADING_POLICY_VERSION,
@@ -2412,6 +2577,7 @@ def run_pipeline(args: argparse.Namespace) -> dict[str, Any]:
         f"available_unique={merge['available_unique_samples']} written={merge['written_samples']} "
         f"target_ceiling={args.max_samples or 'unlimited'} shortfall={merge['shortfall']} "
         f"train={merge['train']['rows']} val={merge['val']['rows']} "
+        f"table_samples={merge['table_samples']} tables={merge['tables_written']} "
         f"bytes={merge['train']['bytes'] + merge['val']['bytes']} "
         f"elapsed={elapsed_text(time.monotonic() - started)} manifest={output_dir / 'manifest.json'}",
         flush=True,
