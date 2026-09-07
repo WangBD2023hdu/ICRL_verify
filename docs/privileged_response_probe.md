@@ -94,6 +94,62 @@ prompt or restrict the response to table content: the full page is still evaluat
 and visualized. Use a separate output directory for a table-only report so that
 previously saved non-table results are not included by the report rebuild.
 
+### Three-way token probability statistics
+
+Every scored response token has one `token_category`:
+
+- `formatting`: pure whitespace, common Markdown markers (headings, lists,
+  emphasis, fences, link delimiters, pipe-table separators), or HTML tags.
+  Tag spans are recognized in the full decoded text, so a BPE piece such as
+  `td` inside `<td>` is still formatting, not a body word.
+- `body`: remaining document content, including table cell text and LaTeX math.
+  This category includes correct and incorrect ordinary text.
+- `mutation`: any token aligned to the **whole edited word's GT span**, including
+  a model readback of the original spelling or another incorrect spelling.
+
+Tokens containing both syntax/whitespace and content are counted once as `body`,
+or as `mutation` if they overlap an edited word. They carry
+`mixed_format_content=true`. The existing correctness labels are a separate axis;
+the three categories do not replace them. Math and inline-code contents are not
+treated as Markdown punctuation. Formatting detection covers common document
+syntax, not arbitrary malformed Markdown. `category_surface_matches_response`
+reports whether the decoded BPE pieces reproduce the saved response text.
+
+When a release's `changes` only contains `ocr_ans`, `origin_ans`, and `bbox`, the
+probe resolves the full edited word in the GT before alignment. A valid supplied
+`markdown_span` takes precedence; otherwise the match must be unique and
+whole-word. Ambiguous/missing words are listed as unresolved, not assigned an
+arbitrary occurrence. Bboxes are not used as text offsets. Their unlocated tokens
+cannot be identified as mutation tokens. Deleted words have no response token
+and therefore no token probability to average.
+
+New runs write the annotations and per-sample statistics immediately. Existing
+results can be re-annotated without inference or prompt changes:
+
+```bash
+python -u -m qwen_mm_token_probe.privileged_probe \
+  --output-dir /path/to/existing-probe-output \
+  --rebuild-report-only
+```
+
+Rebuild preserves saved `result.json` inference records, and regenerates exports
+and the existing report. The sample report now shows a three-row probability
+summary and category labels in the token detail table. Output files:
+
+- `token_probabilities.csv`: all tokens, with `token_category` and unchanged scores.
+- `token_category_summary.json` / `.csv`: global three-category statistics.
+- `token_category_sample_summary.csv`: three rows per sample, one for each category.
+- `samples/<sample>/token_category_summary.json` / `.csv`: per-sample statistics;
+  JSON also lists unresolved mutation records.
+
+Each category reports token count, mean `p_original` (student), mean `p_teacher`,
+mean changes in probability/log-probability, and the proportion with
+`p_teacher < p_original`. The global mean is **token-weighted**, not a mean of
+sample means. A category with no tokens has null means/rates, not zero scores.
+These descriptive statistics include all tokens and do not use the separate
+teacher-audit correctness or student-probability gates. Probability suppression
+alone is not a claim that the supervision is harmful.
+
 Teacher-signal quality statistics are written to a separate page so the existing
 sample browser and per-token visualization remain unchanged:
 

@@ -1618,6 +1618,64 @@ def _correct_token_teacher_result(
     }
 
 
+def test_category_report_recovers_verl_mutations_without_inference(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    pieces = ["##", " ", "Title", "\n", "<table><tr><td>", "sy", "stem", "</td></tr></table>"]
+    gt = "".join(pieces).replace("system", "systom")
+    result = _correct_token_teacher_result(
+        "table-case", "samples/001_table-case/report.html", gt,
+        [{"raw_token": piece, "token_id": 500 + index, "token_label": "correct",
+          "p_original": 0.4, "delta_logp": 0.2 if index == 5 else -0.2,
+          "teacher_top_token_id": 500 + index, "teacher_top_raw_token": piece,
+          "teacher_top_probability": 0.6, "teacher_rank": 1}
+         for index, piece in enumerate(pieces)],
+    )
+    # Missing/ambiguous entries must not shift the IDs of later resolved words.
+    result["sample"]["changes"] = [
+        {"ocr_ans": "notfound", "origin_ans": "missing", "bbox": [1, 2, 3, 4]},
+        {"ocr_ans": "systom", "origin_ans": "system", "bbox": [5, 6, 7, 8]},
+    ]
+    sample_dir = tmp_path / "samples" / "001_table-case"
+    sample_dir.mkdir(parents=True)
+    source = json.dumps(result, ensure_ascii=False)
+    (sample_dir / "result.json").write_text(source, encoding="utf-8")
+
+    def no_inference(*args: object, **kwargs: object) -> None:
+        pytest.fail("rebuilding categories must not run or load a model")
+
+    monkeypatch.setattr(probe, "load_model_bundle", no_inference)
+    monkeypatch.setattr(probe, "_score_fixed_response_ids", no_inference)
+    probe.rebuild_privileged_report(tmp_path, student_response_min_probability=0.9)
+
+    assert (sample_dir / "result.json").read_text(encoding="utf-8") == source
+    summary = json.loads((tmp_path / "token_category_summary.json").read_text(encoding="utf-8"))
+    groups = {row["token_category"]: row for row in summary["categories"]}
+    assert {key: row["token_count"] for key, row in groups.items()} == {
+        "formatting": 5, "body": 1, "mutation": 2,
+    }
+    assert groups["mutation"]["teacher_lower_probability_rate"] == 0.5
+    assert summary["unresolved_mutation_count"] == 1
+    assert summary["unresolved_mutations"][0]["mutation_id"] == "m001"
+    # Classification is a descriptive full-token statistic, not the audit gate.
+    assert summary["total_tokens"] == len(pieces)
+    with (tmp_path / "token_probabilities.csv").open(encoding="utf-8", newline="") as handle:
+        tokens = list(csv.DictReader(handle))
+    assert [row["mutation_ids"] for row in tokens[5:7]] == ["m002", "m002"]
+    assert [float(row["p_original"]) for row in tokens] == [0.4] * len(pieces)
+    with (tmp_path / "mutation_probabilities.csv").open(encoding="utf-8", newline="") as handle:
+        mutations = list(csv.DictReader(handle))
+    assert mutations[0]["mutation_id"] == "m002"
+    assert mutations[0]["ocr_ans"] == "systom"
+    assert mutations[0]["relation"] == "opposite_variant"
+    assert (sample_dir / "token_category_summary.csv").is_file()
+    assert (tmp_path / "token_category_sample_summary.csv").is_file()
+    page = (sample_dir / "report.html").read_text(encoding="utf-8")
+    assert "当前样本：三类 Token 概率" in page
+    assert "p_teacher &lt; p_student" in page
+    assert "ID 505 · 变异" in page
+
+
 def _correct_token_teacher_fixture() -> tuple[
     list[dict[str, object]], list[dict[str, object]]
 ]:

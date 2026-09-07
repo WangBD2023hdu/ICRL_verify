@@ -35,8 +35,15 @@ from .hf_qwen import (
     move_inputs_to_device,
     prepare_prompt_inputs,
 )
+from .mutation_spans import resolve_mutation_spans
 from .progress import ProgressTracker
 from .prompts import DEFAULT_PDF_OCR_PROMPT
+from .token_categories import (
+    CATEGORY_LABELS,
+    CATEGORY_RULES,
+    annotate_token_categories,
+    summarize_token_categories,
+)
 
 SCHEMA_VERSION = 2
 DEFAULT_MODEL_ID = "Qwen/Qwen3.5-4B"
@@ -553,13 +560,15 @@ def _run_sample(
     original_scores = list(forwards["original"])
     teacher_scores = list(forwards["teacher"])
     rows = _combine_scores(response_ids, original_scores, teacher_scores)
+    resolved_changes = resolve_mutation_spans(ground_truth, sample.changes)
     mutation_observations = _attach_gt_and_mutation_alignment(
         rows=rows,
         response_text=response_text,
         ground_truth=ground_truth,
-        changes=sample.changes,
+        changes=resolved_changes,
     )
-    mutation_rows = _build_mutation_rows(rows, mutation_observations, sample.changes)
+    mutation_rows = _build_mutation_rows(rows, mutation_observations, resolved_changes)
+    annotate_token_categories(rows, response_text=response_text)
     summary = _summarize_rows(rows, mutation_rows)
     reconstructed = "".join(str(row["raw_token"]) for row in rows)
 
@@ -573,7 +582,7 @@ def _run_sample(
             "source_image": str(sample.image_path),
             "source_ground_truth": str(sample.ground_truth_path),
             "image_copy": str(image_copy),
-            "changes": list(sample.changes),
+            "changes": resolved_changes,
         },
         "protocol": {
             "backend": "huggingface-transformers-offline",
@@ -1040,8 +1049,10 @@ def _build_mutation_rows(
     changes: Sequence[dict[str, Any]],
 ) -> list[dict[str, Any]]:
     mutation_rows: list[dict[str, Any]] = []
-    for index, (observation, change) in enumerate(zip(observations, changes), start=1):
-        mutation_id = f"m{index:03d}"
+    for observation in observations:
+        mutation_id = observation.mutation_id
+        index = int(mutation_id.removeprefix("m"))
+        change = changes[index - 1]
         token_indices = [
             int(row["index"])
             for row in rows
@@ -2420,7 +2431,29 @@ def rebuild_privileged_report(
         raise RuntimeError(
             f"no completed result.json files under {output_root / 'samples'}"
         )
-    results = [json.loads(path.read_text(encoding="utf-8")) for path in result_paths]
+    tracker = ProgressTracker(
+        task="privileged-report", total_items=len(result_paths),
+        total_bytes=sum(path.stat().st_size for path in result_paths),
+    )
+    tracker.start()
+    try:
+        return _rebuild_privileged_report_outputs(
+            output_root, result_paths, tracker,
+            teacher_signal_threshold=teacher_signal_threshold,
+            student_response_min_probability=student_response_min_probability,
+            student_response_max_probability=student_response_max_probability,
+        )
+    finally:
+        tracker.finish()
+
+
+def _rebuild_privileged_report_outputs(
+    output_root: Path, result_paths: Sequence[Path], tracker: ProgressTracker, *,
+    teacher_signal_threshold: float,
+    student_response_min_probability: float | None,
+    student_response_max_probability: float | None,
+) -> dict[str, Any]:
+    results: list[dict[str, Any]] = []
     all_tokens: list[dict[str, Any]] = []
     all_mutations: list[dict[str, Any]] = []
     teacher_signal_rows: list[dict[str, Any]] = []
@@ -2428,8 +2461,36 @@ def rebuild_privileged_report(
     token_teacher_signal_rows: list[dict[str, Any]] = []
     missing_gt_characters_by_pair: dict[str, int] = {}
     sample_rows: list[dict[str, Any]] = []
-    for result_path, result in zip(result_paths, results):
+    category_sample_rows: list[dict[str, Any]] = []
+    unresolved_mutations: list[dict[str, Any]] = []
+    for ordinal, result_path in enumerate(result_paths, start=1):
+        tracker.set_current(index=ordinal, name=str(result_path), phase="rebuild-sample")
+        result = json.loads(result_path.read_text(encoding="utf-8"))
+        results.append(result)
+        # Existing result.json files can lack GT offsets (e.g. VERL releases).
+        # Rebuild only annotations/exports; keep original inference results intact.
+        changes = result.get("sample", {}).get("changes", [])
+        if changes:
+            resolved = resolve_mutation_spans(str(result["ground_truth"]), changes)
+            result["sample"]["changes"] = resolved
+            observations = _attach_gt_and_mutation_alignment(
+                rows=result["tokens"], response_text=str(result["response"]["text"]),
+                ground_truth=str(result["ground_truth"]), changes=resolved,
+            )
+            result["mutation_observations"] = _build_mutation_rows(
+                result["tokens"], observations, resolved,
+            )
+            result["summary"] = _summarize_rows(result["tokens"], result["mutation_observations"])
+            for index, change in enumerate(resolved, start=1):
+                if not change.get("markdown_span"):
+                    unresolved_mutations.append({
+                        "pair_id": result["pair_id"], "mutation_id": f"m{index:03d}", **change,
+                    })
         _write_sample_outputs(result_path.parent, result)
+        category_sample_rows.extend(
+            {"pair_id": result["pair_id"], **row}
+            for row in summarize_token_categories(result["tokens"])
+        )
         relative_report = result_path.parent.relative_to(output_root) / "report.html"
         sample_rows.append(
             {
@@ -2463,10 +2524,27 @@ def rebuild_privileged_report(
                 token_details=token_details,
             )
         )
+        tracker.complete_unit(
+            status="accepted", records=len(result["tokens"]),
+            bytes_count=result_path.stat().st_size, index=ordinal, name=str(result_path),
+        )
 
+    tracker.set_current(index=len(results), name=str(output_root), phase="aggregate-reports")
     _write_csv(output_root / "token_probabilities.csv", all_tokens)
     _write_csv(output_root / "mutation_probabilities.csv", all_mutations)
     _write_csv(output_root / "sample_summary.csv", sample_rows)
+    category_summary = summarize_token_categories(all_tokens)
+    _write_json_atomic(output_root / "token_category_summary.json", {
+        "rules": CATEGORY_RULES,
+        "total_tokens": len(all_tokens),
+        "completed_samples": len(results),
+        "categories": category_summary,
+        "unresolved_mutation_count": len(unresolved_mutations),
+        "unresolved_mutations": unresolved_mutations,
+        "sample_summary": category_sample_rows,
+    })
+    _write_csv(output_root / "token_category_summary.csv", category_summary)
+    _write_csv(output_root / "token_category_sample_summary.csv", category_sample_rows)
     global_summary = _summarize_global(results, all_tokens, all_mutations)
     _write_json_atomic(output_root / "summary.json", global_summary)
     _write_text_atomic(
@@ -2642,6 +2720,18 @@ def _summarize_global(
 
 
 def _write_sample_outputs(sample_dir: Path, result: dict[str, Any]) -> None:
+    annotate_token_categories(result["tokens"], response_text=str(result["response"]["text"]))
+    categories = summarize_token_categories(result["tokens"])
+    _write_json_atomic(sample_dir / "token_category_summary.json", {
+        "pair_id": result["pair_id"], "rules": CATEGORY_RULES,
+        "categories": categories,
+        "unresolved_mutations": [
+            {"mutation_id": f"m{index:03d}", **change}
+            for index, change in enumerate(result.get("sample", {}).get("changes", []), start=1)
+            if not change.get("markdown_span")
+        ],
+    })
+    _write_csv(sample_dir / "token_category_summary.csv", categories)
     _write_csv(sample_dir / "token_probabilities.csv", result["tokens"])
     _write_csv(
         sample_dir / "mutation_probabilities.csv", result["mutation_observations"]
@@ -2673,6 +2763,8 @@ def _response_rows_in_generation_order(
 
 def _render_sample_html(result: dict[str, Any]) -> str:
     rows = _response_rows_in_generation_order(result)
+    annotate_token_categories(rows, response_text=str(result["response"]["text"]))
+    category_section = _render_token_category_summary(rows)
     token_rows = "".join(_token_table_row(row) for row in rows)
     mutations = list(result.get("mutation_observations", []))
     mutation_cards = "".join(
@@ -2705,12 +2797,41 @@ def _render_sample_html(result: dict[str, Any]) -> str:
 </div></div>
 </section>
 {mutation_section}
+{category_section}
 <section id="token-details"><div class="section-heading"><h2>全部 Response Token（严格按生成顺序）</h2><output>{len(rows)} tokens</output></div>
 <div class="table-scroll token-table-scroll"><table class="token-detail-table">
 <thead><tr><th rowspan="2">生成索引</th><th rowspan="2">Response token</th><th colspan="4" class="condition original-condition">原图条件（image + prompt）</th><th colspan="4" class="condition teacher-condition">GT Teacher-Forcing 条件</th><th colspan="2" class="condition delta-condition">概率变化（Teacher - Original）</th></tr>
 <tr><th>p(response token)</th><th>response rank</th><th>Top-1</th><th>Top-2</th><th>p(same response token)</th><th>response rank</th><th>Top-1</th><th>Top-2</th><th>Δp</th><th>Δlogp</th></tr></thead>
 <tbody>{token_rows}</tbody></table></div></section>
 </main></body></html>"""
+
+
+def _render_token_category_summary(rows: Sequence[dict[str, Any]]) -> str:
+    def value(number: Any, *, percent: bool = False) -> str:
+        if number is None:
+            return "—"
+        return f"{100 * number:.2f}%" if percent else f"{number:.6f}"
+
+    body = "".join(
+        f"<tr><td>{CATEGORY_LABELS[row['token_category']]}</td>"
+        f"<td>{row['token_count']}</td>"
+        f"<td>{value(row['mean_p_original'])}</td>"
+        f"<td>{value(row['mean_p_teacher'])}</td>"
+        f"<td>{value(row['mean_delta_p_teacher_minus_original'])}</td>"
+        f"<td>{value(row['teacher_lower_probability_rate'], percent=True)}</td></tr>"
+        for row in summarize_token_categories(rows)
+    )
+    return (
+        '<section id="token-categories"><h2>当前样本：三类 Token 概率</h2>'
+        '<p>变异类按整个变异词的对齐 token 统计，包含错误读回原词；'
+        '纯格式归格式类，格式与正文混合的 token 归正文，命中变异词优先归变异类。'
+        '每个实际 response token 只计一次，不按正确性或概率阈值过滤。</p>'
+        '<p><a href="token_category_summary.csv">本样本分类统计 CSV</a></p>'
+        '<div class="table-scroll"><table><thead><tr><th>类别</th><th>Token 数</th>'
+        '<th>平均 p_student</th><th>平均 p_teacher</th><th>平均 Δp</th>'
+        '<th>p_teacher &lt; p_student 占比</th></tr></thead>'
+        f'<tbody>{body}</tbody></table></div></section>'
+    )
 
 
 def _render_aggregate_html(sample_rows: Sequence[dict[str, Any]]) -> str:
@@ -2726,7 +2847,7 @@ def _render_aggregate_html(sample_rows: Sequence[dict[str, Any]]) -> str:
     return f"""<!doctype html>
 <html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
 <title>Privileged Response Token Probe</title>{_report_css()}</head><body><main>
-<nav><a href="token_probabilities.csv">完整 Token CSV</a></nav>
+<nav><a href="token_probabilities.csv">完整 Token CSV</a><a href="token_category_summary.csv">三类全局统计 CSV</a><a href="token_category_sample_summary.csv">三类样本级统计 CSV</a></nav>
 <h1>Response Token 概率对照</h1>
 <div class="sample-browser">
 <aside class="sample-list">{sample_links}</aside>
@@ -3779,12 +3900,13 @@ def _token_table_row(row: dict[str, Any]) -> str:
         f"<span class='mutation-id'>{html.escape(mutation_id)}</span>"
         for mutation_id in mutation_ids
     )
+    category = CATEGORY_LABELS.get(str(row.get("token_category", "")), "")
     return (
         f"<tr id='token-{int(row['index'])}' class='{classes}'>"
         f"<td>{int(row['index'])}</td>"
         "<td><div class='response-token'>"
         f"<code>{html.escape(str(row['token'])) or '&lt;empty&gt;'}</code>"
-        f"<span>ID {int(row['token_id'])}</span>{mutation_badges}</div></td>"
+        f"<span>ID {int(row['token_id'])} · {category}</span>{mutation_badges}</div></td>"
         f"<td>{_probability_cell(row['p_original'], 'original')}</td>"
         f"<td>{int(row['rank_original'])}</td>"
         f"<td>{_candidate_block(row, 'original', 1)}</td>"
