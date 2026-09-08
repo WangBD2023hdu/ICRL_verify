@@ -45,9 +45,10 @@ from arxiv_source_first_v3.table_ast import (
 )
 
 SCHEMA_VERSION = 2
-PIPELINE_VERSION = "arxiv_confusable_text_sft_v3_html_tables"
-PROMPT_VERSION = "heading_rewrite_boundary_en_v2"
-HEADING_POLICY_VERSION = "block_start_heading_levels_1_to_4_v1"
+PIPELINE_VERSION = "arxiv_confusable_text_sft_v4_heading_zero"
+PROMPT_VERSION = "heading_rewrite_boundary_en_v3"
+HEADING_POLICY_VERSION = "block_start_heading_levels_0_to_4_zero28_v2"
+NO_HEADING_PROBABILITY = 0.28
 MUTATION_POLICY_VERSION = "chaos_text_word_ratio_v2"
 DEFAULT_MUTATION_WORD_RATIO = 0.10
 DEFAULT_MIN_MUTATIONS = 3
@@ -58,7 +59,8 @@ PROMPT_PREFIX = (
     "Please rewrite the document enclosed by the boundary markers using only "
     "these two formatting changes. This is not a translation task.\n"
     "1. For each text block beginning with an existing heading prefix of 1 to 6 "
-    "# characters, randomly choose a different heading level from 1 to 4. "
+    "# characters, randomly choose a different number of # characters from "
+    "0 to 4 (0 means removing all leading # characters). "
     "Change only the number of # characters. Preserve the spaces after them "
     "exactly. Do not add heading prefixes to non-heading text or change prefixes "
     "inside figures, tables, formulas, or code.\n"
@@ -1294,7 +1296,12 @@ def rewrite_heading_levels(
         match = HEADING_PREFIX_RE.match(block.markdown) if block.kind == "text" else None
         if match:
             old_level = len(match[1])
-            new_level = rng.choice([level for level in range(1, 5) if level != old_level])
+            # Draw removal separately so excluding the old level does not
+            # inflate its probability above 28%.
+            new_level = (
+                0 if rng.random() < NO_HEADING_PROBABILITY
+                else rng.choice([level for level in range(1, 5) if level != old_level])
+            )
             changes.append(
                 {"input_offset": offset, "from_level": old_level, "to_level": new_level}
             )
@@ -1339,7 +1346,7 @@ def validate_sample(row: dict[str, Any], *, max_response_tokens: int) -> None:
         new_level = heading["to_level"]
         if (
             start < previous_end or not 1 <= old_level <= 6
-            or new_level not in (1, 2, 3, 4) or new_level == old_level
+            or new_level not in (0, 1, 2, 3, 4) or new_level == old_level
         ):
             raise ValueError("invalid heading level change")
         match = HEADING_PREFIX_RE.match(extracted[start:])

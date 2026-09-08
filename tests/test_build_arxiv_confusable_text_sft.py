@@ -28,12 +28,20 @@ class ArxivConfusableTextSftTests(unittest.TestCase):
     def test_english_prompt_and_sample_are_exact_text_copy(self) -> None:
         self.assertEqual(
             MODULE.sha256_text(MODULE.PROMPT_PREFIX + "{A}" + MODULE.PROMPT_SUFFIX),
-            "d0cb3fc514819601449d1413774e7b86d1618de97a25ba81739b7f60a923520a",
+            "a4e546e28f0f058af71762e285466854e6579ea9f532e9b42916ba88e9902c83",
         )
         markdown = "The availobility evidence remains **important**."
         prompt = MODULE.build_prompt(markdown)
         self.assertTrue(prompt.startswith("Please rewrite the document enclosed"))
         self.assertIn("This is not a translation task.", prompt)
+        self.assertIn(
+            "randomly choose a different number of # characters from 0 to 4 "
+            "(0 means removing all leading # characters).",
+            prompt,
+        )
+        self.assertNotIn(
+            "randomly choose a different heading level from 1 to 4.", prompt
+        )
         self.assertIn("Change only the number of # characters.", prompt)
         self.assertIn("Preserve the spaces after them exactly.", prompt)
         self.assertEqual(prompt.count("<<<DOCUMENT_START>>>"), 1)
@@ -240,13 +248,14 @@ Ordinary research text after the excluded blocks.
         )
         self.assertEqual(len(changes), 24)
         self.assertTrue(all(set(change) == {"input_offset", "from_level", "to_level"} for change in changes))
+        self.assertTrue(any(change["to_level"] == 0 for change in changes))
 
         by_offset = {change["input_offset"]: change for change in changes}
         self.assertEqual(set(by_offset), {item[0] for item in expected_offsets})
         for block_index, (offset, level, spaces) in enumerate(expected_offsets):
             change = by_offset[offset]
             self.assertEqual(change["from_level"], level)
-            self.assertIn(change["to_level"], (1, 2, 3, 4))
+            self.assertIn(change["to_level"], (0, 1, 2, 3, 4))
             self.assertNotEqual(change["to_level"], level)
             expected_blocks[block_index] = (
                 "#" * change["to_level"]
@@ -265,6 +274,62 @@ Ordinary research text after the excluded blocks.
             rng=random.Random(20260907),
         )
         self.assertEqual((repeated, repeated_changes), (rewritten, changes))
+
+    def test_rewrite_heading_levels_zero_threshold_and_nonzero_choice_pool(self) -> None:
+        class ProbeRng:
+            def __init__(self) -> None:
+                self.random_values: list[float] = []
+                self.choice_values: list[tuple[int, ...]] = []
+
+            def random(self) -> float:
+                value = 0.0 if not self.random_values else 0.28
+                self.random_values.append(value)
+                return value
+
+            def choice(self, values: list[int]) -> int:
+                candidates = tuple(values)
+                self.choice_values.append(candidates)
+                return candidates[(len(self.choice_values) - 1) % len(candidates)]
+
+        levels = range(1, 7)
+        blocks = [
+            self._text_block("#" * level + "   heading", source_start=index * 20)
+            for index, level in enumerate(levels)
+        ]
+        markdown = "\n\n".join(block.markdown for block in blocks)
+        rng = ProbeRng()
+        rewritten, changes = MODULE.rewrite_heading_levels(
+            markdown, blocks=blocks, rng=rng
+        )
+
+        self.assertEqual(MODULE.NO_HEADING_PROBABILITY, 0.28)
+        self.assertEqual(rng.random_values, [0.0, 0.28, 0.28, 0.28, 0.28, 0.28])
+        self.assertEqual(changes[0]["to_level"], 0)
+        self.assertEqual(rewritten[: len("   heading")], "   heading")
+        self.assertEqual(
+            rng.choice_values,
+            [(1, 3, 4), (1, 2, 4), (1, 2, 3), (1, 2, 3, 4), (1, 2, 3, 4)],
+        )
+        self.assertTrue(
+            all(
+                change["to_level"] in {1, 2, 3, 4}
+                and change["to_level"] != change["from_level"]
+                for change in changes[1:]
+            )
+        )
+        expected_blocks = [
+            "#" * change["to_level"] + "   heading" for change in changes
+        ]
+        self.assertEqual(rewritten, "\n\n".join(expected_blocks))
+        for block_index, change in enumerate(changes):
+            expected_prefix = "#" * change["to_level"] + "   heading"
+            start = sum(
+                len(block.markdown) + 2 for block in blocks[:block_index]
+            ) + sum(
+                previous["to_level"] - previous["from_level"]
+                for previous in changes[:block_index]
+            )
+            self.assertEqual(rewritten[start : start + len(expected_prefix)], expected_prefix)
 
     def test_rewrite_heading_levels_without_heading_only_adds_fence(self) -> None:
         body = "plain text <table><tr><td>HTML</td></tr></table>\n\\alpha + 1"
@@ -303,7 +368,7 @@ Ordinary research text after the excluded blocks.
         stem = "2601.00001v1"
         config = MODULE.WorkerConfig(
             fingerprint="heading-rewrite-test",
-            seed=83,
+            seed=2,
             tokenizer="simple",
             tokenizer_local_only=True,
             trust_remote_code=False,
@@ -381,6 +446,7 @@ Ordinary research text after the excluded blocks.
         self.assertEqual(len(actual_changes), len(expected_changes))
         heading_deltas = sample["extra_info"]["heading_changes"]
         self.assertGreaterEqual(len(heading_deltas), 3)
+        self.assertTrue(any(heading["to_level"] == 0 for heading in heading_deltas))
         self.assertTrue(
             any(
                 change["input_char_offset"] > heading_deltas[1]["input_offset"]
@@ -407,6 +473,10 @@ Ordinary research text after the excluded blocks.
             )
             self.assertEqual(actual["char_offset"], actual["input_char_offset"] + expected_shift)
             self.assertEqual(actual["char_end"], actual["input_char_end"] + expected_shift)
+
+        # A removed heading still preserves its following spaces, and the
+        # validator must accept the resulting A/B offsets and fenced answer.
+        MODULE.validate_sample(sample, max_response_tokens=config.max_response_tokens)
 
     def test_validator_rejects_body_space_newline_and_missing_fence_changes(self) -> None:
         body_words = "availability methodological contribution demographic ongoing scientific"
@@ -449,7 +519,8 @@ Ordinary research text after the excluded blocks.
         body_index = body.index("\n") + 1
         changed_body_char = "X" if body[body_index] != "X" else "Y"
         body_changed = body[:body_index] + changed_body_char + body[body_index + 1 :]
-        space_changed = body.replace("# 1", "#  1", 1)
+        space_index = body.index(" ")
+        space_changed = body[:space_index] + "  " + body[space_index + 1 :]
         newline_index = body.index("\n")
         newline_changed = body[:newline_index] + " " + body[newline_index + 1 :]
         missing_fence = body

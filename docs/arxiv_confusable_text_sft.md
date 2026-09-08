@@ -28,9 +28,14 @@ mutation policy produce input document **A**, which is inserted between
 Answer **B** differs from A in exactly two ways:
 
 1. At the beginning of each extracted text block, an existing prefix of 1–6
-   `#` characters is replaced with 1–4 `#` characters, excluding the original
-   level. Every eligible heading changes. No heading is added to other text.
-   Spaces after the hashes and all other characters remain unchanged.
+   `#` characters is replaced with 0–4 `#` characters, excluding the original
+   level. Each eligible heading has a **28% probability of removing all hashes**.
+   The remaining 72% is split equally among levels 1–4 other than the original:
+   three choices at 24% each for original levels 1–4, or four choices at 18%
+   each for original levels 5–6. This is per-heading sampling, not a quota of
+   entirely heading-free documents. Every eligible heading changes. No heading
+   is added to other text. Spaces after the hashes and all other characters
+   remain unchanged, including when all hashes are removed.
 2. The complete answer is `"```markdown\n" + rewritten_body + "\n```"`.
    Even documents without headings receive this fence.
 
@@ -46,21 +51,26 @@ exact text is in `PROMPT_PREFIX` and `PROMPT_SUFFIX` in the script. No system
 message or image field is added.
 
 `extra_info.heading_changes` records `input_offset`, `from_level` and
-`to_level`. For each word mutation, `input_char_offset`/`input_char_end` locate
+`to_level` (`0` means the heading hashes were removed). For each word mutation,
+`input_char_offset`/`input_char_end` locate
 the word in A; `char_offset`/`char_end` locate it in the complete fenced B.
 The response token limit includes both fences. The sample validator rebuilds
 B from A and the heading changes and requires exact equality.
 
 CLI flags, input/output path conventions and the source-processing worker
-pool are unchanged. The pipeline/prompt/schema versions were bumped for this
-format; old copy-task checkpoints are not reused. Use a new output directory
-to keep old and new datasets separate.
+pool are unchanged. The current pipeline is
+`arxiv_confusable_text_sft_v4_heading_zero`, with prompt
+`heading_rewrite_boundary_en_v3` and heading policy
+`block_start_heading_levels_0_to_4_zero28_v2`. Only the approved prompt sentence
+changes the allowed hash count from 1–4 to 0–4; the rest is unchanged. Updated
+versions isolate checkpoints from earlier heading policies. Use a new output
+directory to keep old and new datasets separate.
 
 ## Source tables → HTML (v3 extraction)
 
-The prompt is **unchanged**, including its version `heading_rewrite_boundary_en_v2`.
-Only the pipeline version changes to `arxiv_confusable_text_sft_v3_html_tables`
-so old table-free checkpoints are not reused.
+HTML table extraction was introduced in
+`arxiv_confusable_text_sft_v3_html_tables` without changing the then-current
+prompt. It remains unchanged in the current heading-zero version.
 
 - `tabular`, `tabular*` and `tabularx` are parsed from source, including those
   inside `table` / `table*` floats. No PDF, OCR, LaTeX compilation or LLM is used.
