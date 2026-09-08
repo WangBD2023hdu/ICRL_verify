@@ -79,6 +79,11 @@ from arxiv_canonical_reflow_v4.prompts import (
     DOC2MD_PROMPT_STYLE,
     DOC2MD_SFT_PROMPT,
 )
+from arxiv_canonical_reflow_v4.resume import (
+    CompileCheckpoint,
+    JobResumeSpec,
+    ResumeIndex,
+)
 from arxiv_source_first_v3.document_ast import parse_document_ast
 from arxiv_source_first_v3.semantic_declarations import (
     extract_semantic_environment_definitions,
@@ -1655,6 +1660,7 @@ def _compile_with_rescue(
     depth: int = 0,
     *,
     mutation_config: MutationConfig | None = None,
+    resume_spec: JobResumeSpec | None = None,
 ) -> tuple[WorkerResult, ...]:
     """Compile a source sequence into dense pages with one-bundle backoff.
 
@@ -1673,12 +1679,21 @@ def _compile_with_rescue(
         return _direct_mutate_and_compile(candidate, config, mutation_config)
 
     bundles = list(bundle_blocks(page.blocks))
+    checkpoint = CompileCheckpoint(page, resume_spec) if resume_spec is not None else None
+    if checkpoint is not None:
+        bundles = checkpoint.restore(bundles)
     terminal: list[WorkerResult] = []
     start = 0
-    output_ordinal = 1
+    output_ordinal = checkpoint.next_ordinal if checkpoint is not None else 1
     while start < len(bundles):
         if config.stop_file is not None and Path(config.stop_file).is_file():
             break
+        if checkpoint is not None:
+            saved_end = checkpoint.skip_saved_prefix(bundles, start, output_ordinal)
+            if saved_end is not None:
+                start = saved_end
+                output_ordinal += 1
+                continue
         terminal_start = len(terminal)
         attempt_results: list[WorkerResult] = []
         end = _initial_bundle_end(
@@ -1785,6 +1800,11 @@ def _compile_with_rescue(
                     )
                     terminal.append(obstruction_result)
                     _persist_terminal_result(obstruction_result, config)
+                    if checkpoint is not None:
+                        checkpoint.record(
+                            page_id=obstruction_result.page_id, status="rejected",
+                            blocks=bundles[best_end], next_ordinal=output_ordinal + 1,
+                        )
                     _remove_nonterminal_direct_artifacts(
                         attempt_results,
                         terminal_page_ids={obstruction_result.page_id},
@@ -1828,6 +1848,12 @@ def _compile_with_rescue(
             )
             terminal.append(result)
             _persist_terminal_result(result, config)
+            if checkpoint is not None:
+                checkpoint.record(
+                    page_id=result.page_id, status=result.status,
+                    blocks=_flatten_bundles(bundles, start, best_end),
+                    next_ordinal=output_ordinal + 1,
+                )
             start = best_end
         else:
             if last_result is None:
@@ -1839,6 +1865,11 @@ def _compile_with_rescue(
             )
             terminal.append(result)
             _persist_terminal_result(result, config)
+            if checkpoint is not None:
+                checkpoint.record(
+                    page_id=result.page_id, status=result.status,
+                    blocks=bundles[start], next_ordinal=output_ordinal + 1,
+                )
             start += 1
         _remove_nonterminal_direct_artifacts(
             attempt_results,
@@ -2753,6 +2784,8 @@ class _RealtimeTrainingWriter:
                 if mutation_policy == weighted_mutation.POLICY_NAME else None
             ),
         )
+        self._complete_ids = self.sft_ids & self.verl_ids
+        self._known_ids = self.sft_ids | self.verl_ids
         partial_ids = self.sft_ids ^ self.verl_ids
         self.partial_image_paths = _existing_training_image_paths(
             self.sft_path,
@@ -2785,10 +2818,15 @@ class _RealtimeTrainingWriter:
 
     @property
     def complete_ids(self) -> set[str]:
-        return self.sft_ids & self.verl_ids
+        return self._complete_ids
+
+    def _update_committed_ids(self, pair_id: str) -> None:
+        self._known_ids.add(pair_id)
+        if pair_id in self.sft_ids and pair_id in self.verl_ids:
+            self._complete_ids.add(pair_id)
 
     def _new_image_relative_path(self, pair_id: str) -> str:
-        ordinal = len(self.sft_ids | self.verl_ids)
+        ordinal = len(self._known_ids)
         shard_id = ordinal // self.images_per_shard
         return f"images/shard_{shard_id:05d}/{pair_id}.png"
 
@@ -2907,6 +2945,10 @@ class _RealtimeTrainingWriter:
         for pair_id in sorted(sft_parts.keys() & verl_parts.keys()):
             sft_path = sft_parts[pair_id]
             verl_path = verl_parts[pair_id]
+            if pair_id in self.complete_ids:
+                sft_path.unlink(missing_ok=True)
+                verl_path.unlink(missing_ok=True)
+                continue
             sft = self._read_part(sft_path, pair_id)
             verl = self._read_part(verl_path, pair_id)
             if sft is None or verl is None:
@@ -2940,6 +2982,7 @@ class _RealtimeTrainingWriter:
                 self._record_mutations(verl)
                 self.recovered_parts += 1
             self._sync_training_pair()
+            self._update_committed_ids(pair_id)
             sft_path.unlink(missing_ok=True)
             verl_path.unlink(missing_ok=True)
         try:
@@ -2950,7 +2993,7 @@ class _RealtimeTrainingWriter:
     def recover_parts(self) -> set[str]:
         """Admit worker-written pairs before their whole compile job returns."""
 
-        before = self.complete_ids
+        before = self.complete_ids.copy()
         self._recover_parts()
         return self.complete_ids - before
 
@@ -2992,6 +3035,7 @@ class _RealtimeTrainingWriter:
             self._record_mutations(verl)
             self.added_verl += 1
         self._sync_training_pair()
+        self._update_committed_ids(result.page_id)
         if result.page_id in self.complete_ids:
             self._remove_parts(result.page_id)
         return True
@@ -3099,6 +3143,28 @@ def _admit_direct_result(
     return "admitted"
 
 
+def _compile_resume_index(
+    output: Path, config: WorkerConfig, mutation_config: MutationConfig,
+    accepted_ids: set[str],
+) -> ResumeIndex:
+    settings = asdict(config)
+    for name in ("output_dir", "work_dir", "stop_file", "minimal_output", "prompt_style"):
+        settings.pop(name)
+    settings.update(
+        pipeline_version=PIPELINE_VERSION,
+        mutation_suffix=_mutation_page_id("", mutation_config),
+    )
+    return ResumeIndex(output, settings, accepted_ids,
+                       _mutation_page_id("", mutation_config))
+
+
+def _archive_resume_fingerprint(archive: CrawlerArchive) -> str:
+    return hashlib.sha256(json.dumps({
+        "path": archive.archive, "sha256": archive.expected_sha256,
+        "bytes": archive.input_bytes, "mtime_ns": archive.input_mtime_ns,
+    }, sort_keys=True).encode()).hexdigest()
+
+
 def _run_fused_crawler_direct_pipeline(
     archives: Sequence[CrawlerArchive],
     *,
@@ -3148,6 +3214,16 @@ def _run_fused_crawler_direct_pipeline(
         prompt_style=config.prompt_style,
     )
     accepted_ids = set(realtime_writer.complete_ids)
+    resume_index = _compile_resume_index(output, config, mutation_config, accepted_ids)
+    source_fingerprints = {
+        archive.paper_id: _archive_resume_fingerprint(archive) for archive in archives
+    }
+    source_jobs_pending: dict[str, set[str]] = {}
+    source_dependencies: dict[str, set[str]] = {}
+    source_resume_blocked: set[str] = set()
+    resumed_sources = 0
+    resumed_empty_jobs = 0
+    saved_pages_skipped = 0
     initial_accepted = len(accepted_ids)
     if target_count > 0 and initial_accepted > target_count:
         realtime_writer.close()
@@ -3182,11 +3258,21 @@ def _run_fused_crawler_direct_pipeline(
         executor: ProcessPoolExecutor,
         pending: dict[Any, tuple[str, CrawlerArchive | CanonicalPage]],
     ) -> bool:
-        nonlocal source_index
-        if source_index >= total_sources or not target_open():
+        nonlocal source_index, source_completed, completed_input_bytes, resumed_sources
+        nonlocal saved_pages_skipped
+        while source_index < total_sources and target_open():
+            archive = archives[source_index]
+            source_index += 1
+            if not resume_index.source_complete(
+                archive.paper_id, source_fingerprints[archive.paper_id],
+            ):
+                break
+            source_completed += 1
+            resumed_sources += 1
+            saved_pages_skipped += len(resume_index.sources[archive.paper_id]["accepted_ids"])
+            completed_input_bytes += archive.input_bytes
+        else:
             return False
-        archive = archives[source_index]
-        source_index += 1
         future = executor.submit(
             _prepare_extract_crawler_job,
             archive,
@@ -3209,6 +3295,7 @@ def _run_fused_crawler_direct_pipeline(
             job,
             config,
             mutation_config=mutation_config,
+            resume_spec=resume_index.job_spec(job),
         )
         pending[future] = ("compile", job)
         return True
@@ -3395,11 +3482,20 @@ def _run_fused_crawler_direct_pipeline(
                             if debug_artifacts:
                                 preparation_rows.append(preparation)
                             candidate_pages += len(paper_pages)
-                            new_jobs = (
-                                _bounded_dense_jobs_from_pages(paper_pages)
-                                if target_open()
-                                else ()
-                            )
+                            all_jobs = _bounded_dense_jobs_from_pages(paper_pages)
+                            source_jobs_pending[archive.paper_id] = {
+                                job.page_id for job in all_jobs
+                            }
+                            source_dependencies[archive.paper_id] = set()
+                            new_jobs = all_jobs if target_open() else ()
+                            # Empty successful extraction is also completed work;
+                            # transport/extraction errors remain retryable.
+                            if not all_jobs and extraction_report is not None and (
+                                extraction_report.get("status") == "success"
+                            ):
+                                resume_index.mark_source_complete(
+                                    archive.paper_id, source_fingerprints[archive.paper_id], set(),
+                                )
                             available_jobs += len(new_jobs)
                             compile_backlog.extend(new_jobs)
                             _emit(
@@ -3451,6 +3547,8 @@ def _run_fused_crawler_direct_pipeline(
                             _persist_terminal_result(failed, config)
                             rows = (failed,)
                         completed_jobs += 1
+                        if not rows:
+                            resumed_empty_jobs += 1
                         for row in rows:
                             if row.status != "accepted":
                                 stage_rejected += 1
@@ -3475,6 +3573,23 @@ def _run_fused_crawler_direct_pipeline(
                                     accepted=len(accepted_ids),
                                     rejected=stage_rejected,
                                 )
+                        checkpoint = CompileCheckpoint(job, resume_index.job_spec(job))
+                        saved_pages_skipped += checkpoint.saved_pages_skipped
+                        dependencies = checkpoint.completion_ids(accepted_ids)
+                        if dependencies is None:
+                            # Interrupted jobs or accepted concurrent overruns
+                            # must not make their entire source look finished.
+                            source_resume_blocked.add(job.paper_id)
+                        else:
+                            source_dependencies[job.paper_id].update(dependencies)
+                        source_jobs_pending[job.paper_id].discard(job.page_id)
+                        if not source_jobs_pending[job.paper_id] and (
+                            job.paper_id not in source_resume_blocked
+                        ):
+                            resume_index.mark_source_complete(
+                                job.paper_id, source_fingerprints[job.paper_id],
+                                source_dependencies[job.paper_id],
+                            )
                         realtime_writer.checkpoint(
                             completed_jobs=completed_jobs,
                             total_jobs=available_jobs,
@@ -3590,6 +3705,10 @@ def _run_fused_crawler_direct_pipeline(
                 "accepted_count": accepted,
                 "accepted_before_run": initial_accepted,
                 "accepted_added_this_run": accepted - initial_accepted,
+                "sources_skipped_from_checkpoint": resumed_sources,
+                "compile_jobs_without_new_attempts": resumed_empty_jobs,
+                "saved_pages_skipped_before_compile": saved_pages_skipped,
+                "resume_directory": str(resume_index.root.relative_to(output)),
                 "rejected_count_this_run": stage_rejected,
                 "discarded_concurrent_overrun": discarded_overrun,
                 "cancelled_jobs": cancelled_jobs,
@@ -3617,6 +3736,8 @@ def _run_fused_crawler_direct_pipeline(
         "finish",
         f"accepted={accepted} target={target_count or 'all'} "
         f"rejected={stage_rejected} sources={source_completed}/{total_sources} "
+        f"resumed_sources={resumed_sources} reused_jobs={resumed_empty_jobs} "
+        f"saved_pages_skipped={saved_pages_skipped} "
         f"compile_jobs={completed_jobs}/{available_jobs} elapsed={elapsed:.1f}s "
         f"output={output}",
     )
@@ -4246,6 +4367,10 @@ def main(
     accepted_ids = (
         set(realtime_writer.complete_ids) if realtime_writer is not None else set()
     )
+    resume_index = (
+        _compile_resume_index(output, config, mutation_config, accepted_ids)
+        if direct_edit and mutation_config is not None else None
+    )
     initial_accepted = len(accepted_ids)
     if args.target_count > 0 and initial_accepted > args.target_count:
         if realtime_writer is not None:
@@ -4290,6 +4415,7 @@ def main(
                 job,
                 config,
                 mutation_config=mutation_config if direct_edit else None,
+                resume_spec=resume_index.job_spec(job) if resume_index is not None else None,
             )
         ] = job
         return True

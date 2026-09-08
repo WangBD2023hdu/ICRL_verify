@@ -47,13 +47,53 @@ python scripts/experimental/build_arxiv_canonical_reflow_v5.py \
 
 `--target-count` is the desired number of saved edited samples. Change 40000
 as needed. New runs should use a new output directory. Re-running the same
-command resumes that run. `--papers-root` also accepts normalized local
+command resumes that run. To grow an existing dataset, keep its output
+directory and generation settings unchanged and increase `--target-count`
+(for example, 10000 to 20000). The target is the total saved count, not the
+number to add. `--papers-root` also accepts normalized local
 papers. Existing V4 defaults and V4 sample IDs are preserved.
 
 Source parsing and compilation share the worker pool. Each ready sample is
 appended to both datasets, flushed and fsynced before its temporary parts are
 removed. Images use subdirectories of at most 20,000 samples. Temporary
 compilation and extraction files are removed by the existing V4 workflow.
+
+## Computation resume (including old datasets)
+
+The direct-edit pipeline reads the intersection of the existing SFT and VERL
+sample IDs once. Existing rows and images are not rewritten. The prompt,
+mutation policy, image paths, and training-record format are unchanged.
+
+- Old outputs without checkpoints: after parallel source parsing, recover
+  saved page spans by matching the native block-ID hash in `pair_id` against
+  source bundles. Exact matches are removed from pending compilation. If an
+  old page spans a removed bad bundle and cannot be matched yet, replay the
+  unresolved packer path and retry the exact match there. Never skip a whole
+  paper just because it has some accepted pages. This first migration still
+  needs source parsing and may repeat unresolved historical failures.
+- New checkpoints: each terminal page records only its consumed source-block
+  IDs, status, sample ID, and next output ordinal in a small atomic/fsynced job
+  file. Successful pages count as consumed only when both final training rows
+  exist. Interrupted exports and target-count overruns remain eligible.
+- With `--crawler-root --target-count`, the parent records a source as fully
+  processed only when all its jobs are complete and their accepted samples
+  are saved. Such sources skip both extraction and compilation on the next
+  run. Partial sources resume their remaining bundles; terminal rejected
+  bundles are not compiled again with identical settings.
+
+Keep `realtime_training/resume/` alongside the JSONL files: it is lightweight
+resume metadata, not compilation residue. It contains sharded job checkpoints
+and an append-only source index. A generation-setting change selects a new
+checkpoint namespace; changed source archive fingerprints invalidate the
+source-level skip, and changed source blocks invalidate job checkpoints.
+No new command-line arguments are needed. Use one running process per output
+directory. `run_summary.json` reports `sources_skipped_from_checkpoint`,
+`compile_jobs_without_new_attempts`, `saved_pages_skipped_before_compile`,
+and `resume_directory`.
+
+In-memory saved-ID sets and image-shard counts are maintained incrementally;
+each newly saved row no longer recomputes a full-dataset set intersection or
+union. The parent remains the sole final JSONL writer and fsyncs each pair.
 
 ## Output and prompts
 
