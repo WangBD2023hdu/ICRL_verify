@@ -13,6 +13,7 @@ import sys
 import tarfile
 import tempfile
 import unittest
+from dataclasses import replace
 from pathlib import Path
 from unittest import mock
 
@@ -95,6 +96,35 @@ class ArxivConfusableTextSftTests(unittest.TestCase):
             )[0],
             markdown,
         )
+
+    def test_no_fence_prompt_changes_only_the_two_approved_sentences(self) -> None:
+        expected_prefix = MODULE.PROMPT_PREFIX.replace(
+            "these two formatting changes. This is not a translation task.",
+            "the following heading-prefix change. This is not a translation task.",
+        ).replace(
+            "2. Enclose the entire result in a Markdown code fence: start with "
+            "```markdown followed by a newline, and end with a newline followed by ```.",
+            "2. Output the rewritten document directly. Do not add an outer Markdown code fence.",
+        )
+        self.assertEqual(MODULE.NO_FENCE_PROMPT_VERSION, "heading_rewrite_boundary_en_v4_no_fence")
+        self.assertEqual(MODULE.NO_FENCE_PROMPT_PREFIX, expected_prefix)
+        body = (
+            "#  heading\n\n"
+            "```python\nvalue = 1\n```\n"
+            '<table><tr><td>$x_i$ &amp; text</td></tr></table>  '
+        )
+        prompt = MODULE.build_prompt(body, response_fence="none")
+        self.assertEqual(
+            prompt,
+            MODULE.NO_FENCE_PROMPT_PREFIX + body + MODULE.PROMPT_SUFFIX,
+        )
+        self.assertEqual(
+            prompt.split("<<<DOCUMENT_START>>>\n", 1)[1].rsplit(
+                "\n<<<DOCUMENT_END>>>", 1
+            )[0],
+            body,
+        )
+        self.assertEqual(MODULE.response_affixes("none"), ("", ""))
 
     def test_latex_conversion_keeps_markup_and_drops_citations_and_bibliography(self) -> None:
         raw = r"""
@@ -635,6 +665,148 @@ Ordinary research text after the excluded blocks.
         # validator must accept the resulting A/B offsets and fenced answer.
         MODULE.validate_sample(sample, max_response_tokens=config.max_response_tokens)
 
+        none_config = replace(config, response_fence="none")
+        none_sample = MODULE.make_sample(
+            row=row,
+            stem=stem,
+            markdown=markdown,
+            clean_tokens=counter.count(markdown),
+            blocks=blocks,
+            counter=counter,
+            config=none_config,
+        )
+        none_answer = none_sample["messages"][1]["content"]
+        none_prompt = none_sample["messages"][0]["content"]
+        none_a = none_prompt.split("<<<DOCUMENT_START>>>\n", 1)[1].rsplit(
+            "\n<<<DOCUMENT_END>>>", 1
+        )[0]
+        self.assertEqual(none_a, a)
+        self.assertEqual(none_answer, modified_body)
+        self.assertEqual(
+            answer,
+            MODULE.RESPONSE_PREFIX + none_answer + MODULE.RESPONSE_SUFFIX,
+        )
+        self.assertFalse(none_answer.startswith(MODULE.RESPONSE_PREFIX))
+        self.assertFalse(none_answer.endswith(MODULE.RESPONSE_SUFFIX))
+        self.assertEqual(
+            none_sample["extra_info"]["heading_changes"],
+            sample["extra_info"]["heading_changes"],
+        )
+        self.assertEqual(none_sample["extra_info"]["response_fence"], "none")
+        self.assertEqual(
+            none_sample["extra_info"]["prompt_version"],
+            MODULE.NO_FENCE_PROMPT_VERSION,
+        )
+        self.assertNotIn("response_fence", sample["extra_info"])
+        self.assertNotEqual(
+            none_sample["extra_info"]["sample_id"], sample["extra_info"]["sample_id"]
+        )
+        self.assertEqual(
+            sample["extra_info"]["response_tokens"], counter.count(answer)
+        )
+        self.assertEqual(
+            none_sample["extra_info"]["response_tokens"], counter.count(none_answer)
+        )
+        self.assertEqual(
+            sample["extra_info"]["response_tokens"]
+            - none_sample["extra_info"]["response_tokens"],
+            counter.count(MODULE.RESPONSE_PREFIX)
+            + counter.count(MODULE.RESPONSE_SUFFIX),
+        )
+        for fenced_change, none_change in zip(
+            sample["extra_info"]["changes"], none_sample["extra_info"]["changes"]
+        ):
+            self.assertEqual(
+                fenced_change["input_char_offset"], none_change["input_char_offset"]
+            )
+            self.assertEqual(
+                fenced_change["input_char_end"], none_change["input_char_end"]
+            )
+            self.assertEqual(
+                fenced_change["char_offset"],
+                none_change["char_offset"] + len(MODULE.RESPONSE_PREFIX),
+            )
+            self.assertEqual(
+                fenced_change["char_end"],
+                none_change["char_end"] + len(MODULE.RESPONSE_PREFIX),
+            )
+        MODULE.validate_sample(
+            none_sample, max_response_tokens=none_config.max_response_tokens
+        )
+
+    def test_no_fence_sample_without_headings_is_valid_and_unwrapped(self) -> None:
+        words = [
+            "availability",
+            "methodological",
+            "contribution",
+            "demographic",
+            "ongoing",
+            "scientific",
+            "evaluation",
+            "observation",
+        ]
+        inner_code = "```python\n# availability stays in this inner fence\nprint(42)\n```"
+        table_math = "<table><tr><td>$x_i$</td></tr></table>"
+        markdown = "  " + " ".join(words * 20) + "\n\n" + inner_code + "\n" + table_math + "\n  "
+        block = self._text_block(markdown)
+        config = MODULE.WorkerConfig(
+            fingerprint="no-fence-no-heading-test",
+            seed=2,
+            tokenizer="simple",
+            tokenizer_local_only=True,
+            trust_remote_code=False,
+            length_buckets=(MODULE.LengthBucket(1, 10_000, 1.0),),
+            min_response_tokens=1,
+            max_response_tokens=10_000,
+            mutation_word_ratio=0.10,
+            min_mutations=3,
+            max_mutations=0,
+            max_samples_per_paper=0,
+            temp_root=None,
+            resume=True,
+            retry_failed=False,
+            response_fence="none",
+        )
+        counter = MODULE.SimpleTokenCounter()
+        sample = MODULE.make_sample(
+            row={"arxiv_id": "2601.00001", "version": "v1"},
+            stem="2601.00001v1",
+            markdown=markdown,
+            clean_tokens=counter.count(markdown),
+            blocks=[block],
+            counter=counter,
+            config=config,
+        )
+        answer = sample["messages"][1]["content"]
+        self.assertEqual(sample["extra_info"]["heading_changes"], [])
+        a = sample["messages"][0]["content"].split("<<<DOCUMENT_START>>>\n", 1)[1].rsplit(
+            "\n<<<DOCUMENT_END>>>", 1
+        )[0]
+        self.assertEqual(a, answer)
+        self.assertTrue(sample["extra_info"]["changes"])
+        self.assertFalse(answer.startswith(MODULE.RESPONSE_PREFIX))
+        self.assertFalse(answer.endswith(MODULE.RESPONSE_SUFFIX))
+        self.assertIn(inner_code, answer)
+        self.assertIn(table_math, answer)
+        self.assertTrue(answer.startswith("  "))
+        self.assertTrue(answer.endswith("\n  "))
+        self.assertEqual(sample["extra_info"]["response_tokens"], counter.count(answer))
+        MODULE.validate_sample(sample, max_response_tokens=config.max_response_tokens)
+
+    def test_response_fence_isolated_in_none_fingerprint_but_default_is_legacy(self) -> None:
+        buckets = (MODULE.LengthBucket(1, 10_000, 1.0),)
+        default_args = self._pipeline_args(
+            Path("/tmp/input"), Path("/tmp/output"), response_fence="markdown"
+        )
+        none_args = self._pipeline_args(
+            Path("/tmp/input"), Path("/tmp/output"), response_fence="none"
+        )
+        legacy_args = copy.deepcopy(default_args)
+        delattr(legacy_args, "response_fence")
+        default_fingerprint = MODULE.config_fingerprint(default_args, buckets)
+        self.assertEqual(default_fingerprint, MODULE.config_fingerprint(legacy_args, buckets))
+        self.assertNotEqual(default_fingerprint, MODULE.config_fingerprint(none_args, buckets))
+
     def test_validator_rejects_body_space_newline_and_missing_fence_changes(self) -> None:
         body_words = "availability methodological contribution demographic ongoing scientific"
         blocks = [
@@ -858,6 +1030,7 @@ Observation & 93.5 \\
             "trust_remote_code": False,
             "resume": True,
             "retry_failed": False,
+            "response_fence": "markdown",
         }
         values.update(overrides)
         return argparse.Namespace(**values)
@@ -1112,6 +1285,102 @@ Observation & 93.5 \\
             for row in rows:
                 MODULE.validate_sample(row, max_response_tokens=1_100)
 
+    def test_cli_workers_two_no_fence_output_and_resume(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            input_root = root / "input"
+            output_dir = root / "output"
+            input_root.mkdir()
+            self._write_input(input_root)
+            command = [
+                sys.executable,
+                str(SCRIPT),
+                "--input-root",
+                str(input_root),
+                "--output-dir",
+                str(output_dir),
+                "--tokenizer",
+                "simple",
+                "--workers",
+                "2",
+                "--max-papers",
+                "1",
+                "--max-samples",
+                "2",
+                "--max-samples-per-paper",
+                "1",
+                "--min-response-tokens",
+                "1",
+                "--max-response-tokens",
+                "1100",
+                "--response-fence",
+                "none",
+                "--mutation-word-ratio",
+                "0.10",
+                "--min-mutations",
+                "3",
+                "--shard-size",
+                "2",
+                "--write-merged-jsonl",
+                "--val-fraction",
+                "0",
+                "--seed",
+                "83",
+                "--split-seed",
+                "42",
+            ]
+            first = subprocess.run(
+                command,
+                check=False,
+                capture_output=True,
+                text=True,
+                timeout=120,
+            )
+            self.assertEqual(
+                first.returncode,
+                0,
+                msg=f"stdout:\n{first.stdout}\nstderr:\n{first.stderr}",
+            )
+            manifest = json.loads(
+                (output_dir / "manifest.json").read_text(encoding="utf-8")
+            )
+            self.assertEqual(manifest["response_fence"], "none")
+            self.assertEqual(manifest["prompt_version"], MODULE.NO_FENCE_PROMPT_VERSION)
+            self.assertEqual(manifest["configuration"]["response_fence"], "none")
+            first_rows = list(MODULE.read_jsonl(output_dir / "train.jsonl"))
+            self.assertGreater(len(first_rows), 0)
+            for row in first_rows:
+                answer = row["messages"][1]["content"]
+                self.assertFalse(answer.startswith(MODULE.RESPONSE_PREFIX))
+                self.assertFalse(answer.endswith(MODULE.RESPONSE_SUFFIX))
+                self.assertEqual(row["extra_info"]["response_fence"], "none")
+                self.assertEqual(
+                    row["extra_info"]["prompt_version"],
+                    MODULE.NO_FENCE_PROMPT_VERSION,
+                )
+                MODULE.validate_sample(row, max_response_tokens=1_100)
+
+            second = subprocess.run(
+                command,
+                check=False,
+                capture_output=True,
+                text=True,
+                timeout=120,
+            )
+            self.assertEqual(
+                second.returncode,
+                0,
+                msg=f"stdout:\n{second.stdout}\nstderr:\n{second.stderr}",
+            )
+            resumed_manifest = json.loads(
+                (output_dir / "manifest.json").read_text(encoding="utf-8")
+            )
+            self.assertEqual(resumed_manifest["papers"]["reused"], 1)
+            self.assertEqual(
+                resumed_manifest["merge"]["written_samples"], len(first_rows)
+            )
+            self.assertEqual(list(MODULE.read_jsonl(output_dir / "train.jsonl")), first_rows)
+
     def test_pipeline_outputs_available_rows_without_forcing_target(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -1144,6 +1413,7 @@ Observation & 93.5 \\
                 trust_remote_code=False,
                 resume=True,
                 retry_failed=False,
+                response_fence="markdown",
             )
             summary = MODULE.run_pipeline(args)
             merge = summary["merge"]

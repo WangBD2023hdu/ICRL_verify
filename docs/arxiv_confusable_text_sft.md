@@ -25,7 +25,7 @@ The existing source extraction, window selection and approximately 10% word
 mutation policy produce input document **A**, which is inserted between
 `<<<DOCUMENT_START>>>` and `<<<DOCUMENT_END>>>` without an added code fence.
 
-Answer **B** differs from A in exactly two ways:
+By default, answer **B** differs from A in exactly two ways:
 
 1. At the beginning of each extracted text block, an existing prefix of 1–6
    `#` characters is replaced with 0–4 `#` characters, excluding the original
@@ -53,11 +53,11 @@ message or image field is added.
 `extra_info.heading_changes` records `input_offset`, `from_level` and
 `to_level` (`0` means the heading hashes were removed). For each word mutation,
 `input_char_offset`/`input_char_end` locate
-the word in A; `char_offset`/`char_end` locate it in the complete fenced B.
-The response token limit includes both fences. The sample validator rebuilds
+the word in A; `char_offset`/`char_end` locate it in the complete B.
+The response token limit includes both fences when enabled. The sample validator rebuilds
 B from A and the heading changes and requires exact equality.
 
-CLI flags, input/output path conventions and the source-processing worker
+Existing CLI flags, input/output path conventions and the source-processing worker
 pool are unchanged. The current pipeline is
 `arxiv_confusable_text_sft_v5_weighted_pairs`, with prompt
 `heading_rewrite_boundary_en_v3` and heading policy
@@ -65,6 +65,38 @@ pool are unchanged. The current pipeline is
 changes the allowed hash count from 1–4 to 0–4; the rest is unchanged. Updated
 versions isolate checkpoints from earlier heading policies. Use a new output
 directory to keep old and new datasets separate.
+
+## Optional answer without an outer fence
+
+Add `--response-fence none` to generate B as the rewritten body directly.
+The default `--response-fence markdown` preserves the existing V5 prompt,
+sample IDs and checkpoint fingerprint. It does not change existing data.
+
+No-fence mode keeps A, weighted character mutations and heading choices the
+same for a given source window and seed. It adds no outer delimiter and does
+not strip or trim the body: existing code fences inside A, HTML tables,
+formulas, spaces and line breaks are preserved. Word offsets in B and response
+token counts are calculated from the actual unwrapped answer.
+
+Its prompt version is `heading_rewrite_boundary_en_v4_no_fence`. Only the two
+approved sentences differ from the default prompt:
+
+```text
+Please rewrite the document enclosed by the boundary markers using only the following heading-prefix change. This is not a translation task.
+```
+
+and the second numbered instruction becomes:
+
+```text
+2. Output the rewritten document directly. Do not add an outer Markdown code fence.
+```
+
+All other prompt text, including the boundary markers, is unchanged. The
+sample records `extra_info.response_fence = "none"`; default-mode records
+without this field remain valid. No-fence mode uses distinct sample IDs and
+checkpoint fingerprints, so it does not reuse fenced responses. Use a new
+`--output-dir` for the no-fence dataset to preserve previous final exports.
+Multiprocessing, incremental sample persistence and resume remain unchanged.
 
 ## V5 weighted letter mutations
 

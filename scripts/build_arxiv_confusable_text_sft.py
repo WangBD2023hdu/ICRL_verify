@@ -7,7 +7,8 @@ The input is the directory produced by ``crawl_arxiv_sources.py`` and contains
 extracts each source archive, conservatively converts visible LaTeX prose to
 Markdown, creates deterministic same-length character confusions, and writes
 MS-Swift ``messages`` JSONL shards. The input document A remains unchanged;
-the answer B changes only existing heading levels and adds a Markdown fence.
+the answer B changes only existing heading levels, with an optional outer
+Markdown fence (enabled by default).
 
 This is intentionally a text-rewrite auxiliary task, not page OCR: no PDF is read
 and no image field is emitted.  A target such as one million rows is a ceiling,
@@ -74,6 +75,16 @@ PROMPT_PREFIX = (
     "<<<DOCUMENT_START>>>\n"
 )
 PROMPT_SUFFIX = "\n<<<DOCUMENT_END>>>"
+NO_FENCE_PROMPT_VERSION = "heading_rewrite_boundary_en_v4_no_fence"
+# Only these two prompt edits were approved for the optional no-fence mode.
+NO_FENCE_PROMPT_PREFIX = PROMPT_PREFIX.replace(
+    "these two formatting changes. This is not a translation task.",
+    "the following heading-prefix change. This is not a translation task.",
+).replace(
+    "2. Enclose the entire result in a Markdown code fence: start with "
+    "```markdown followed by a newline, and end with a newline followed by ```.",
+    "2. Output the rewritten document directly. Do not add an outer Markdown code fence.",
+)
 RESPONSE_PREFIX = "```markdown\n"
 RESPONSE_SUFFIX = "\n```"
 HEADING_PREFIX_RE = re.compile(r"^(#{1,6})(?!#)")
@@ -333,6 +344,7 @@ class WorkerConfig:
     temp_root: str | None
     resume: bool
     retry_failed: bool
+    response_fence: str = "markdown"
 
 
 @dataclass
@@ -1279,8 +1291,21 @@ def mutate_markdown(
     return edited, changes
 
 
-def build_prompt(markdown: str) -> str:
-    return PROMPT_PREFIX + markdown + PROMPT_SUFFIX
+def prompt_version_for(response_fence: str) -> str:
+    return NO_FENCE_PROMPT_VERSION if response_fence == "none" else PROMPT_VERSION
+
+
+def response_affixes(response_fence: str) -> tuple[str, str]:
+    if response_fence == "none":
+        return "", ""
+    if response_fence == "markdown":
+        return RESPONSE_PREFIX, RESPONSE_SUFFIX
+    raise ValueError(f"unsupported response fence: {response_fence}")
+
+
+def build_prompt(markdown: str, *, response_fence: str = "markdown") -> str:
+    prefix = NO_FENCE_PROMPT_PREFIX if response_fence == "none" else PROMPT_PREFIX
+    return prefix + markdown + PROMPT_SUFFIX
 
 
 def rewrite_heading_levels(
@@ -1341,6 +1366,7 @@ def validate_sample(row: dict[str, Any], *, max_response_tokens: int) -> None:
     extra = row.get("extra_info")
     if not isinstance(extra, dict):
         raise ValueError("missing extra_info")
+    response_prefix, response_suffix = response_affixes(extra.get("response_fence", "markdown"))
     headings = extra.get("heading_changes")
     if not isinstance(headings, list):
         raise ValueError("missing heading changes")
@@ -1365,7 +1391,7 @@ def validate_sample(row: dict[str, Any], *, max_response_tokens: int) -> None:
             expected_body[:start] + "#" * heading["to_level"]
             + expected_body[start + heading["from_level"]:]
         )
-    if answer != RESPONSE_PREFIX + expected_body + RESPONSE_SUFFIX:
+    if answer != response_prefix + expected_body + response_suffix:
         raise ValueError("answer differs beyond heading levels and Markdown fence")
     response_tokens = extra.get("response_tokens")
     if not isinstance(response_tokens, int) or response_tokens <= 0 or response_tokens > max_response_tokens:
@@ -1445,7 +1471,8 @@ def make_sample(
         )
     )
     rewritten, heading_changes = rewrite_heading_levels(edited, blocks=blocks, rng=heading_rng)
-    answer = RESPONSE_PREFIX + rewritten + RESPONSE_SUFFIX
+    response_prefix, response_suffix = response_affixes(config.response_fence)
+    answer = response_prefix + rewritten + response_suffix
     response_tokens = counter.count(answer)
     if response_tokens < config.min_response_tokens:
         raise RejectedSource("edited_response_below_min_tokens")
@@ -1462,10 +1489,12 @@ def make_sample(
         source_file, blocks[0].source_start, blocks[-1].source_end,
         signature, PIPELINE_VERSION, heading_signature,
     ).hex()[:20]
+    if config.response_fence == "none":
+        sample_digest = stable_digest(sample_digest, NO_FENCE_PROMPT_VERSION).hex()[:20]
     sample_id = f"{stem}_{sample_digest}"
     for change in changes:
         start, end = change["char_offset"], change["char_end"]
-        shift = len(RESPONSE_PREFIX) + sum(
+        shift = len(response_prefix) + sum(
             heading["to_level"] - heading["from_level"]
             for heading in heading_changes if heading["input_offset"] < start
         )
@@ -1484,7 +1513,7 @@ def make_sample(
     ]
     sample = {
         "messages": [
-            {"role": "user", "content": build_prompt(edited)},
+            {"role": "user", "content": build_prompt(edited, response_fence=config.response_fence)},
             {"role": "assistant", "content": answer},
         ],
         "data_source": "arxiv_confusable_text_copy",
@@ -1492,7 +1521,7 @@ def make_sample(
         "extra_info": {
             "schema_version": SCHEMA_VERSION,
             "pipeline_version": PIPELINE_VERSION,
-            "prompt_version": PROMPT_VERSION,
+            "prompt_version": prompt_version_for(config.response_fence),
             "mutation_policy_version": MUTATION_POLICY_VERSION,
             "mutation_pair_policy_fingerprint": POLICY_FINGERPRINT,
             "heading_policy_version": HEADING_POLICY_VERSION,
@@ -1520,6 +1549,8 @@ def make_sample(
             "changes": changes,
         },
     }
+    if config.response_fence == "none":
+        sample["extra_info"]["response_fence"] = "none"
     validate_sample(sample, max_response_tokens=config.max_response_tokens)
     return sample
 
@@ -1628,6 +1659,7 @@ def process_paper(task: dict[str, Any]) -> PaperResult:
         temp_root=task["config"].get("temp_root"),
         resume=bool(task["config"]["resume"]),
         retry_failed=bool(task["config"]["retry_failed"]),
+        response_fence=task["config"].get("response_fence", "markdown"),
     )
     started = time.monotonic()
     archive_sha256: str | None = None
@@ -2269,10 +2301,11 @@ def select_input_rows(
 
 
 def config_fingerprint(args: argparse.Namespace, buckets: Sequence[LengthBucket]) -> str:
+    response_fence = getattr(args, "response_fence", "markdown")
     value = {
         "pipeline_version": PIPELINE_VERSION,
         "table_ast_version": TABLE_AST_VERSION,
-        "prompt_version": PROMPT_VERSION,
+        "prompt_version": prompt_version_for(response_fence),
         "mutation_policy_version": MUTATION_POLICY_VERSION,
         "mutation_pair_policy_fingerprint": POLICY_FINGERPRINT,
         "heading_policy_version": HEADING_POLICY_VERSION,
@@ -2288,11 +2321,16 @@ def config_fingerprint(args: argparse.Namespace, buckets: Sequence[LengthBucket]
         "max_mutations": args.max_mutations,
         "max_samples_per_paper": args.max_samples_per_paper,
     }
+    # Keep existing default-mode checkpoints usable; isolate only the new mode.
+    if response_fence == "none":
+        value["response_fence"] = "none"
     return sha256_text(json.dumps(value, sort_keys=True, separators=(",", ":")))[:20]
 
 
 def run_pipeline(args: argparse.Namespace) -> dict[str, Any]:
     started = time.monotonic()
+    response_fence = getattr(args, "response_fence", "markdown")
+    response_affixes(response_fence)
     if args.workers < 1:
         raise ValueError("--workers must be positive")
     if args.max_papers < 0 or args.max_samples < 0 or args.max_samples_per_paper < 0:
@@ -2366,6 +2404,7 @@ def run_pipeline(args: argparse.Namespace) -> dict[str, Any]:
         "temp_root": str(args.temp_root.resolve()) if args.temp_root else None,
         "resume": args.resume,
         "retry_failed": args.retry_failed,
+        "response_fence": response_fence,
     }
     preflight_config = WorkerConfig(
         fingerprint=fingerprint,
@@ -2383,6 +2422,7 @@ def run_pipeline(args: argparse.Namespace) -> dict[str, Any]:
         temp_root=str(args.temp_root.resolve()) if args.temp_root else None,
         resume=args.resume,
         retry_failed=args.retry_failed,
+        response_fence=response_fence,
     )
     preflight_tokens = get_token_counter(preflight_config).count("tokenizer preflight")
     if preflight_tokens <= 0:
@@ -2412,7 +2452,7 @@ def run_pipeline(args: argparse.Namespace) -> dict[str, Any]:
         f"papers={len(tasks)} workers={args.workers} tokenizer={args.tokenizer} "
         f"response_tokens={args.min_response_tokens}-{args.max_response_tokens} "
         f"mutation_word_ratio={args.mutation_word_ratio:g} "
-        f"heading_policy={HEADING_POLICY_VERSION} response_fence=markdown "
+        f"heading_policy={HEADING_POLICY_VERSION} response_fence={response_fence} "
         f"mutation_limits={args.min_mutations}-{args.max_mutations or 'unlimited'} "
         f"target_ceiling={args.max_samples or 'unlimited'} resume={args.resume} "
         f"config_fingerprint={fingerprint}",
@@ -2543,7 +2583,8 @@ def run_pipeline(args: argparse.Namespace) -> dict[str, Any]:
         "status": "passed" if merge["written_samples"] else "failed",
         "schema_version": SCHEMA_VERSION,
         "pipeline_version": PIPELINE_VERSION,
-        "prompt_version": PROMPT_VERSION,
+        "prompt_version": prompt_version_for(response_fence),
+        "response_fence": response_fence,
         "mutation_policy_version": MUTATION_POLICY_VERSION,
         "mutation_pair_policy_fingerprint": POLICY_FINGERPRINT,
         "heading_policy_version": HEADING_POLICY_VERSION,
@@ -2619,6 +2660,10 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--max-samples-per-paper", type=int, default=0, help="0 keeps every unique window produced by the fixed policy")
     parser.add_argument("--min-response-tokens", type=int, default=1_000)
     parser.add_argument("--max-response-tokens", type=int, default=7_800)
+    parser.add_argument(
+        "--response-fence", choices=("markdown", "none"), default="markdown",
+        help="Outer answer wrapper: markdown keeps V5 behavior; none uses the approved no-fence prompt",
+    )
     parser.add_argument(
         "--mutation-word-ratio",
         type=float,
