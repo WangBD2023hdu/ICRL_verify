@@ -59,12 +59,45 @@ B from A and the heading changes and requires exact equality.
 
 CLI flags, input/output path conventions and the source-processing worker
 pool are unchanged. The current pipeline is
-`arxiv_confusable_text_sft_v4_heading_zero`, with prompt
+`arxiv_confusable_text_sft_v5_weighted_pairs`, with prompt
 `heading_rewrite_boundary_en_v3` and heading policy
 `block_start_heading_levels_0_to_4_zero28_v2`. Only the approved prompt sentence
 changes the allowed hash count from 1–4 to 0–4; the rest is unchanged. Updated
 versions isolate checkpoints from earlier heading policies. Use a new output
 directory to keep old and new datasets separate.
+
+## V5 weighted letter mutations
+
+Text rewrite and multimodal V5 share the exact `PAIR_COUNTS` / `PAIR_WEIGHTS`
+in `src/arxiv_confusable_pairs.py`: 19 source letters, 45 directed pairs and
+total weight 1012.
+The digit substitution `0 -> e` is excluded. This replaces the old rewrite
+letter table; it is not a union of the old and new pairs. For example, `m -> n`,
+`n -> m` and `w -> v` are now available, while the old `g -> q` is not.
+
+- First select a valid character pair by its integer weight, then uniformly
+  select a matching word occurrence, then a valid character position in that
+  occurrence. Do not multiply pair weights by the number of candidate words.
+- Pairs with no remaining valid occurrence are removed and the remaining
+  weights are renormalized. The exported frequencies depend on available
+  source words; these weights are sampling targets, not exact corpus quotas.
+- Rewrite keeps its existing approximately 10% occurrence-level budget,
+  minimum 3 mutations, and default uncapped maximum. It does **not** switch
+  to multimodal V5's 3–4 mutations per page or unique-word requirement.
+- Each selected occurrence changes one lower-case character, with no insertion
+  or deletion. Numbers, upper-case letters, tags, attributes, formulas, code
+  and link targets keep the existing protection. Table cell text may mutate.
+  Existing vocabulary collision checks remain in place.
+
+Prompt `heading_rewrite_boundary_en_v3` and the 28% heading-removal rule are
+unchanged. A is generated using the new character policy, and B retains the
+same character mutations as A. `extra_info.changes` continues to record both
+word spellings, the character pair, and offsets in A/B.
+The mutation version is `chaos_text_empirical_1012_pair_first_v3`, and
+`mutation_pair_policy_fingerprint` is recorded in each sample, the config
+fingerprint inputs, and the final manifest. Old-policy checkpoints are not
+reused. CLI flags and file paths are unchanged; use a new output directory.
+Chinese glyph-pair synthesis is not changed by this English-letter update.
 
 ## Source tables → HTML (v3 extraction)
 
@@ -93,8 +126,9 @@ prompt. It remains unchanged in the current heading-zero version.
 distinguishes `text`, `caption` and `table`. The final manifest reports
 `merge.table_samples` and `merge.tables_written`.
 
-The script now imports the repository's table parser. Transfer the script
-**and** `src/arxiv_source_first_v3/` together (or use the repository checkout);
+The script imports the repository's table parser and shared letter weights.
+Transfer the script, `src/arxiv_confusable_pairs.py` **and**
+`src/arxiv_source_first_v3/` together (or use the repository checkout);
 it is no longer a standalone copied Python file. The table parser itself uses
 the Python standard library. Tokenizer dependencies are unchanged.
 

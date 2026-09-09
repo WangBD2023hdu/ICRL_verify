@@ -16,12 +16,55 @@ import unittest
 from pathlib import Path
 from unittest import mock
 
+from arxiv_canonical_reflow_v4 import weighted_mutation as V5_WEIGHTED_MUTATION
+
 SCRIPT = Path(__file__).resolve().parents[1] / "scripts" / "build_arxiv_confusable_text_sft.py"
 SPEC = importlib.util.spec_from_file_location("build_arxiv_confusable_text_sft", SCRIPT)
 assert SPEC and SPEC.loader
 MODULE = importlib.util.module_from_spec(SPEC)
 sys.modules[SPEC.name] = MODULE
 SPEC.loader.exec_module(MODULE)
+
+
+class RecordingWeightedRng:
+    """Small deterministic RNG double for pair-first mutation assertions."""
+
+    def __init__(self, *pairs: tuple[str, str]) -> None:
+        self.pairs = list(pairs)
+        self.populations: list[tuple[tuple[str, str], ...]] = []
+        self.weights: list[tuple[int, ...]] = []
+        self.randrange_stops: list[int] = []
+        self.position_inputs: list[tuple[int, ...]] = []
+
+    def random(self) -> float:
+        return 1.0
+
+    def choices(
+        self,
+        population: list[tuple[str, str]],
+        weights: list[int] | None = None,
+        *,
+        cum_weights: object = None,
+        k: int = 1,
+    ) -> list[tuple[str, str]]:
+        del cum_weights
+        self.populations.append(tuple(population))
+        self.weights.append(tuple(weights or ()))
+        pair = self.pairs.pop(0) if self.pairs else population[0]
+        return [pair for _ in range(k)]
+
+    def randrange(self, stop: int, *args: object) -> int:
+        del args
+        self.randrange_stops.append(stop)
+        return stop - 1
+
+    def shuffle(self, values: list[int]) -> None:
+        self.position_inputs.append(tuple(values))
+        values.reverse()
+
+    def choice(self, values: list[int]) -> int:
+        self.position_inputs.append(tuple(values))
+        return values[-1]
 
 
 class ArxivConfusableTextSftTests(unittest.TestCase):
@@ -91,6 +134,120 @@ This is a \textbf{carefully written} paragraph with $x_i$ and prior work
             end = change["char_end"]
             self.assertEqual(edited[start:end], change["ocr_ans"])
             self.assertEqual(len(change["origin_ans"]), len(change["ocr_ans"]))
+
+    def test_weighted_pair_table_is_shared_with_v5(self) -> None:
+        self.assertIs(MODULE.PAIR_COUNTS, V5_WEIGHTED_MUTATION.PAIR_COUNTS)
+        self.assertIs(MODULE.PAIR_WEIGHTS, V5_WEIGHTED_MUTATION.PAIR_WEIGHTS)
+        self.assertEqual(len(MODULE.PAIR_COUNTS), 19)
+        self.assertEqual(sum(MODULE.PAIR_WEIGHTS.values()), 1_012)
+        self.assertEqual(MODULE.POLICY_FINGERPRINT, V5_WEIGHTED_MUTATION.POLICY_FINGERPRINT)
+        self.assertEqual(MODULE.PIPELINE_VERSION, "arxiv_confusable_text_sft_v5_weighted_pairs")
+        self.assertNotIn(("0", "e"), MODULE.PAIR_WEIGHTS)
+        self.assertEqual(MODULE.PAIR_COUNTS["m"]["n"], 63)
+        self.assertEqual(MODULE.PAIR_COUNTS["w"]["v"], 19)
+        self.assertNotIn("g", MODULE.PAIR_COUNTS)
+        self.assertNotIn(("g", "q"), MODULE.PAIR_WEIGHTS)
+
+    def test_weighted_mutation_uses_pair_weights_not_word_frequency(self) -> None:
+        source = " ".join(["many"] * 7 + ["wave"])
+        rng = RecordingWeightedRng(("m", "n"), ("m", "n"))
+        edited, changes = MODULE.mutate_markdown(
+            source,
+            response_tokens=1,
+            rng=rng,
+            mutation_word_ratio=0.25,
+            min_mutations=2,
+            max_mutations=2,
+        )
+
+        self.assertEqual(len(changes), 2)
+        self.assertEqual([change["origin_ans"] for change in changes], ["many", "many"])
+        self.assertEqual([change["ocr_ans"] for change in changes], ["nany", "nany"])
+        self.assertEqual(edited.split().count("nany"), 2)
+        self.assertEqual(edited.split().count("many"), 5)
+        self.assertTrue(rng.populations)
+        observed_weights = {
+            pair: weight
+            for pair, weight in zip(rng.populations[0], rng.weights[0])
+        }
+        self.assertEqual(observed_weights[("m", "n")], MODULE.PAIR_WEIGHTS[("m", "n")])
+        self.assertEqual(observed_weights[("w", "v")], MODULE.PAIR_WEIGHTS[("w", "v")])
+        self.assertEqual(observed_weights[("w", "u")], MODULE.PAIR_WEIGHTS[("w", "u")])
+        self.assertEqual(rng.randrange_stops[:2], [7, 6])
+
+    def test_weighted_mutation_selects_each_character_position_and_new_pairs(self) -> None:
+        rng = RecordingWeightedRng(("m", "n"))
+        edited, changes = MODULE.mutate_markdown(
+            "mmmm",
+            response_tokens=1,
+            rng=rng,
+            mutation_word_ratio=1.0,
+            min_mutations=1,
+            max_mutations=1,
+        )
+        self.assertEqual(edited, "mmmn")
+        self.assertEqual(len(changes), 1)
+        self.assertEqual(changes[0]["origin_ans"], "mmmm")
+        self.assertEqual(changes[0]["ocr_ans"], "mmmn")
+        self.assertEqual(changes[0]["from_char"], "m")
+        self.assertEqual(changes[0]["to_char"], "n")
+        self.assertEqual(changes[0]["char_index_in_word"], 3)
+        self.assertIn((0, 1, 2, 3), rng.position_inputs)
+
+        pair_rng = RecordingWeightedRng(("m", "n"), ("w", "v"))
+        pair_edited, pair_changes = MODULE.mutate_markdown(
+            "mmmm wwww gggg",
+            response_tokens=1,
+            rng=pair_rng,
+            mutation_word_ratio=1.0,
+            min_mutations=2,
+            max_mutations=2,
+        )
+        self.assertEqual(
+            {(change["from_char"], change["to_char"]) for change in pair_changes},
+            {("m", "n"), ("w", "v")},
+        )
+        self.assertNotIn("q", pair_edited)
+        self.assertEqual(pair_edited.split(), ["mmmn", "wwwv", "gggg"])
+
+    def test_weighted_mutation_rejects_missing_pairs_and_candidate_exhaustion(self) -> None:
+        for source in ("gggg", "zzzz", "123456"):
+            with self.assertRaises(MODULE.RejectedSource):
+                MODULE.mutate_markdown(
+                    source,
+                    response_tokens=1,
+                    rng=random.Random(7),
+                    mutation_word_ratio=1.0,
+                    min_mutations=1,
+                    max_mutations=1,
+                )
+        with self.assertRaises(MODULE.RejectedSource):
+            MODULE.mutate_markdown(
+                "muse",
+                response_tokens=1,
+                rng=random.Random(7),
+                mutation_word_ratio=1.0,
+                min_mutations=3,
+                max_mutations=3,
+            )
+
+    def test_weighted_mutation_protects_digits_and_filters_old_vocabulary_collisions(self) -> None:
+        source = "many nany wave vave 2026 model42"
+        edited, changes = MODULE.mutate_markdown(
+            source,
+            response_tokens=1,
+            rng=random.Random(17),
+            mutation_word_ratio=0.5,
+            min_mutations=1,
+            max_mutations=0,
+        )
+        self.assertEqual(len(edited), len(source))
+        self.assertEqual(re.findall(r"\d+", edited), re.findall(r"\d+", source))
+        vocabulary = {word.lower() for word in re.findall(r"[A-Za-z]{4,}", source)}
+        self.assertTrue(changes)
+        for change in changes:
+            self.assertFalse(any(character.isdigit() for character in change["ocr_ans"]))
+            self.assertNotIn(change["ocr_ans"].lower(), vocabulary)
 
     def _text_block(self, markdown: str, *, source_start: int = 0, kind: str = "text") -> object:
         return MODULE.TextBlock(

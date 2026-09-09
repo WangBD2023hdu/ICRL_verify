@@ -38,6 +38,7 @@ from pathlib import Path, PurePosixPath
 from typing import Any, BinaryIO
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
+from arxiv_confusable_pairs import PAIR_COUNTS, PAIR_WEIGHTS, POLICY_FINGERPRINT
 from arxiv_source_first_v3.table_ast import (
     TABLE_AST_VERSION,
     TableAstError,
@@ -45,11 +46,11 @@ from arxiv_source_first_v3.table_ast import (
 )
 
 SCHEMA_VERSION = 2
-PIPELINE_VERSION = "arxiv_confusable_text_sft_v4_heading_zero"
+PIPELINE_VERSION = "arxiv_confusable_text_sft_v5_weighted_pairs"
 PROMPT_VERSION = "heading_rewrite_boundary_en_v3"
 HEADING_POLICY_VERSION = "block_start_heading_levels_0_to_4_zero28_v2"
 NO_HEADING_PROBABILITY = 0.28
-MUTATION_POLICY_VERSION = "chaos_text_word_ratio_v2"
+MUTATION_POLICY_VERSION = "chaos_text_empirical_1012_pair_first_v3"
 DEFAULT_MUTATION_WORD_RATIO = 0.10
 DEFAULT_MIN_MUTATIONS = 3
 DEFAULT_MAX_MUTATIONS = 0
@@ -90,25 +91,6 @@ MAX_ARCHIVE_BYTES = 500 * 1024 * 1024
 MAX_MEMBER_BYTES = 100 * 1024 * 1024
 MAX_TEX_FILES_PER_PAPER = 500
 MAX_TEX_FILE_BYTES = 20 * 1024 * 1024
-
-# One lower-case ASCII code point is replaced by one lower-case ASCII code
-# point.  Digits, insertions, deletions, and Unicode homoglyphs are forbidden.
-CONFUSABLES: dict[str, tuple[str, ...]] = {
-    "a": ("o",),
-    "c": ("e", "o"),
-    "e": ("c",),
-    "g": ("q",),
-    "h": ("n",),
-    "i": ("l",),
-    "l": ("i",),
-    "n": ("h",),
-    "o": ("a", "c"),
-    "q": ("g",),
-    "s": ("z",),
-    "u": ("v",),
-    "v": ("u",),
-    "z": ("s",),
-}
 
 EXCLUDED_ENVIRONMENTS = {
     "thebibliography",
@@ -1200,6 +1182,12 @@ def mutate_markdown(
     min_mutations: int = DEFAULT_MIN_MUTATIONS,
     max_mutations: int = DEFAULT_MAX_MUTATIONS,
 ) -> tuple[str, list[dict[str, Any]]]:
+    """Use V5 pair weights while retaining rewrite's occurrence-level budget.
+
+    Draw the character pair first, then a matching word occurrence, then a
+    valid position. Missing/exhausted pairs are removed, not replaced with
+    unrelated substitutions. Pair weights are not multiplied by word counts.
+    """
     del response_tokens  # Retained for call-site compatibility and audit context.
     spans = protected_spans(markdown)
     vocabulary = {match.group(0).lower() for match in WORD_RE.finditer(markdown)}
@@ -1214,24 +1202,41 @@ def mutate_markdown(
         min_mutations=min_mutations,
         max_mutations=max_mutations,
     )
-    candidates: list[tuple[re.Match[str], list[tuple[int, str]]]] = []
-    for match in occurrences:
+    by_pair: dict[tuple[str, str], list[tuple[int, tuple[int, ...]]]] = defaultdict(list)
+    for word_index, match in enumerate(occurrences):
         original = match.group(0)
-        options: list[tuple[int, str]] = []
+        positions: dict[tuple[str, str], list[int]] = defaultdict(list)
         for index, character in enumerate(original):
-            if character not in CONFUSABLES:
-                continue
-            for replacement in CONFUSABLES[character]:
+            for replacement in PAIR_COUNTS.get(character, {}):
                 mutated = original[:index] + replacement + original[index + 1 :]
                 if mutated.lower() not in vocabulary:
-                    options.append((index, replacement))
-        if options:
-            candidates.append((match, options))
-    rng.shuffle(candidates)
+                    positions[character, replacement].append(index)
+        for pair, indexes in positions.items():
+            by_pair[pair].append((word_index, tuple(indexes)))
+
+    available = [pair for pair in PAIR_WEIGHTS if pair in by_pair]
+    selected_indexes: set[int] = set()
     selected: list[tuple[int, int, str, str, int, str, str]] = []
-    for match, options in candidates[:desired]:
+    while available and len(selected) < desired:
+        pair = rng.choices(available, weights=[PAIR_WEIGHTS[pair] for pair in available])[0]
+        options = by_pair[pair]
+        # Random removal gives uniform word sampling without repeatedly
+        # copying all candidates; stale entries from other pairs are skipped.
+        while options:
+            option_index = rng.randrange(len(options))
+            word_index, positions_tuple = options[option_index]
+            options[option_index] = options[-1]
+            options.pop()
+            if word_index not in selected_indexes:
+                break
+        else:
+            available.remove(pair)
+            continue
+        selected_indexes.add(word_index)
+        match = occurrences[word_index]
         original = match.group(0)
-        char_index, replacement = rng.choice(options)
+        char_index = rng.choice(positions_tuple)
+        replacement = pair[1]
         mutated = original[:char_index] + replacement + original[char_index + 1 :]
         selected.append(
             (
@@ -1489,6 +1494,7 @@ def make_sample(
             "pipeline_version": PIPELINE_VERSION,
             "prompt_version": PROMPT_VERSION,
             "mutation_policy_version": MUTATION_POLICY_VERSION,
+            "mutation_pair_policy_fingerprint": POLICY_FINGERPRINT,
             "heading_policy_version": HEADING_POLICY_VERSION,
             "heading_changes": heading_changes,
             "sample_id": sample_id,
@@ -2268,6 +2274,7 @@ def config_fingerprint(args: argparse.Namespace, buckets: Sequence[LengthBucket]
         "table_ast_version": TABLE_AST_VERSION,
         "prompt_version": PROMPT_VERSION,
         "mutation_policy_version": MUTATION_POLICY_VERSION,
+        "mutation_pair_policy_fingerprint": POLICY_FINGERPRINT,
         "heading_policy_version": HEADING_POLICY_VERSION,
         "seed": args.seed,
         "tokenizer": args.tokenizer,
@@ -2538,6 +2545,7 @@ def run_pipeline(args: argparse.Namespace) -> dict[str, Any]:
         "pipeline_version": PIPELINE_VERSION,
         "prompt_version": PROMPT_VERSION,
         "mutation_policy_version": MUTATION_POLICY_VERSION,
+        "mutation_pair_policy_fingerprint": POLICY_FINGERPRINT,
         "heading_policy_version": HEADING_POLICY_VERSION,
         "created_at": utc_now(),
         "input_root": str(input_root),
