@@ -436,8 +436,11 @@ def test_sample_generates_once_then_forwards_same_ids_twice(
 
     assert generation_calls == [[1, 2, 3]]
     assert len(model.calls) == 2
-    assert model.calls[0].tolist() == [[1, 2, 3, 7, 8]]
-    assert model.calls[1].tolist() == [[4, 5, 6, 7, 8]]
+    assert model.calls[0].tolist() == [[4, 5, 6, 7, 8]]
+    assert model.calls[1].tolist() == [[1, 2, 3, 7, 8]]
+    assert all(
+        row["p_original_teacher_top1"] == row["p_original"] for row in result["tokens"]
+    )
     assert result["response"]["token_ids"] == [7, 8]
     assert result["protocol"]["generation_count"] == 1
     assert result["protocol"]["teacher_forced_forward_count"] == 2
@@ -485,8 +488,14 @@ def test_sample_routes_distinct_student_and_teacher_bundles(
         ground_truth_path=gt_path,
         changes=(),
     )
+    class AlternativeTeacher(RecordingModel):
+        def forward(self, **kwargs: object) -> SimpleNamespace:
+            output = super().forward(**kwargs)
+            output.logits[:, :, 9] = 20.0
+            return output
+
     student_model = RecordingModel()
-    teacher_model = RecordingModel()
+    teacher_model = AlternativeTeacher()
     student_bundle = _bundle(student_model, model_id="student")
     teacher_bundle = _bundle(teacher_model, model_id="teacher")
     generation_calls: list[dict[str, object]] = []
@@ -532,6 +541,11 @@ def test_sample_routes_distinct_student_and_teacher_bundles(
     assert student_model.calls[0].tolist() == [[1, 2, 3, 7, 8]]
     assert len(teacher_model.calls) == 1
     assert teacher_model.calls[0].tolist() == [[4, 5, 6, 7, 8]]
+    for row in result["tokens"]:
+        assert row["top_token_id_teacher"] == 9
+        assert row["p_original"] > 0.999
+        assert 0 < row["p_original_teacher_top1"] < 1e-8
+        assert 9 not in {candidate["token_id"] for candidate in row["top_candidates_original"]}
     assert student_bundle.tokenizer.messages is None
     assert teacher_bundle.tokenizer.messages == [
         {"role": "user", "content": _expected_privileged_prompt(ground_truth)}
@@ -944,6 +958,7 @@ def test_sample_report_visualizes_mutations_and_keeps_complete_token_order() -> 
     assert "GT Teacher-Forcing 条件" in report
     assert "p(response token)" in report
     assert "p(same response token)" in report
+    assert "学生 p(教师 Top-1)" in report
     assert "Top-1" in report
     assert "Top-2" in report
     assert '<div class="stats">' not in report
@@ -994,7 +1009,7 @@ def test_sample_report_visualizes_mutations_and_keeps_complete_token_order() -> 
         parser.token_rows, expected
     ):
         assert row_id == f"token-{index}"
-        assert len(cells) == 12
+        assert len(cells) == 13
         assert cells[0] == str(index)
         assert token_text in cells[1]
         assert f"ID {token_id}" in cells[1]
@@ -1007,6 +1022,8 @@ def test_sample_report_visualizes_mutations_and_keeps_complete_token_order() -> 
     assert "p 0.600000" in parser.token_rows[0][1][4]
     assert "0.400000" in parser.token_rows[0][1][6]
     assert "p 0.400000" in parser.token_rows[0][1][8]
+    assert "0.200000" in parser.token_rows[0][1][12]
+    assert "未记录（需补评分）" in report
 
     no_mutation_rows = [dict(row, mutation_ids="") for row in rows]
     no_mutation_result = {
@@ -1616,6 +1633,60 @@ def _correct_token_teacher_result(
         "protocol": {"teacher_model_is_student": True},
         "tokens": rows,
     }
+
+
+@pytest.mark.parametrize("missing_score", [False, True])
+def test_backfill_teacher_top1_reuses_response_and_teacher(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, missing_score: bool,
+) -> None:
+    image_path = tmp_path / "page.png"
+    Image.new("RGB", (32, 32), "white").save(image_path)
+    gt_path = tmp_path / "page.md"
+    gt_path.write_text("AB", encoding="utf-8")
+    sample = probe.PrivilegedProbeSample(1, "p1", image_path, gt_path, ())
+    result = _correct_token_teacher_result(
+        "p1", "samples/001_p1/report.html", "AB",
+        [{"token_id": token_id, "raw_token": piece, "p_original": 0.4,
+          "delta_logp": 0.0, "token_label": "correct",
+          "teacher_top_token_id": 9 if missing_score else token_id,
+          "teacher_top_raw_token": "X" if missing_score else piece,
+          "teacher_top_probability": 0.6, "teacher_rank": 2 if missing_score else 1}
+         for token_id, piece in [(7, "A"), (8, "B")]],
+    )
+    for row in result["tokens"]:
+        row.pop("p_original_teacher_top1", None)
+        row.pop("logp_original_teacher_top1", None)
+    student, teacher = _bundle(), _bundle(model_id="teacher")
+    monkeypatch.setattr(probe, "prepare_prompt_inputs", lambda **_: {
+        "input_ids": torch.tensor([[1, 2, 3]]),
+        "attention_mask": torch.ones((1, 3), dtype=torch.long),
+    })
+    monkeypatch.setattr(probe, "generate_from_prompt", lambda **_: pytest.fail("must not regenerate"))
+    extended = probe._run_sample(
+        sample=sample, sample_dir=tmp_path / "sample", fingerprint="fp",
+        student_model_bundle=student, teacher_model_bundle=teacher,
+        prompt="OCR", privileged_instruction=_PRIVILEGED_PROMPT_INSTRUCTION,
+        max_new_tokens=16, top_k=2, forward_chunk_size=1,
+        min_pixels=2048, max_pixels=16777216, image_patch_size=16,
+        seed=7, tracker=TrackerStub(), cached_result=result,
+    )
+    assert len(student.model.calls) == int(missing_score)
+    assert teacher.model.calls == []
+    assert extended["response"]["token_ids"] == [7, 8]
+    assert [row["p_original"] for row in extended["tokens"]] == [0.4, 0.4]
+    assert [row["p_teacher"] for row in extended["tokens"]] == [0.4, 0.4]
+    assert extended["protocol"]["generation_performed_this_run"] is False
+    if missing_score:
+        assert student.model.calls[0].tolist() == [[1, 2, 3, 7, 8]]
+        assert all(0 < row["p_original_teacher_top1"] < 1e-8 for row in extended["tokens"])
+    else:
+        assert all(row["p_original_teacher_top1"] == 0.4 for row in extended["tokens"])
+    probe._write_sample_outputs(tmp_path / "sample", extended)
+    with (tmp_path / "sample" / "token_probabilities.csv").open(newline="") as handle:
+        saved = list(csv.DictReader(handle))
+    assert [float(row["p_original_teacher_top1"]) for row in saved] == [
+        row["p_original_teacher_top1"] for row in extended["tokens"]
+    ]
 
 
 def test_category_report_recovers_verl_mutations_without_inference(

@@ -8,10 +8,13 @@ every page it performs exactly:
 
 1. one student `model.generate` call with `image + original prompt`, preserving
    the generated response ID sequence;
-2. one student forward after directly concatenating that ID tensor to the same
-   multimodal prompt;
-3. one teacher forward after directly concatenating the identical ID tensor to
-   this text-only prompt:
+2. one teacher forward after directly concatenating that ID tensor to the
+   text-only GT prompt shown below;
+3. one student forward after directly concatenating the identical ID tensor to
+   the original multimodal prompt, scoring both the response IDs and the
+   teacher's Top-1 IDs at each position.
+
+The teacher's text-only prompt is:
 
 ```text
 Please transcribe the document enclosed by the boundary markers verbatim, character by character and symbol by symbol. This is a transcription task, not a translation task. Do not change, correct, add, or omit any character. Output only the document content; do not include the boundary markers.
@@ -84,6 +87,22 @@ The root `report.html` is a sample browser and opens the first completed sample
 directly. It contains no aggregate statistics or filtered token analysis. Each
 sample report keeps the complete Ground Truth and model Response visible side by
 side, followed by every generated response token in its original ID order.
+
+The last token-table column, `学生 p(教师 Top-1)`, reports the student's
+original-image probability for the teacher's GT-conditioned Top-1 **token ID**,
+even when it differs from the actual response token or is outside the student's
+saved Top-k. Both distributions use the unchanged student response prefix.
+New runs score the teacher first, then gather these IDs from the student logits
+during the existing original-image forward; this still needs only two scoring
+forwards per sample. The prompts and generation are unchanged.
+
+The values are also saved as `p_original_teacher_top1` and
+`logp_original_teacher_top1` in the token JSON/CSV. Re-running the same inference
+command with resume enabled extends matching old results without regenerating
+responses or recomputing teacher scores: known exact-ID values are reused, and
+any missing values require one student scoring forward per affected sample.
+`--rebuild-report-only` does not run a model; missing values that cannot be
+recovered from saved student Top-k entries display as `未记录（需补评分）`, not zero.
 
 To infer only the first 10 table-containing samples, add `--require-table --limit 10`
 to the inference command. Selection uses HTML `<table>` opening tags in the GT

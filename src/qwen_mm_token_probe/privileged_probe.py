@@ -305,7 +305,14 @@ def run_privileged_probe(
             sample_dir = samples_root / f"{sample.ordinal:03d}_{sample.pair_id}"
             result_path = sample_dir / "result.json"
             fingerprint = _sample_fingerprint(sample=sample, config=config)
-            if resume and _result_matches(result_path, fingerprint):
+            cached_result = (
+                json.loads(result_path.read_text(encoding="utf-8"))
+                if resume and _result_matches(result_path, fingerprint) else None
+            )
+            if cached_result is not None and all(
+                row.get("p_original_teacher_top1") is not None
+                for row in cached_result["tokens"]
+            ):
                 skipped += 1
                 tracker.complete_unit(
                     status="skipped",
@@ -333,6 +340,7 @@ def run_privileged_probe(
                     image_patch_size=image_patch_size,
                     seed=seed + sample.ordinal - 1,
                     tracker=tracker,
+                    cached_result=cached_result,
                 )
                 _write_json_atomic(result_path, result)
                 _write_sample_outputs(sample_dir, result)
@@ -435,6 +443,7 @@ def _run_sample(
     image_patch_size: int,
     seed: int,
     tracker: ProgressTracker,
+    cached_result: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     sample_dir.mkdir(parents=True, exist_ok=True)
     image_copy = sample_dir / f"input{sample.image_path.suffix.lower()}"
@@ -464,6 +473,37 @@ def _run_sample(
         image_patch_size=image_patch_size,
         enable_thinking=False,
     )
+    if cached_result is not None:
+        # Preserve the original response and teacher scores when extending an old run.
+        rows = _response_rows_in_generation_order(cached_result)
+        for row in rows:
+            row["p_original_teacher_top1"], row["logp_original_teacher_top1"] = (
+                _student_score_for_teacher_top1(row)
+            )
+        if any(row["p_original_teacher_top1"] is None for row in rows):
+            teacher_top_ids = [int(row["top_token_id_teacher"]) for row in rows]
+            _validate_teacher_top1_ids(
+                student_model_bundle, teacher_model_bundle, teacher_top_ids
+            )
+            tracker.set_current(
+                index=sample.ordinal, name=sample.pair_id,
+                phase="backfilling-student-probability-of-teacher-top1",
+            )
+            original_scores = _score_fixed_response_ids(
+                model_bundle=student_model_bundle,
+                prompt_inputs=original_inputs,
+                response_ids=cached_result["response"]["token_ids"],
+                probe_token_ids=teacher_top_ids,
+                top_k=top_k,
+                chunk_size=forward_chunk_size,
+            )
+            for row, score in zip(rows, original_scores):
+                row["p_original_teacher_top1"] = score["probe_probability"]
+                row["logp_original_teacher_top1"] = score["probe_log_probability"]
+            _empty_device_cache(student_model_bundle.device)
+        cached_result.setdefault("protocol", {})["teacher_top1_scored_under_original"] = True
+        cached_result["protocol"]["generation_performed_this_run"] = False
+        return cached_result
     tracker.set_current(
         index=sample.ordinal,
         name=sample.pair_id,
@@ -530,20 +570,34 @@ def _run_sample(
     forwards = dict(partial.get("forwards", {}))
     scoring_contexts = (
         (
-            "original",
-            student_model_bundle,
-            original_inputs,
-            "scoring-original-exact-response-ids",
-        ),
-        (
             "teacher",
             teacher_model_bundle,
             teacher_inputs,
             "scoring-privileged-exact-response-ids",
         ),
+        (
+            "original",
+            student_model_bundle,
+            original_inputs,
+            "scoring-original-response-and-teacher-top1-ids",
+        ),
     )
     for context_name, scoring_bundle, context_inputs, phase in scoring_contexts:
-        if context_name in forwards:
+        probe_ids = None
+        if context_name == "original":
+            probe_ids = [int(row["top_token_id"]) for row in forwards["teacher"]]
+            _validate_teacher_top1_ids(student_model_bundle, teacher_model_bundle, probe_ids)
+        cached_scores = forwards.get(context_name)
+        if cached_scores is not None and (
+            probe_ids is None or (
+                len(cached_scores) == len(probe_ids)
+                and all(
+                    row.get("probe_token_id") == token_id
+                    and row.get("probe_probability") is not None
+                    for row, token_id in zip(cached_scores, probe_ids)
+                )
+            )
+        ):
             continue
         tracker.set_current(index=sample.ordinal, name=sample.pair_id, phase=phase)
         forwards[context_name] = _score_fixed_response_ids(
@@ -552,6 +606,7 @@ def _run_sample(
             response_ids=response_ids,
             top_k=top_k,
             chunk_size=forward_chunk_size,
+            probe_token_ids=probe_ids,
         )
         partial["forwards"] = forwards
         _write_json_atomic(partial_path, partial)
@@ -595,6 +650,7 @@ def _run_sample(
             "generation_count": 1,
             "generation_performed_this_run": generation_performed,
             "teacher_forced_forward_count": 2,
+            "teacher_top1_scored_under_original": True,
             "response_ids_reused_for_all_forwards": True,
             "response_ids_directly_concatenated": True,
             "response_text_retokenized": False,
@@ -737,6 +793,16 @@ def _validate_response_id_compatibility(
         )
 
 
+def _validate_teacher_top1_ids(
+    student: ModelBundle, teacher: ModelBundle, token_ids: Sequence[int],
+) -> None:
+    _validate_response_id_compatibility(
+        student_model_bundle=student, teacher_model_bundle=teacher,
+        response_ids=token_ids,
+        response_text=decode_generated_tokens(student.tokenizer, list(token_ids)),
+    )
+
+
 def _score_fixed_response_ids(
     *,
     model_bundle: ModelBundle,
@@ -744,13 +810,16 @@ def _score_fixed_response_ids(
     response_ids: Sequence[int],
     top_k: int,
     chunk_size: int,
+    probe_token_ids: Sequence[int] | None = None,
 ) -> list[dict[str, Any]]:
-    """Append response IDs directly and score them without decoding/re-tokenizing."""
+    """Score response/probe IDs using the unchanged student response as the prefix."""
 
     import torch
 
     if not response_ids:
         raise ValueError("response_ids must not be empty")
+    if probe_token_ids is not None and len(probe_token_ids) != len(response_ids):
+        raise ValueError("probe_token_ids must have the same length as response_ids")
     prompt_length = int(prompt_inputs["input_ids"].shape[-1])
     scoring_inputs = append_generated_tokens(prompt_inputs, list(response_ids))
     scoring_inputs.pop("position_ids", None)
@@ -798,6 +867,15 @@ def _score_fixed_response_ids(
         log_normalizer = torch.logsumexp(chunk, dim=-1)
         selected_logits = chunk.gather(1, target_tensor[:, None]).squeeze(1)
         selected_logp = selected_logits - log_normalizer
+        probe_logp_cpu = None
+        if probe_token_ids is not None:
+            probe_tensor = torch.tensor(
+                [int(value) for value in probe_token_ids[start:end]],
+                dtype=torch.long, device=chunk.device,
+            )
+            probe_logp_cpu = (
+                chunk.gather(1, probe_tensor[:, None]).squeeze(1) - log_normalizer
+            ).detach().cpu().tolist()
         target_ranks = 1 + (chunk > selected_logits[:, None]).sum(dim=-1)
         top_values, top_ids = torch.topk(
             chunk,
@@ -853,6 +931,13 @@ def _score_fixed_response_ids(
                     "top_candidates": candidates,
                 }
             )
+            if probe_logp_cpu is not None:
+                probe_logp = float(probe_logp_cpu[offset])
+                rows[-1].update({
+                    "probe_token_id": int(probe_token_ids[start + offset]),
+                    "probe_probability": math.exp(probe_logp),
+                    "probe_log_probability": probe_logp,
+                })
         del chunk, probabilities
     del outputs, logits, target_logits
     return rows
@@ -992,7 +1077,31 @@ def _combine_scores(
                 "top1_transition": top1_transition,
             }
         )
+        if original.get("probe_token_id") == top_teacher_id:
+            rows[-1]["p_original_teacher_top1"] = float(original["probe_probability"])
+            rows[-1]["logp_original_teacher_top1"] = float(original["probe_log_probability"])
+        else:
+            rows[-1]["p_original_teacher_top1"], rows[-1]["logp_original_teacher_top1"] = (
+                _student_score_for_teacher_top1(rows[-1])
+            )
     return rows
+
+
+def _student_score_for_teacher_top1(row: dict[str, Any]) -> tuple[float | None, float | None]:
+    """Recover an exact-ID student score; never approximate missing Top-k entries."""
+    if row.get("p_original_teacher_top1") is not None:
+        return row["p_original_teacher_top1"], row.get("logp_original_teacher_top1")
+    teacher_id = row.get("top_token_id_teacher")
+    if teacher_id is None:
+        return None, None
+    if teacher_id == row.get("token_id"):
+        return row.get("p_original"), row.get("logp_original")
+    if teacher_id == row.get("top_token_id_original"):
+        return row.get("top_p_original"), row.get("top_logp_original")
+    for candidate in row.get("top_candidates_original", []):
+        if candidate["token_id"] == teacher_id:
+            return candidate.get("probability"), candidate.get("log_probability")
+    return None, None
 
 
 def _attach_gt_and_mutation_alignment(
@@ -2720,6 +2829,10 @@ def _summarize_global(
 
 
 def _write_sample_outputs(sample_dir: Path, result: dict[str, Any]) -> None:
+    for row in result["tokens"]:
+        row["p_original_teacher_top1"], row["logp_original_teacher_top1"] = (
+            _student_score_for_teacher_top1(row)
+        )
     annotate_token_categories(result["tokens"], response_text=str(result["response"]["text"]))
     categories = summarize_token_categories(result["tokens"])
     _write_json_atomic(sample_dir / "token_category_summary.json", {
@@ -2799,8 +2912,9 @@ def _render_sample_html(result: dict[str, Any]) -> str:
 {mutation_section}
 {category_section}
 <section id="token-details"><div class="section-heading"><h2>全部 Response Token（严格按生成顺序）</h2><output>{len(rows)} tokens</output></div>
+<p>最后一列为学生在原图、相同 Response 前缀下，对教师 Top-1 token ID 给出的概率；不会将前缀替换成教师输出。旧结果未保存且不在学生 Top-k 中的值显示为“未记录（需补评分）”。</p>
 <div class="table-scroll token-table-scroll"><table class="token-detail-table">
-<thead><tr><th rowspan="2">生成索引</th><th rowspan="2">Response token</th><th colspan="4" class="condition original-condition">原图条件（image + prompt）</th><th colspan="4" class="condition teacher-condition">GT Teacher-Forcing 条件</th><th colspan="2" class="condition delta-condition">概率变化（Teacher - Original）</th></tr>
+<thead><tr><th rowspan="2">生成索引</th><th rowspan="2">Response token</th><th colspan="4" class="condition original-condition">原图条件（image + prompt）</th><th colspan="4" class="condition teacher-condition">GT Teacher-Forcing 条件</th><th colspan="2" class="condition delta-condition">概率变化（Teacher - Original）</th><th rowspan="2">学生 p(教师 Top-1)</th></tr>
 <tr><th>p(response token)</th><th>response rank</th><th>Top-1</th><th>Top-2</th><th>p(same response token)</th><th>response rank</th><th>Top-1</th><th>Top-2</th><th>Δp</th><th>Δlogp</th></tr></thead>
 <tbody>{token_rows}</tbody></table></div></section>
 </main></body></html>"""
@@ -3877,11 +3991,15 @@ def _candidate_block(
     )
 
 
-def _probability_cell(value: Any, condition: str) -> str:
+def _probability_cell(value: Any, condition: str, *, show_small: bool = False) -> str:
     probability = min(1.0, max(0.0, float(value)))
+    display = (
+        f"{probability:.3e}" if show_small and 0 < probability < 1e-6
+        else f"{probability:.6f}"
+    )
     return (
         f"<div class='probability-cell {condition}'>"
-        f"<strong>{probability:.6f}</strong>"
+        f"<strong>{display}</strong>"
         f"<span class='probability-track'><i style='width:{100 * probability:.4f}%'></i></span>"
         "</div>"
     )
@@ -3901,6 +4019,11 @@ def _token_table_row(row: dict[str, Any]) -> str:
         for mutation_id in mutation_ids
     )
     category = CATEGORY_LABELS.get(str(row.get("token_category", "")), "")
+    teacher_top1_student_p, _ = _student_score_for_teacher_top1(row)
+    teacher_top1_student_cell = (
+        _probability_cell(teacher_top1_student_p, "original", show_small=True)
+        if teacher_top1_student_p is not None else "未记录（需补评分）"
+    )
     return (
         f"<tr id='token-{int(row['index'])}' class='{classes}'>"
         f"<td>{int(row['index'])}</td>"
@@ -3916,7 +4039,8 @@ def _token_table_row(row: dict[str, Any]) -> str:
         f"<td>{_candidate_block(row, 'teacher', 1)}</td>"
         f"<td>{_candidate_block(row, 'teacher', 2)}</td>"
         f"<td class='{_delta_class(delta_p)}'>{delta_p:+.6f}</td>"
-        f"<td class='{_delta_class(delta)}'>{delta:+.4f}</td></tr>"
+        f"<td class='{_delta_class(delta)}'>{delta:+.4f}</td>"
+        f"<td class='student-teacher-top1'>{teacher_top1_student_cell}</td></tr>"
     )
 
 
