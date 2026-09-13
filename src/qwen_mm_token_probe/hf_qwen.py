@@ -1,13 +1,18 @@
 from __future__ import annotations
 
+import warnings
+from collections.abc import Sequence
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
-import warnings
 
 import torch
 from PIL import Image
-from transformers import AutoModelForImageTextToText, AutoProcessor, PreTrainedTokenizerBase
+from transformers import (
+    AutoModelForImageTextToText,
+    AutoProcessor,
+    PreTrainedTokenizerBase,
+)
 
 
 @dataclass(frozen=True)
@@ -245,6 +250,226 @@ def move_inputs_to_device(inputs: dict[str, Any], device: torch.device) -> dict[
         else:
             moved[key] = value
     return moved
+
+
+def collate_prompt_inputs(
+    prompt_inputs: Sequence[dict[str, Any]],
+    *,
+    pad_token_id: int,
+) -> dict[str, torch.Tensor]:
+    """Left-pad prepared Qwen image-prompt inputs into one generation batch.
+
+    Images have already been opened, resized/patchified, and processed by the
+    existing single-sample preparation path. This function only joins those
+    tensors: image patch tensors and image-grid rows are concatenated in sample
+    order, while sequence-aligned tensors are left-padded to the longest prompt.
+    """
+
+    if not prompt_inputs:
+        raise ValueError("cannot collate an empty prompt batch")
+
+    supported_keys = {
+        "input_ids",
+        "attention_mask",
+        "token_type_ids",
+        "mm_token_type_ids",
+        "pixel_values",
+        "image_grid_thw",
+    }
+    present_keys = set().union(*(set(inputs) for inputs in prompt_inputs))
+    unsupported_keys = sorted(present_keys - supported_keys)
+    if unsupported_keys:
+        raise ValueError(
+            "unsupported prepared prompt input key(s) for batching: "
+            + ", ".join(unsupported_keys)
+        )
+    if any("input_ids" not in inputs for inputs in prompt_inputs):
+        raise ValueError("every prepared prompt input must contain input_ids")
+
+    def as_single_sequence(inputs: dict[str, Any], key: str, index: int) -> torch.Tensor:
+        value = inputs.get(key)
+        if not torch.is_tensor(value):
+            raise ValueError(f"prompt {index} {key} must be a tensor")
+        if value.ndim == 1:
+            value = value.unsqueeze(0)
+        if value.ndim != 2 or value.shape[0] != 1:
+            raise ValueError(f"prompt {index} {key} must have shape [1, sequence_length]")
+        return value
+
+    input_rows = [as_single_sequence(inputs, "input_ids", i) for i, inputs in enumerate(prompt_inputs)]
+    if any(row.shape[1] == 0 for row in input_rows):
+        raise ValueError("prepared prompt input_ids must not be empty")
+    reference_device = input_rows[0].device
+    if any(row.device != reference_device for row in input_rows):
+        raise ValueError("all prepared prompt tensors must be on the same device")
+
+    lengths = [int(row.shape[1]) for row in input_rows]
+    max_length = max(lengths)
+    batch_input_ids = torch.full(
+        (len(input_rows), max_length),
+        int(pad_token_id),
+        dtype=input_rows[0].dtype,
+        device=reference_device,
+    )
+    batch_attention_mask = torch.zeros(
+        (len(input_rows), max_length),
+        dtype=torch.long,
+        device=reference_device,
+    )
+
+    has_attention_masks = ["attention_mask" in inputs for inputs in prompt_inputs]
+    if any(has_attention_masks) and not all(has_attention_masks):
+        raise ValueError("attention_mask must be present for every prompt or none")
+
+    sequence_optional: dict[str, list[torch.Tensor]] = {}
+    for key in ("token_type_ids", "mm_token_type_ids"):
+        present = [key in inputs for inputs in prompt_inputs]
+        if any(present) and not all(present):
+            raise ValueError(f"{key} must be present for every prompt or none")
+        if all(present):
+            sequence_optional[key] = [
+                as_single_sequence(inputs, key, i) for i, inputs in enumerate(prompt_inputs)
+            ]
+
+    for i, (inputs, input_row, length) in enumerate(zip(prompt_inputs, input_rows, lengths)):
+        offset = max_length - length
+        batch_input_ids[i, offset:] = input_row[0]
+
+        if has_attention_masks[i]:
+            attention = as_single_sequence(inputs, "attention_mask", i)
+            if attention.shape[1] != length:
+                raise ValueError(f"prompt {i} attention_mask length does not match input_ids")
+            if attention.device != reference_device:
+                raise ValueError("all prepared prompt tensors must be on the same device")
+            batch_attention_mask[i, offset:] = attention[0].to(dtype=batch_attention_mask.dtype)
+        else:
+            batch_attention_mask[i, offset:] = 1
+
+    batched: dict[str, torch.Tensor] = {
+        "input_ids": batch_input_ids,
+        "attention_mask": batch_attention_mask,
+    }
+    for key, rows in sequence_optional.items():
+        padded = torch.zeros(
+            (len(rows), max_length),
+            dtype=rows[0].dtype,
+            device=reference_device,
+        )
+        for i, (row, length) in enumerate(zip(rows, lengths)):
+            if row.shape[1] != length:
+                raise ValueError(f"prompt {i} {key} length does not match input_ids")
+            if row.device != reference_device:
+                raise ValueError("all prepared prompt tensors must be on the same device")
+            padded[i, max_length - length :] = row[0]
+        batched[key] = padded
+
+    image_key_presence = {
+        key: [key in inputs for inputs in prompt_inputs]
+        for key in ("pixel_values", "image_grid_thw")
+    }
+    for key, present in image_key_presence.items():
+        if any(present) and not all(present):
+            raise ValueError(f"{key} must be present for every prompt or none")
+    if any(image_key_presence["pixel_values"]) != any(image_key_presence["image_grid_thw"]):
+        raise ValueError("pixel_values and image_grid_thw must be provided together")
+
+    if all(image_key_presence["pixel_values"]):
+        pixel_values = [inputs["pixel_values"] for inputs in prompt_inputs]
+        image_grids = [inputs["image_grid_thw"] for inputs in prompt_inputs]
+        if any(not torch.is_tensor(value) or value.ndim < 1 for value in pixel_values):
+            raise ValueError("pixel_values must be non-scalar tensors")
+        if any(not torch.is_tensor(value) for value in image_grids):
+            raise ValueError("image_grid_thw must be tensors")
+        normalized_grids = [
+            grid.reshape(1, -1) if grid.ndim == 1 else grid
+            for grid in image_grids
+        ]
+        if any(grid.ndim != 2 or grid.shape[1] != 3 for grid in normalized_grids):
+            raise ValueError("image_grid_thw tensors must have shape [images, 3]")
+        all_image_tensors = pixel_values + normalized_grids
+        if any(value.device != reference_device for value in all_image_tensors):
+            raise ValueError("all prepared prompt tensors must be on the same device")
+        batched["pixel_values"] = torch.cat(pixel_values, dim=0)
+        batched["image_grid_thw"] = torch.cat(normalized_grids, dim=0)
+
+    return batched
+
+
+def _configured_token_ids(value: Any) -> set[int]:
+    if value is None:
+        return set()
+    if isinstance(value, int):
+        return {int(value)}
+    return {int(token_id) for token_id in value}
+
+
+def _trim_generated_batch_tail(
+    token_ids: list[int],
+    *,
+    eos_token_ids: set[int],
+    pad_token_id: int | None,
+    tokenizer: PreTrainedTokenizerBase,
+) -> list[int]:
+    for index, token_id in enumerate(token_ids):
+        if token_id in eos_token_ids:
+            token_ids = token_ids[:index]
+            break
+    if pad_token_id is not None:
+        while token_ids and token_ids[-1] == pad_token_id:
+            token_ids = token_ids[:-1]
+    return trim_tail_special_tokens(token_ids, tokenizer)
+
+
+def generate_batch_from_prompts(
+    *,
+    model: torch.nn.Module,
+    tokenizer: PreTrainedTokenizerBase,
+    prompt_inputs: Sequence[dict[str, Any]],
+    max_new_tokens: int,
+) -> list[tuple[list[int], str]]:
+    """Greedily generate one response per prepared prompt in a single call."""
+
+    generation_config = getattr(model, "generation_config", None)
+    pad_token_id = getattr(generation_config, "pad_token_id", None)
+    if pad_token_id is None:
+        pad_token_id = getattr(tokenizer, "pad_token_id", None)
+    if pad_token_id is None:
+        raise ValueError("batch generation requires a configured tokenizer/model pad_token_id")
+
+    batch_inputs = collate_prompt_inputs(prompt_inputs, pad_token_id=int(pad_token_id))
+    prompt_width = int(batch_inputs["input_ids"].shape[1])
+    generation_kwargs = {
+        "max_new_tokens": max_new_tokens,
+        "do_sample": False,
+    }
+
+    with torch.inference_mode():
+        output_ids = model.generate(**batch_inputs, **generation_kwargs)
+
+    if not torch.is_tensor(output_ids) or output_ids.ndim != 2:
+        raise ValueError("model.generate must return a [batch, sequence_length] token tensor")
+    if output_ids.shape[0] != len(prompt_inputs) or output_ids.shape[1] < prompt_width:
+        raise ValueError("model.generate returned an unexpected batch or sequence shape")
+
+    configured_eos_ids = getattr(generation_config, "eos_token_id", None)
+    if configured_eos_ids is None:
+        configured_eos_ids = getattr(tokenizer, "eos_token_id", None)
+    eos_token_ids = _configured_token_ids(configured_eos_ids)
+    decoded: list[tuple[list[int], str]] = []
+    for row in output_ids[:, prompt_width:].detach().cpu().tolist():
+        response_ids = _trim_generated_batch_tail(
+            [int(token_id) for token_id in row],
+            eos_token_ids=eos_token_ids,
+            pad_token_id=int(pad_token_id),
+            tokenizer=tokenizer,
+        )
+        response_text = tokenizer.decode(
+            response_ids,
+            skip_special_tokens=True,
+            clean_up_tokenization_spaces=False,
+        ).strip()
+        decoded.append((response_ids, response_text))
+    return decoded
 
 
 def generate_from_prompt(

@@ -7,11 +7,17 @@ import html
 import inspect
 import json
 import math
+import multiprocessing
+import os
 import re
 import shutil
 import statistics
+import sys
+import threading
+import time
 from bisect import bisect_left
 from collections.abc import Iterable, Sequence
+from concurrent.futures import ProcessPoolExecutor
 from dataclasses import asdict, dataclass
 from datetime import datetime, timezone
 from heapq import nlargest, nsmallest
@@ -30,6 +36,7 @@ from .hf_qwen import (
     append_generated_tokens,
     decode_generated_tokens,
     decode_token_piece,
+    generate_batch_from_prompts,
     generate_from_prompt,
     load_model_bundle,
     move_inputs_to_device,
@@ -38,6 +45,7 @@ from .hf_qwen import (
 from .mutation_spans import resolve_mutation_spans
 from .progress import ProgressTracker
 from .prompts import DEFAULT_PDF_OCR_PROMPT
+from .score_statistics import collect_token_statistics
 from .token_categories import (
     CATEGORY_LABELS,
     CATEGORY_RULES,
@@ -161,6 +169,13 @@ def run_privileged_probe(
     max_new_tokens: int = 4096,
     top_k: int = 5,
     forward_chunk_size: int = 16,
+    batch_size: int = 1,
+    postprocess_workers: int | None = None,
+    num_nodes: int = 1,
+    node_rank: int = 0,
+    num_shards: int = 1,
+    shard_index: int = 0,
+    worker_mode: bool = False,
     device_map: str | None = "auto",
     dtype: str = "bfloat16",
     trust_remote_code: bool = False,
@@ -193,6 +208,14 @@ def run_privileged_probe(
         raise ValueError("top_k must be between 2 and 50 so Top-1/Top-2 are available")
     if forward_chunk_size <= 0:
         raise ValueError("forward_chunk_size must be positive")
+    if batch_size <= 0:
+        raise ValueError("batch_size must be positive")
+    if postprocess_workers is not None and postprocess_workers < 0:
+        raise ValueError("postprocess_workers must be non-negative")
+    if num_nodes < 1 or not 0 <= node_rank < num_nodes:
+        raise ValueError("node_rank must be in [0, num_nodes)")
+    if num_shards < 1 or not 0 <= shard_index < num_shards:
+        raise ValueError("shard_index must be in [0, num_shards)")
     if min_pixels <= 0 or max_pixels < min_pixels:
         raise ValueError("pixel limits must be positive and max_pixels >= min_pixels")
     if image_patch_size <= 0:
@@ -212,9 +235,16 @@ def run_privileged_probe(
     output_root = Path(output_dir).expanduser().resolve()
     samples_root = output_root / "samples"
     samples_root.mkdir(parents=True, exist_ok=True)
-    samples = load_release_samples(
+    all_samples = load_release_samples(
         dataset_path, limit=limit, require_table=require_table
     )
+    samples = _partition_samples(all_samples, num_nodes=num_nodes, node_rank=node_rank,
+                                 num_shards=num_shards, shard_index=shard_index)
+    worker_mode = worker_mode or num_nodes > 1 or num_shards > 1
+    unit_root = (output_root / "workers" / f"node_{node_rank:03d}" / f"shard_{shard_index:03d}"
+                 if worker_mode else output_root)
+    if postprocess_workers is None:
+        postprocess_workers = 2 if batch_size > 1 or len(all_samples) > 1000 else 0
     config = {
         "schema_version": SCHEMA_VERSION,
         "created_at": _utc_now(),
@@ -236,6 +266,15 @@ def run_privileged_probe(
         "max_new_tokens": max_new_tokens,
         "top_k": top_k,
         "forward_chunk_size": forward_chunk_size,
+        "batch_size": batch_size,
+        "postprocess_workers": postprocess_workers,
+        "num_nodes": num_nodes,
+        "node_rank": node_rank,
+        "num_shards": num_shards,
+        "shard_index": shard_index,
+        "worker_mode": worker_mode,
+        "samples_total": len(all_samples),
+        "samples_selected": len(samples),
         "device_map": device_map,
         "dtype": dtype,
         "trust_remote_code": trust_remote_code,
@@ -251,16 +290,24 @@ def run_privileged_probe(
         "student_response_min_probability": student_response_min_probability,
         "student_response_max_probability": student_response_max_probability,
     }
-    _write_json_atomic(output_root / "config.json", config)
+    _write_json_atomic(unit_root / "config.json", config)
 
     tracker = ProgressTracker(
         task="qwen-mm-privileged-probe",
         total_items=len(samples),
         total_bytes=sum(sample.image_path.stat().st_size for sample in samples),
-        shard="single-process/huggingface-transformers",
+        shard=(f"node={node_rank}/{num_nodes}/gpu-shard={shard_index}/{num_shards}/"
+               f"batch={batch_size}/cpu-workers={postprocess_workers}"),
         heartbeat_seconds=heartbeat_seconds,
     )
     tracker.start()
+    if not samples:
+        tracker.finish()
+        summary = PrivilegedProbeSummary(output_root, 0, 0, 0, 0, False)
+        _write_json_atomic(unit_root / "run_summary.json", asdict(summary) | {
+            "output_dir": str(output_root), "completed_now": 0,
+        })
+        return summary
     tracker.set_current(
         index=0,
         name=student_model_id,
@@ -300,105 +347,133 @@ def run_privileged_probe(
     failed = 0
     interrupted = False
     fatal_error: BaseException | None = None
+    writer = _SampleResultWriter(
+        tracker=tracker, output_root=unit_root, workers=postprocess_workers,
+        max_pending=max(2, batch_size * 2),
+    )
     try:
-        for sample in samples:
-            sample_dir = samples_root / f"{sample.ordinal:03d}_{sample.pair_id}"
-            result_path = sample_dir / "result.json"
-            fingerprint = _sample_fingerprint(sample=sample, config=config)
-            cached_result = (
-                json.loads(result_path.read_text(encoding="utf-8"))
-                if resume and _result_matches(result_path, fingerprint) else None
-            )
-            if cached_result is not None and all(
-                row.get("p_original_teacher_top1") is not None
-                for row in cached_result["tokens"]
-            ):
-                skipped += 1
-                tracker.complete_unit(
-                    status="skipped",
-                    records=1,
-                    bytes_count=sample.image_path.stat().st_size,
-                    index=sample.ordinal,
-                    name=sample.pair_id,
+        for batch_start in range(0, len(samples), batch_size):
+            if fail_fast and writer.first_error is not None:
+                raise writer.first_error
+            pending: list[tuple[PrivilegedProbeSample, Path, str, dict[str, Any] | None]] = []
+            for sample in samples[batch_start:batch_start + batch_size]:
+                sample_dir = samples_root / f"{sample.ordinal:03d}_{sample.pair_id}"
+                result_path = sample_dir / "result.json"
+                fingerprint = _sample_fingerprint(sample=sample, config=config)
+                cached_result = (
+                    json.loads(result_path.read_text(encoding="utf-8"))
+                    if resume and _result_matches(result_path, fingerprint) else None
                 )
-                continue
-            sample_dir.mkdir(parents=True, exist_ok=True)
-            try:
-                result = _run_sample(
-                    sample=sample,
-                    sample_dir=sample_dir,
-                    fingerprint=fingerprint,
-                    student_model_bundle=student_model_bundle,
-                    teacher_model_bundle=teacher_model_bundle,
-                    prompt=prompt,
-                    privileged_instruction=privileged_instruction,
-                    max_new_tokens=max_new_tokens,
-                    top_k=top_k,
-                    forward_chunk_size=forward_chunk_size,
-                    min_pixels=min_pixels,
-                    max_pixels=max_pixels,
-                    image_patch_size=image_patch_size,
-                    seed=seed + sample.ordinal - 1,
-                    tracker=tracker,
-                    cached_result=cached_result,
-                )
-                _write_json_atomic(result_path, result)
-                _write_sample_outputs(sample_dir, result)
-                completed_now += 1
-                tracker.complete_unit(
-                    status="accepted",
-                    records=len(result["tokens"]),
-                    bytes_count=sample.image_path.stat().st_size,
-                    index=sample.ordinal,
-                    name=sample.pair_id,
-                )
-            except KeyboardInterrupt:
-                raise
-            except Exception as exc:  # noqa: BLE001 - preserve the rest of the batch
-                failed += 1
-                _append_jsonl(
-                    output_root / "failures.jsonl",
-                    {
-                        "timestamp": _utc_now(),
-                        "pair_id": sample.pair_id,
-                        "exception_type": type(exc).__name__,
-                        "message": _safe_error(exc),
-                    },
-                )
-                tracker.complete_unit(
-                    status="error",
-                    records=0,
-                    bytes_count=sample.image_path.stat().st_size,
-                    index=sample.ordinal,
-                    name=f"{sample.pair_id}: {type(exc).__name__}: {_safe_error(exc)}",
-                )
-                if fail_fast:
-                    fatal_error = exc
-                    break
+                if cached_result is not None and all(
+                    row.get("p_original_teacher_top1") is not None
+                    for row in cached_result["tokens"]
+                ) and not (sample_dir / "partial.json").exists():
+                    skipped += 1
+                    tracker.complete_unit(
+                        status="skipped", records=1,
+                        bytes_count=sample.image_path.stat().st_size,
+                        index=sample.ordinal, name=sample.pair_id,
+                    )
+                    continue
+                pending.append((sample, sample_dir, fingerprint, cached_result))
+            prepared: dict[int, dict[str, Any]] = {}
+            generated_now: set[int] = set()
+            if batch_size > 1:
+                generation_work = [item for item in pending if item[3] is None and (
+                    not resume or _load_partial(item[1] / "partial.json", item[2]) is None
+                )]
+                ready = []
+                for item in generation_work:
+                    sample, sample_dir, fingerprint, _ = item
+                    try:
+                        tracker.set_current(index=sample.ordinal, name=sample.pair_id,
+                                            phase="preparing-generation-batch")
+                        prepared[sample.ordinal] = prepare_prompt_inputs(
+                            processor=student_model_bundle.processor,
+                            image_path=sample.image_path, prompt=prompt, device="cpu",
+                            min_pixels=min_pixels, max_pixels=max_pixels,
+                            image_patch_size=image_patch_size, enable_thinking=False,
+                        )
+                        ready.append(item)
+                    except Exception as exc:
+                        writer.record_error(sample, exc)
+                        pending.remove(item)
+                        if fail_fast:
+                            raise
+                if ready:
+                    try:
+                        _generate_pending_batch(
+                            ready, prepared=prepared, model_bundle=student_model_bundle,
+                            max_new_tokens=max_new_tokens, seed=seed, tracker=tracker,
+                            generated_now=generated_now,
+                        )
+                    except Exception as exc:
+                        # Successfully checkpointed sub-batches remain resumable.
+                        for item in ready:
+                            if item[0].ordinal not in generated_now:
+                                writer.record_error(item[0], exc)
+                                pending.remove(item)
+                        if fail_fast:
+                            raise
+            for sample, sample_dir, fingerprint, cached_result in pending:
+                if fail_fast and writer.first_error is not None:
+                    raise writer.first_error
+                try:
+                    result = _run_sample(
+                        sample=sample, sample_dir=sample_dir, fingerprint=fingerprint,
+                        student_model_bundle=student_model_bundle,
+                        teacher_model_bundle=teacher_model_bundle,
+                        prompt=prompt, privileged_instruction=privileged_instruction,
+                        max_new_tokens=max_new_tokens, top_k=top_k,
+                        forward_chunk_size=forward_chunk_size,
+                        min_pixels=min_pixels, max_pixels=max_pixels,
+                        image_patch_size=image_patch_size,
+                        seed=seed + sample.ordinal - 1, tracker=tracker,
+                        cached_result=cached_result,
+                        prepared_original_inputs=prepared.pop(sample.ordinal, None),
+                        generated_now=sample.ordinal in generated_now,
+                        defer_postprocess=postprocess_workers > 0,
+                        resume=resume,
+                    )
+                    writer.submit(sample, sample_dir, result)
+                except KeyboardInterrupt:
+                    raise
+                except Exception as exc:
+                    writer.record_error(sample, exc)
+                    if fail_fast:
+                        raise
     except KeyboardInterrupt:
         interrupted = True
     except Exception as exc:  # noqa: BLE001 - finalize progress before surfacing
-        fatal_error = exc
+        fatal_error = RuntimeError(f"{type(exc).__name__}: {_safe_error(exc)}")
         tracker.note_error(
             phase="offline-probe-error",
             name=f"{type(exc).__name__}: {_safe_error(exc)}",
         )
+    finally:
+        # Drain ready CPU work and persist it even when GPU inference is interrupted.
+        writer.close()
+        completed_now = writer.completed
+        failed = writer.failed
+        if fail_fast and fatal_error is None and writer.first_error is not None:
+            fatal_error = writer.first_error
 
-    tracker.set_current(
-        index=len(samples), name="aggregate-report", phase="building-report"
-    )
-    completed_total = 0
+    completed_total = completed_now + skipped
     report_error: Exception | None = None
-    try:
-        report_summary = rebuild_privileged_report(
-            output_root,
-            teacher_signal_threshold=teacher_signal_threshold,
-            student_response_min_probability=student_response_min_probability,
-            student_response_max_probability=student_response_max_probability,
+    if not worker_mode:
+        tracker.set_current(
+            index=len(samples), name="aggregate-report", phase="building-report"
         )
-        completed_total = int(report_summary["completed_samples"])
-    except Exception as exc:  # noqa: BLE001 - report errors must not hide run status
-        report_error = exc
+        try:
+            report_summary = rebuild_privileged_report(
+                output_root,
+                teacher_signal_threshold=teacher_signal_threshold,
+                student_response_min_probability=student_response_min_probability,
+                student_response_max_probability=student_response_max_probability,
+            )
+            completed_total = int(report_summary["completed_samples"])
+        except Exception as exc:  # noqa: BLE001 - report errors must not hide run status
+            report_error = exc
     tracker.finish(interrupted=interrupted)
 
     summary = PrivilegedProbeSummary(
@@ -410,7 +485,7 @@ def run_privileged_probe(
         interrupted=interrupted,
     )
     _write_json_atomic(
-        output_root / "run_summary.json",
+        unit_root / "run_summary.json",
         asdict(summary)
         | {
             "output_dir": str(output_root),
@@ -424,6 +499,188 @@ def run_privileged_probe(
     if report_error is not None:
         raise report_error
     return summary
+
+
+def _partition_samples(
+    samples: Sequence[PrivilegedProbeSample], *, num_nodes: int, node_rank: int,
+    num_shards: int, shard_index: int,
+) -> list[PrivilegedProbeSample]:
+    """Partition after the global table filter/limit, without changing sample identities."""
+    if num_nodes < 1 or not 0 <= node_rank < num_nodes:
+        raise ValueError("node_rank must be in [0, num_nodes)")
+    if num_shards < 1 or not 0 <= shard_index < num_shards:
+        raise ValueError("shard_index must be in [0, num_shards)")
+    return list(samples[node_rank::num_nodes][shard_index::num_shards])
+
+
+def _generate_pending_batch(
+    pending: Sequence[tuple[PrivilegedProbeSample, Path, str, dict[str, Any] | None]],
+    *, prepared: dict[int, dict[str, Any]], model_bundle: ModelBundle,
+    max_new_tokens: int, seed: int, tracker: ProgressTracker,
+    generated_now: set[int] | None = None,
+) -> None:
+    """Generate once per batch and immediately checkpoint every response's exact IDs."""
+    import torch
+
+    first = pending[0][0]
+    tracker.set_current(index=first.ordinal,
+                        name=", ".join(item[0].pair_id for item in pending),
+                        phase=f"generating-response-batch-{len(pending)}")
+    started = time.perf_counter()
+    _seed_everything(seed + first.ordinal - 1)
+    device_inputs = []
+    out_of_memory = False
+    try:
+        device_inputs = [move_inputs_to_device(prepared[item[0].ordinal], model_bundle.device)
+                         for item in pending]
+        generated = generate_batch_from_prompts(
+            model=model_bundle.model, tokenizer=model_bundle.tokenizer,
+            prompt_inputs=device_inputs, max_new_tokens=max_new_tokens,
+        )
+    except torch.OutOfMemoryError:
+        if len(pending) == 1:
+            raise
+        out_of_memory = True
+    finally:
+        del device_inputs
+    if out_of_memory:
+        # Release the failed forward's traceback/tensors before retrying smaller batches.
+        _empty_device_cache(model_bundle.device)
+        print(f"[privileged-batch] CUDA memory limit: splitting batch={len(pending)} "
+              f"current={first.pair_id}", flush=True)
+        split = len(pending) // 2
+        for sub_batch in (pending[:split], pending[split:]):
+            _generate_pending_batch(sub_batch, prepared=prepared, model_bundle=model_bundle,
+                                    max_new_tokens=max_new_tokens, seed=seed, tracker=tracker,
+                                    generated_now=generated_now)
+        return
+    elapsed = time.perf_counter() - started
+    if len(generated) != len(pending):
+        raise RuntimeError("batch generation returned a different number of responses")
+    for (sample, sample_dir, fingerprint, _), (response_ids, _) in zip(pending, generated):
+        if not response_ids:
+            raise RuntimeError(f"model generated no scoreable response token IDs: {sample.pair_id}")
+        _write_json_atomic(sample_dir / "partial.json", {
+            "schema_version": SCHEMA_VERSION, "partial": True,
+            "fingerprint": fingerprint, "pair_id": sample.pair_id,
+            "generation_count": 1, "response_ids": response_ids,
+            "response_text": decode_generated_tokens(model_bundle.tokenizer, response_ids),
+            "finish_reason": "length" if len(response_ids) >= max_new_tokens else "stop",
+            "generation_batch_size": len(pending),
+            "generation_batch_seconds": elapsed, "forwards": {},
+        })
+        if generated_now is not None:
+            generated_now.add(sample.ordinal)
+    print(f"[privileged-timing] phase=generation batch={len(pending)} "
+          f"response_tokens={sum(len(item[0]) for item in generated)} "
+          f"seconds={elapsed:.3f} current={first.pair_id}", flush=True)
+
+
+class _SampleResultWriter:
+    """CPU workers analyze samples; a serialized parent-side callback persists results."""
+
+    def __init__(self, *, tracker: ProgressTracker, output_root: Path,
+                 workers: int, max_pending: int) -> None:
+        self.tracker = tracker
+        self.output_root = output_root
+        self.completed = 0
+        self.failed = 0
+        self.first_error: Exception | None = None
+        self._lock = threading.RLock()
+        self._slots = threading.Semaphore(max_pending)
+        self._executor = (ProcessPoolExecutor(
+            max_workers=workers, mp_context=multiprocessing.get_context("spawn"),
+        ) if workers else None)
+
+    def record_error(self, sample: PrivilegedProbeSample, exc: Exception) -> None:
+        with self._lock:
+            self.failed += 1
+            if self.first_error is None:
+                # Keeping a failed model forward's traceback would keep its GPU tensors alive.
+                self.first_error = RuntimeError(f"{type(exc).__name__}: {_safe_error(exc)}")
+            _append_jsonl(self.output_root / "failures.jsonl", {
+                "timestamp": _utc_now(), "pair_id": sample.pair_id,
+                "exception_type": type(exc).__name__, "message": _safe_error(exc),
+            })
+            self.tracker.complete_unit(
+                status="error", records=0, bytes_count=sample.image_path.stat().st_size,
+                index=sample.ordinal, name=f"{sample.pair_id}: {type(exc).__name__}: {_safe_error(exc)}",
+            )
+
+    def _persist(self, sample: PrivilegedProbeSample, sample_dir: Path,
+                 result: dict[str, Any], rendered_html: str | None = None) -> None:
+        with self._lock:
+            _write_json_atomic(sample_dir / "result.json", result)
+            if rendered_html is None:
+                _write_sample_outputs(sample_dir, result)
+            else:
+                _write_sample_outputs(sample_dir, result, rendered_html=rendered_html)
+            # A saved response is removed only after its final record/exports exist.
+            (sample_dir / "partial.json").unlink(missing_ok=True)
+            self.completed += 1
+            self.tracker.complete_unit(
+                status="accepted", records=len(result["tokens"]),
+                bytes_count=sample.image_path.stat().st_size,
+                index=sample.ordinal, name=sample.pair_id,
+            )
+            if result.get("timings"):
+                print(f"[privileged-timing] current={sample.pair_id} "
+                      + " ".join(f"{key}={value:.3f}" for key, value in result["timings"].items()),
+                      flush=True)
+
+    def submit(self, sample: PrivilegedProbeSample, sample_dir: Path,
+               result: dict[str, Any]) -> None:
+        if self._executor is None:
+            self._persist(sample, sample_dir, result)
+            return
+        self._slots.acquire()
+        try:
+            future = self._executor.submit(_finish_and_render_sample, result)
+        except BaseException:
+            self._slots.release()
+            raise
+
+        def save_completed(completed: Any) -> None:
+            try:
+                final_result, rendered_html = completed.result()
+                self._persist(sample, sample_dir, final_result, rendered_html)
+            except Exception as exc:  # noqa: BLE001 - persist worker/write failures per sample
+                self.record_error(sample, exc)
+            finally:
+                self._slots.release()
+
+        future.add_done_callback(save_completed)
+
+    def close(self) -> None:
+        if self._executor is not None:
+            self._executor.shutdown(wait=True)
+
+
+def _finish_sample_result(result: dict[str, Any]) -> dict[str, Any]:
+    started = time.perf_counter()
+    result.pop("_needs_postprocessing", None)
+    rows = result["tokens"]
+    resolved_changes = resolve_mutation_spans(result["ground_truth"], result["sample"]["changes"])
+    observations = _attach_gt_and_mutation_alignment(
+        rows=rows, response_text=result["response"]["text"],
+        ground_truth=result["ground_truth"], changes=resolved_changes,
+    )
+    mutations = _build_mutation_rows(rows, observations, resolved_changes)
+    annotate_token_categories(rows, response_text=result["response"]["text"])
+    result["sample"]["changes"] = resolved_changes
+    result["mutation_observations"] = mutations
+    result["summary"] = _summarize_rows(rows, mutations)
+    result.setdefault("timings", {})["postprocess_seconds"] = time.perf_counter() - started
+    return result
+
+
+def _finish_and_render_sample(result: dict[str, Any]) -> tuple[dict[str, Any], str]:
+    if result.get("_needs_postprocessing"):
+        result = _finish_sample_result(result)
+    started = time.perf_counter()
+    rendered = _render_sample_html(result)
+    result.setdefault("timings", {})["render_html_seconds"] = time.perf_counter() - started
+    return result, rendered
 
 
 def _run_sample(
@@ -444,7 +701,12 @@ def _run_sample(
     seed: int,
     tracker: ProgressTracker,
     cached_result: dict[str, Any] | None = None,
+    prepared_original_inputs: dict[str, Any] | None = None,
+    generated_now: bool = False,
+    defer_postprocess: bool = False,
+    resume: bool = True,
 ) -> dict[str, Any]:
+    prepare_started = time.perf_counter()
     sample_dir.mkdir(parents=True, exist_ok=True)
     image_copy = sample_dir / f"input{sample.image_path.suffix.lower()}"
     partial_path = sample_dir / "partial.json"
@@ -463,7 +725,8 @@ def _run_sample(
         name=sample.pair_id,
         phase="preparing-original-multimodal-prompt",
     )
-    original_inputs = prepare_prompt_inputs(
+    original_inputs = (move_inputs_to_device(prepared_original_inputs, student_model_bundle.device)
+                       if prepared_original_inputs is not None else prepare_prompt_inputs(
         processor=student_model_bundle.processor,
         image_path=image_copy,
         prompt=prompt,
@@ -472,7 +735,7 @@ def _run_sample(
         max_pixels=max_pixels,
         image_patch_size=image_patch_size,
         enable_thinking=False,
-    )
+    ))
     if cached_result is not None:
         # Preserve the original response and teacher scores when extending an old run.
         rows = _response_rows_in_generation_order(cached_result)
@@ -500,7 +763,6 @@ def _run_sample(
             for row, score in zip(rows, original_scores):
                 row["p_original_teacher_top1"] = score["probe_probability"]
                 row["logp_original_teacher_top1"] = score["probe_log_probability"]
-            _empty_device_cache(student_model_bundle.device)
         cached_result.setdefault("protocol", {})["teacher_top1_scored_under_original"] = True
         cached_result["protocol"]["generation_performed_this_run"] = False
         return cached_result
@@ -514,8 +776,9 @@ def _run_sample(
         prompt=privileged_prompt,
     )
 
-    partial = _load_partial(partial_path, fingerprint)
-    generation_performed = False
+    timings = {"prepare_seconds": time.perf_counter() - prepare_started}
+    partial = _load_partial(partial_path, fingerprint) if resume or generated_now else None
+    generation_performed = generated_now
     if partial is None:
         tracker.set_current(
             index=sample.ordinal,
@@ -523,6 +786,7 @@ def _run_sample(
             phase="generating-response-once",
         )
         _seed_everything(seed)
+        generation_started = time.perf_counter()
         response_ids, _ = generate_from_prompt(
             model=student_model_bundle.model,
             tokenizer=student_model_bundle.tokenizer,
@@ -549,6 +813,8 @@ def _run_sample(
             "response_ids": response_ids,
             "response_text": response_text,
             "finish_reason": finish_reason,
+            "generation_batch_size": 1,
+            "generation_batch_seconds": time.perf_counter() - generation_started,
             "forwards": {},
         }
         _write_json_atomic(partial_path, partial)
@@ -556,6 +822,8 @@ def _run_sample(
         response_ids = [int(value) for value in partial["response_ids"]]
         response_text = str(partial["response_text"])
         finish_reason = str(partial.get("finish_reason", "unknown"))
+    if partial.get("generation_batch_seconds") is not None:
+        timings["generation_batch_seconds"] = float(partial["generation_batch_seconds"])
 
     _validate_response_id_compatibility(
         student_model_bundle=student_model_bundle,
@@ -600,6 +868,7 @@ def _run_sample(
         ):
             continue
         tracker.set_current(index=sample.ordinal, name=sample.pair_id, phase=phase)
+        scoring_started = time.perf_counter()
         forwards[context_name] = _score_fixed_response_ids(
             model_bundle=scoring_bundle,
             prompt_inputs=context_inputs,
@@ -608,23 +877,13 @@ def _run_sample(
             chunk_size=forward_chunk_size,
             probe_token_ids=probe_ids,
         )
+        timings[f"{context_name}_scoring_seconds"] = time.perf_counter() - scoring_started
         partial["forwards"] = forwards
         _write_json_atomic(partial_path, partial)
-        _empty_device_cache(scoring_bundle.device)
 
     original_scores = list(forwards["original"])
     teacher_scores = list(forwards["teacher"])
     rows = _combine_scores(response_ids, original_scores, teacher_scores)
-    resolved_changes = resolve_mutation_spans(ground_truth, sample.changes)
-    mutation_observations = _attach_gt_and_mutation_alignment(
-        rows=rows,
-        response_text=response_text,
-        ground_truth=ground_truth,
-        changes=resolved_changes,
-    )
-    mutation_rows = _build_mutation_rows(rows, mutation_observations, resolved_changes)
-    annotate_token_categories(rows, response_text=response_text)
-    summary = _summarize_rows(rows, mutation_rows)
     reconstructed = "".join(str(row["raw_token"]) for row in rows)
 
     result = {
@@ -637,7 +896,7 @@ def _run_sample(
             "source_image": str(sample.image_path),
             "source_ground_truth": str(sample.ground_truth_path),
             "image_copy": str(image_copy),
-            "changes": resolved_changes,
+            "changes": list(sample.changes),
         },
         "protocol": {
             "backend": "huggingface-transformers-offline",
@@ -649,6 +908,8 @@ def _run_sample(
             "privileged_scoring_model_id": teacher_model_bundle.model_id,
             "generation_count": 1,
             "generation_performed_this_run": generation_performed,
+            "generation_batch_size": int(partial.get("generation_batch_size", 1)),
+            "scoring_batch_size": 1,
             "teacher_forced_forward_count": 2,
             "teacher_top1_scored_under_original": True,
             "response_ids_reused_for_all_forwards": True,
@@ -674,12 +935,13 @@ def _run_sample(
             "piece_reconstruction_matches_response": reconstructed == response_text,
         },
         "ground_truth": ground_truth,
-        "summary": summary,
-        "mutation_observations": mutation_rows,
+        "timings": timings,
         "tokens": rows,
     }
-    partial_path.unlink(missing_ok=True)
-    return result
+    if defer_postprocess:
+        result["_needs_postprocessing"] = True
+        return result
+    return _finish_sample_result(result)
 
 
 def _build_privileged_prompt(*, ground_truth: str, instruction: str) -> str:
@@ -855,91 +1117,53 @@ def _score_fixed_response_ids(
             f"logits={target_logits.shape[0]} ids={len(response_ids)}"
         )
 
-    rows: list[dict[str, Any]] = []
-    for start in range(0, len(response_ids), chunk_size):
-        end = min(len(response_ids), start + chunk_size)
-        chunk = target_logits[start:end].float()
-        target_tensor = torch.tensor(
-            [int(value) for value in response_ids[start:end]],
-            dtype=torch.long,
-            device=chunk.device,
-        )
-        log_normalizer = torch.logsumexp(chunk, dim=-1)
-        selected_logits = chunk.gather(1, target_tensor[:, None]).squeeze(1)
-        selected_logp = selected_logits - log_normalizer
-        probe_logp_cpu = None
-        if probe_token_ids is not None:
-            probe_tensor = torch.tensor(
-                [int(value) for value in probe_token_ids[start:end]],
-                dtype=torch.long, device=chunk.device,
-            )
-            probe_logp_cpu = (
-                chunk.gather(1, probe_tensor[:, None]).squeeze(1) - log_normalizer
-            ).detach().cpu().tolist()
-        target_ranks = 1 + (chunk > selected_logits[:, None]).sum(dim=-1)
-        top_values, top_ids = torch.topk(
-            chunk,
-            k=min(top_k, int(chunk.shape[-1])),
-            dim=-1,
-        )
-        top_logp = top_values - log_normalizer[:, None]
-        probabilities = torch.softmax(chunk, dim=-1)
-        entropies = -(probabilities * torch.log_softmax(chunk, dim=-1)).sum(dim=-1)
-
-        selected_logp_cpu = selected_logp.detach().cpu().tolist()
-        ranks_cpu = target_ranks.detach().cpu().tolist()
-        entropy_cpu = entropies.detach().cpu().tolist()
-        top_ids_cpu = top_ids.detach().cpu().tolist()
-        top_logp_cpu = top_logp.detach().cpu().tolist()
-        for offset, token_id in enumerate(response_ids[start:end]):
-            raw_token = decode_token_piece(model_bundle.tokenizer, int(token_id))
-            candidates: list[dict[str, Any]] = []
-            for rank, (candidate_id, candidate_logp) in enumerate(
-                zip(top_ids_cpu[offset], top_logp_cpu[offset]),
-                start=1,
-            ):
-                candidate_raw = decode_token_piece(
-                    model_bundle.tokenizer,
-                    int(candidate_id),
-                )
-                candidates.append(
-                    {
-                        "rank": rank,
-                        "token_id": int(candidate_id),
-                        "token": _display_token(candidate_raw),
-                        "raw_token": candidate_raw,
-                        "probability": math.exp(float(candidate_logp)),
-                        "log_probability": float(candidate_logp),
-                    }
-                )
-            target_logp = float(selected_logp_cpu[offset])
-            top = candidates[0]
-            rows.append(
-                {
-                    "token_id": int(token_id),
-                    "token": _display_token(raw_token),
-                    "raw_token": raw_token,
-                    "probability": math.exp(target_logp),
-                    "log_probability": target_logp,
-                    "target_rank": int(ranks_cpu[offset]),
-                    "entropy": float(entropy_cpu[offset]),
-                    "top_token_id": int(top["token_id"]),
-                    "top_token": str(top["token"]),
-                    "top_raw_token": str(top["raw_token"]),
-                    "top_probability": float(top["probability"]),
-                    "top_log_probability": float(top["log_probability"]),
-                    "top_candidates": candidates,
-                }
-            )
-            if probe_logp_cpu is not None:
-                probe_logp = float(probe_logp_cpu[offset])
-                rows[-1].update({
-                    "probe_token_id": int(probe_token_ids[start + offset]),
-                    "probe_probability": math.exp(probe_logp),
-                    "probe_log_probability": probe_logp,
-                })
-        del chunk, probabilities
+    stats = collect_token_statistics(
+        target_logits, response_ids, probe_token_ids=probe_token_ids,
+        top_k=top_k, chunk_size=chunk_size,
+    )
     del outputs, logits, target_logits
+    # The tokenizer is fixed within this forward. Repeated IDs need only one decode.
+    decoded: dict[int, str] = {}
+
+    def piece(token_id: int) -> str:
+        if token_id not in decoded:
+            decoded[token_id] = decode_token_piece(model_bundle.tokenizer, token_id)
+        return decoded[token_id]
+
+    rows: list[dict[str, Any]] = []
+    for index, token_id in enumerate(response_ids):
+        raw_token = piece(int(token_id))
+        candidates: list[dict[str, Any]] = []
+        for rank, (candidate_id, candidate_logp) in enumerate(
+            zip(stats["top_ids"][index], stats["top_logp"][index]), start=1,
+        ):
+            candidate_raw = piece(int(candidate_id))
+            candidates.append({
+                "rank": rank, "token_id": int(candidate_id),
+                "token": _display_token(candidate_raw), "raw_token": candidate_raw,
+                "probability": math.exp(float(candidate_logp)),
+                "log_probability": float(candidate_logp),
+            })
+        target_logp = float(stats["selected_logp"][index])
+        top = candidates[0]
+        rows.append({
+            "token_id": int(token_id), "token": _display_token(raw_token),
+            "raw_token": raw_token, "probability": math.exp(target_logp),
+            "log_probability": target_logp, "target_rank": int(stats["ranks"][index]),
+            "entropy": float(stats["entropy"][index]),
+            "top_token_id": int(top["token_id"]), "top_token": str(top["token"]),
+            "top_raw_token": str(top["raw_token"]),
+            "top_probability": float(top["probability"]),
+            "top_log_probability": float(top["log_probability"]),
+            "top_candidates": candidates,
+        })
+        if stats["probe_logp"] is not None:
+            probe_logp = float(stats["probe_logp"][index])
+            rows[-1].update({
+                "probe_token_id": int(probe_token_ids[index]),
+                "probe_probability": math.exp(probe_logp),
+                "probe_log_probability": probe_logp,
+            })
     return rows
 
 
@@ -2828,7 +3052,8 @@ def _summarize_global(
     }
 
 
-def _write_sample_outputs(sample_dir: Path, result: dict[str, Any]) -> None:
+def _write_sample_outputs(sample_dir: Path, result: dict[str, Any], *,
+                          rendered_html: str | None = None) -> None:
     for row in result["tokens"]:
         row["p_original_teacher_top1"], row["logp_original_teacher_top1"] = (
             _student_score_for_teacher_top1(row)
@@ -2849,7 +3074,8 @@ def _write_sample_outputs(sample_dir: Path, result: dict[str, Any]) -> None:
     _write_csv(
         sample_dir / "mutation_probabilities.csv", result["mutation_observations"]
     )
-    _write_text_atomic(sample_dir / "report.html", _render_sample_html(result))
+    _write_text_atomic(sample_dir / "report.html",
+                       rendered_html if rendered_html is not None else _render_sample_html(result))
 
 
 def _response_rows_in_generation_order(
@@ -4808,9 +5034,13 @@ def _write_text_atomic(path: Path, value: str) -> None:
 
 
 def _write_json_atomic(path: Path, value: Any) -> None:
-    _write_text_atomic(
-        path, json.dumps(value, ensure_ascii=False, indent=2, allow_nan=False)
-    )
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_suffix(path.suffix + ".tmp")
+    with temporary.open("w", encoding="utf-8") as handle:
+        json.dump(value, handle, ensure_ascii=False, indent=2, allow_nan=False)
+        handle.flush()
+        os.fsync(handle.fileno())
+    temporary.replace(path)
 
 
 def _append_jsonl(path: Path, value: dict[str, Any]) -> None:
@@ -4818,6 +5048,7 @@ def _append_jsonl(path: Path, value: dict[str, Any]) -> None:
     with path.open("a", encoding="utf-8") as handle:
         handle.write(json.dumps(value, ensure_ascii=False) + "\n")
         handle.flush()
+        os.fsync(handle.fileno())
 
 
 def _write_csv(path: Path, rows: Sequence[dict[str, Any]]) -> None:
@@ -4877,6 +5108,18 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--max-new-tokens", type=int, default=4096)
     parser.add_argument("--top-k", type=int, default=5)
     parser.add_argument("--forward-chunk-size", type=int, default=16)
+    parser.add_argument("--batch-size", type=int, default=1,
+                        help="Number of pages generated together (try 4 on H100 80GB). Exact-ID scoring remains per page.")
+    parser.add_argument("--postprocess-workers", type=int, default=None,
+                        help="CPU analysis/render workers; default 2 when batching or above 1000 pages, otherwise 0. Use 0 for synchronous processing.")
+    parser.add_argument("--gpus", help="Launch one independent inference process per listed GPU, e.g. 0,1,2,3.")
+    parser.add_argument("--num-nodes", type=int, default=1,
+                        help="Number of machines partitioning this dataset; no cross-machine model communication.")
+    parser.add_argument("--node-rank", type=int, default=0,
+                        help="This machine's zero-based rank. Use 0 and 1 for two machines.")
+    parser.add_argument("--num-shards", type=int, default=1, help=argparse.SUPPRESS)
+    parser.add_argument("--shard-index", type=int, default=0, help=argparse.SUPPRESS)
+    parser.add_argument("--worker-mode", action="store_true", help=argparse.SUPPRESS)
     parser.add_argument("--device-map", default="auto")
     parser.add_argument(
         "--dtype",
@@ -4956,6 +5199,22 @@ def main(argv: Sequence[str] | None = None) -> int:
         return 0
     if not args.dataset_root:
         parser.error("--dataset-root is required unless --rebuild-report-only is used")
+    if args.gpus:
+        if args.worker_mode:
+            parser.error("--gpus cannot be combined with --worker-mode")
+        from .multi_gpu_probe import launch_gpu_workers
+
+        gpu_ids = [gpu.strip() for gpu in args.gpus.split(",") if gpu.strip()]
+        if not gpu_ids or len(set(gpu_ids)) != len(gpu_ids):
+            parser.error("--gpus must contain distinct GPU identifiers")
+        summary = launch_gpu_workers(
+            list(sys.argv[1:] if argv is None else argv), gpu_ids=gpu_ids,
+            num_nodes=args.num_nodes, node_rank=args.node_rank,
+            output_dir=Path(args.output_dir), dataset_root=Path(args.dataset_root),
+            limit=args.limit, require_table=args.require_table,
+            heartbeat_seconds=args.heartbeat_seconds,
+        )
+        return 0 if not summary.get("failed_workers", 0) and not summary.get("interrupted", False) else 1
     prompt = args.prompt
     if args.prompt_file:
         prompt = Path(args.prompt_file).expanduser().read_text(encoding="utf-8")
@@ -4970,6 +5229,13 @@ def main(argv: Sequence[str] | None = None) -> int:
         max_new_tokens=args.max_new_tokens,
         top_k=args.top_k,
         forward_chunk_size=args.forward_chunk_size,
+        batch_size=args.batch_size,
+        postprocess_workers=args.postprocess_workers,
+        num_nodes=args.num_nodes,
+        node_rank=args.node_rank,
+        num_shards=args.num_shards,
+        shard_index=args.shard_index,
+        worker_mode=args.worker_mode,
         device_map=device_map,
         dtype=args.dtype,
         trust_remote_code=args.trust_remote_code,
@@ -4992,7 +5258,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         f"skipped={summary.skipped_items} failed={summary.failed_items}",
         flush=True,
     )
-    return 0
+    return 1 if summary.failed_items and (args.worker_mode or args.num_nodes > 1 or args.num_shards > 1) else 0
 
 
 if __name__ == "__main__":
